@@ -18,9 +18,8 @@ No emulation, no streaming: the Apple Silicon Mac build runs directly on iOS / i
 | Gameplay (loading saves, driving, combat) | ✅ works |
 | On-screen controls (virtual gamepad + touch-as-mouse in menus) | ✅ works |
 | Bluetooth / MFi controllers (Xbox, DualSense, DualShock 4) | ✅ works, on-screen pad hides automatically |
-| Resolution up to native (2868 × 1320 on iPhone 16 Pro Max), MetalFX / FSR | ✅ works |
+| Resolution picker up to native (2868 × 1320 on iPhone 16 Pro Max) | ✅ works |
 | Performance | ⚠️ ~30–60 FPS at 1434 × 660 with low settings on an iPhone 16 Pro Max; CPU-bound, the phone gets hot and throttles in long sessions |
-| Frame generation (FSR 3) | ⚠️ selectable, not well tested |
 | Online features (GOG Galaxy, CDPR account, crash upload) | ❌ offline only (stubbed) |
 
 Tested on: **iPhone 16 Pro Max (A18 Pro, 8 GB), iOS 27.0.1**, built with Xcode 27.
@@ -87,8 +86,7 @@ M-series iPads have more RAM and better cooling and should run it as well or bet
 
 ### Start screen
 - **Resolution** – the size the game renders and outputs at: 717 × 330 … 2868 × 1320 (native) on an iPhone 16 Pro Max.
-  1434 × 660 is a good start. Upscaler (MetalFX / FSR 2 / FSR 3), frame generation, FPS limit and all other graphics options
-  are set in the game's own **Settings** menu and are kept between launches.
+  1434 × 660 is a good start. All other graphics options are set in the game's own **Settings** menu and are kept between launches.
 - **Performance overlay** – Off / FPS / Detailed (FPS, frame time, CPU, RAM; *Detailed* also turns on Apple's Metal HUD).
   The system Metal HUD (Settings → Developer → Graphics HUD) is independent of this.
 - When you change a setting in-game that needs a restart, CyPort offers to quit; just open it again.
