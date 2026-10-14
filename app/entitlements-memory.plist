@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Needs a provisioning profile whose App ID has "Increased Memory Limit" and "Extended Virtual Addressing"
+     (paid Apple Developer account). Without a matching profile the app will not install/launch. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+	<key>get-task-allow</key><true/>
+	<key>com.apple.developer.kernel.increased-memory-limit</key><true/>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key><true/>
+</dict></plist>

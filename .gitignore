@@ -1,0 +1,8 @@
+# build output and anything from the game - never commit game files
+build/
+*.ipa
+Payload/
+*.mobileprovision
+*.dSYM
+.DS_Store
+*.bak*

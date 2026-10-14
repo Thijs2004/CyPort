@@ -1,0 +1,2650 @@
+{
+    "version": 140,
+    "data": [
+        {
+            "group_name": "/controls/fppcameramouse",
+            "options": [
+                {
+                    "name": "FPP_MouseX",
+                    "type": "float",
+                    "value": 5.0,
+                    "default_value": 5.0,
+                    "min_value": 1.0,
+                    "max_value": 30.0,
+                    "step_value": 1.0
+                },
+                {
+                    "name": "FPP_MouseInvertX",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "FPP_MouseY",
+                    "type": "float",
+                    "value": 5.0,
+                    "default_value": 5.0,
+                    "min_value": 1.0,
+                    "max_value": 30.0,
+                    "step_value": 1.0
+                },
+                {
+                    "name": "FPP_MouseInvertY",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "FPP_MouseZoomFactor",
+                    "type": "float",
+                    "value": 1.0,
+                    "default_value": 1.0,
+                    "min_value": 0.0,
+                    "max_value": 2.0,
+                    "step_value": 0.0500000007
+                }
+            ]
+        },
+        {
+            "group_name": "/controls/tppcameramouse",
+            "options": [
+                {
+                    "name": "TPP_MouseX",
+                    "type": "float",
+                    "value": 3.0,
+                    "default_value": 3.0,
+                    "min_value": 1.0,
+                    "max_value": 30.0,
+                    "step_value": 1.0
+                },
+                {
+                    "name": "TPP_MouseInvertX",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "TPP_MouseY",
+                    "type": "float",
+                    "value": 3.0,
+                    "default_value": 3.0,
+                    "min_value": 1.0,
+                    "max_value": 30.0,
+                    "step_value": 1.0
+                },
+                {
+                    "name": "TPP_MouseInvertY",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                }
+            ]
+        },
+        {
+            "group_name": "/audio/volume",
+            "options": [
+                {
+                    "name": "MasterVolume",
+                    "type": "int",
+                    "value": 100,
+                    "default_value": 100,
+                    "min_value": 0,
+                    "max_value": 100,
+                    "step_value": 5
+                },
+                {
+                    "name": "SfxVolume",
+                    "type": "int",
+                    "value": 100,
+                    "default_value": 100,
+                    "min_value": 0,
+                    "max_value": 100,
+                    "step_value": 5
+                },
+                {
+                    "name": "DialogueVolume",
+                    "type": "int",
+                    "value": 100,
+                    "default_value": 100,
+                    "min_value": 0,
+                    "max_value": 100,
+                    "step_value": 5
+                },
+                {
+                    "name": "MusicVolume",
+                    "type": "int",
+                    "value": 100,
+                    "default_value": 100,
+                    "min_value": 0,
+                    "max_value": 100,
+                    "step_value": 5
+                },
+                {
+                    "name": "CarRadioVolume",
+                    "type": "int",
+                    "value": 100,
+                    "default_value": 100,
+                    "min_value": 0,
+                    "max_value": 100,
+                    "step_value": 5
+                },
+                {
+                    "name": "RadioportVolume",
+                    "type": "int",
+                    "value": 100,
+                    "default_value": 100,
+                    "min_value": 0,
+                    "max_value": 100,
+                    "step_value": 5
+                }
+            ]
+        },
+        {
+            "group_name": "/controls/vehicle",
+            "options": [
+                {
+                    "name": "VehicleCombatHoldToShoot",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "VehicleInverseCameraOnPress",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "VehicleTPPCameraAutoResetTimeV2",
+                    "type": "float",
+                    "value": 3.0,
+                    "default_value": 3.0,
+                    "min_value": 0.1000000014,
+                    "max_value": 10.0,
+                    "step_value": 0.1000000014
+                },
+                {
+                    "name": "VehicleTPPCameraHeight",
+                    "type": "name_list",
+                    "is_dynamic": false,
+                    "value": "Low",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Low",
+                        "High"
+                    ]
+                }
+            ]
+        },
+        {
+            "group_name": "/accessibility/interface",
+            "options": [
+                {
+                    "name": "StyleTheme",
+                    "type": "string_list",
+                    "is_dynamic": true,
+                    "value": "LocKey#17794",
+                    "index": 0
+                },
+                {
+                    "name": "HudScaling",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "LensDistortionOverride",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "PostProcessingReduction",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "FluffReduction",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "BigFont",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "PersistentCenterDot",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                }
+            ]
+        },
+        {
+            "group_name": "/language",
+            "options": [
+                {
+                    "name": "VoiceOver",
+                    "type": "name_list",
+                    "is_dynamic": true,
+                    "value": "en-us",
+                    "index": 0
+                },
+                {
+                    "name": "Subtitles",
+                    "type": "name_list",
+                    "is_dynamic": true,
+                    "value": "en-us",
+                    "index": 1
+                },
+                {
+                    "name": "OnScreen",
+                    "type": "name_list",
+                    "is_dynamic": true,
+                    "value": "en-us",
+                    "index": 1
+                },
+                {
+                    "name": "Platform",
+                    "type": "name_list",
+                    "is_dynamic": true,
+                    "value": "en-us",
+                    "index": 1
+                }
+            ]
+        },
+        {
+            "group_name": "/interface/hudSafezones",
+            "options": [
+                {
+                    "name": "HudSafezoneHor",
+                    "type": "float",
+                    "value": 0.0,
+                    "default_value": 0.0,
+                    "min_value": 0.0,
+                    "max_value": 1.0,
+                    "step_value": 0.0500000007
+                }
+            ]
+        },
+        {
+            "group_name": "/audio/dynamicrange",
+            "options": [
+                {
+                    "name": "SpeakerSetup",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Headphones",
+                    "index": 1,
+                    "default_index": 1,
+                    "values": [
+                        "HomeCinema",
+                        "Headphones",
+                        "TVSpeakers",
+                        "SmallSpeakers",
+                        "BoostLow",
+                        "BoostHigh",
+                        "3DAudioHeadphones"
+                    ]
+                },
+                {
+                    "name": "EnableControllerSpeaker",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                }
+            ]
+        },
+        {
+            "group_name": "/gameplay/performance",
+            "options": [
+                {
+                    "name": "CrowdDensity",
+                    "type": "name_list",
+                    "is_dynamic": false,
+                    "value": "Low",
+                    "index": 0,
+                    "default_index": 2,
+                    "values": [
+                        "Low",
+                        "Medium",
+                        "High"
+                    ]
+                },
+                {
+                    "name": "SlowHDD",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "HDDMode",
+                    "type": "name_list",
+                    "is_dynamic": false,
+                    "value": "Auto",
+                    "index": 2,
+                    "default_index": 2,
+                    "values": [
+                        "Off",
+                        "On",
+                        "Auto"
+                    ]
+                }
+            ]
+        },
+        {
+            "group_name": "/controls/tppcamerapad",
+            "options": [
+                {
+                    "name": "TPP_PadX",
+                    "type": "float",
+                    "value": 10.0,
+                    "default_value": 10.0,
+                    "min_value": 1.0,
+                    "max_value": 100.0,
+                    "step_value": 1.0
+                },
+                {
+                    "name": "TPP_PadInvertX",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "TPP_PadY",
+                    "type": "float",
+                    "value": 10.0,
+                    "default_value": 10.0,
+                    "min_value": 1.0,
+                    "max_value": 100.0,
+                    "step_value": 1.0
+                },
+                {
+                    "name": "TPP_PadInvertY",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "TPP_ResponseCurve",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "CameraMovementA",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "CameraMovementA",
+                        "CameraMovementLinear",
+                        "CameraMovementSensitive",
+                        "CameraMovementDynamic"
+                    ]
+                }
+            ]
+        },
+        {
+            "group_name": "/gameplay/radioport",
+            "options": [
+                {
+                    "name": "radioport_sync_to_car",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "radioport_enable_cycling",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "radioport_save_station",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                }
+            ]
+        },
+        {
+            "group_name": "/graphics/presets",
+            "options": [
+                {
+                    "name": "QuickPresets",
+                    "type": "string_list",
+                    "is_dynamic": true,
+                    "value": "Custom",
+                    "index": 0
+                },
+                {
+                    "name": "ResolutionScaling",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "MetalFX",
+                    "index": 3,
+                    "default_index": 1,
+                    "values": [
+                        "Off",
+                        "FSR2",
+                        "FSR3",
+                        "MetalFX"
+                    ]
+                },
+                {
+                    "name": "FSR2",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Auto",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Auto",
+                        "Quality",
+                        "Balanced",
+                        "Performance",
+                        "Dynamic"
+                    ]
+                },
+                {
+                    "name": "MetalFX",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Performance",
+                    "index": 3,
+                    "default_index": 4,
+                    "values": [
+                        "Auto",
+                        "Quality",
+                        "Balanced",
+                        "Performance",
+                        "Dynamic"
+                    ]
+                },
+                {
+                    "name": "FSR2_Sharpness",
+                    "type": "float",
+                    "value": 0.5,
+                    "default_value": 0.5,
+                    "min_value": 0.0,
+                    "max_value": 1.0,
+                    "step_value": 0.0500000007
+                },
+                {
+                    "name": "MetalFX_Sharpness",
+                    "type": "float",
+                    "value": 0.5,
+                    "default_value": 0.5,
+                    "min_value": 0.0,
+                    "max_value": 1.0,
+                    "step_value": 0.0500000007
+                },
+                {
+                    "name": "FSR3",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Auto",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Auto",
+                        "NativeAA",
+                        "Quality",
+                        "Balanced",
+                        "Performance",
+                        "Dynamic"
+                    ]
+                },
+                {
+                    "name": "FSR3_Sharpness",
+                    "type": "float",
+                    "value": 0.5,
+                    "default_value": 0.5,
+                    "min_value": 0.0,
+                    "max_value": 1.0,
+                    "step_value": 0.0500000007
+                },
+                {
+                    "name": "FSR3_FrameGeneration",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "DynamicResolutionScaling",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "DRS_TargetFPS",
+                    "type": "int",
+                    "value": 30,
+                    "default_value": 30,
+                    "min_value": 10,
+                    "max_value": 240,
+                    "step_value": 1
+                },
+                {
+                    "name": "DRS_MinResolution",
+                    "type": "int",
+                    "value": 50,
+                    "default_value": 50,
+                    "min_value": 50,
+                    "max_value": 100,
+                    "step_value": 1
+                },
+                {
+                    "name": "DRS_MaxResolution",
+                    "type": "int",
+                    "value": 65,
+                    "default_value": 65,
+                    "min_value": 50,
+                    "max_value": 100,
+                    "step_value": 1
+                },
+                {
+                    "name": "FrameGeneration",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Off",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Off",
+                        "FSR3"
+                    ]
+                },
+                {
+                    "name": "TextureQuality",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Low",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Low",
+                        "Medium",
+                        "High"
+                    ]
+                }
+            ]
+        },
+        {
+            "group_name": "/accessibility",
+            "options": [
+                {
+                    "name": "Sieja",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                }
+            ]
+        },
+        {
+            "group_name": "/graphics/raytracing",
+            "options": [
+                {
+                    "name": "RayTracing",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "RayTracedReflections",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "RayTracedSunShadows",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "RayTracedLocalShadows",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "RayTracedLighting",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Off",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Off",
+                        "Medium",
+                        "Ultra",
+                        "Psycho"
+                    ]
+                },
+                {
+                    "name": "RayTracedPathTracing",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "RayTracedPathTracingForPhotoMode",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                }
+            ]
+        },
+        {
+            "group_name": "/controls",
+            "options": [
+                {
+                    "name": "SteeringSensitivity",
+                    "type": "float",
+                    "value": 100.0,
+                    "default_value": 100.0,
+                    "min_value": 1.0,
+                    "max_value": 100.0,
+                    "step_value": 5.0
+                },
+                {
+                    "name": "Axis_DeadzoneInner",
+                    "type": "float",
+                    "value": 0.349999994,
+                    "default_value": 0.349999994,
+                    "min_value": 0.0,
+                    "max_value": 0.4900000095,
+                    "step_value": 0.0099999997
+                },
+                {
+                    "name": "Axis_DeadzoneInnerFix",
+                    "type": "float",
+                    "value": 0.349999994,
+                    "default_value": 0.349999994,
+                    "min_value": 0.0,
+                    "max_value": 0.4900000095,
+                    "step_value": 0.0099999997
+                },
+                {
+                    "name": "Axis_DeadzoneOuter",
+                    "type": "float",
+                    "value": 0.8999999761,
+                    "default_value": 0.8999999761,
+                    "min_value": 0.5,
+                    "max_value": 1.0,
+                    "step_value": 0.0099999997
+                },
+                {
+                    "name": "MovementDodge",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "ToggleAim-Mac",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "ToggleCrouch",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "MagicMouse",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "ToggleAim",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                }
+            ]
+        },
+        {
+            "group_name": "/accessibility/difficulty",
+            "options": [
+                {
+                    "name": "AimAssistance",
+                    "type": "int_list",
+                    "is_dynamic": false,
+                    "value": 2,
+                    "index": 2,
+                    "default_index": 2,
+                    "values": [
+                        0,
+                        1,
+                        2,
+                        3
+                    ]
+                },
+                {
+                    "name": "AimSnap",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "AimAssistanceMelee",
+                    "type": "int_list",
+                    "is_dynamic": false,
+                    "value": 2,
+                    "index": 2,
+                    "default_index": 2,
+                    "values": [
+                        0,
+                        1,
+                        2
+                    ]
+                },
+                {
+                    "name": "AimAssistanceDriverCombatOnOff",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "VehicleAimAssistance",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "AdditiveCameraMovements",
+                    "type": "float_list",
+                    "is_dynamic": false,
+                    "value": 1.0,
+                    "index": 2,
+                    "default_index": 2,
+                    "values": [
+                        0.0,
+                        0.5,
+                        1.0
+                    ]
+                },
+                {
+                    "name": "SwayEffect",
+                    "type": "float_list",
+                    "is_dynamic": false,
+                    "value": 0.0,
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        0.0,
+                        1.0
+                    ]
+                },
+                {
+                    "name": "MinigameTimer",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "GamepadLayout",
+                    "type": "int_list",
+                    "is_dynamic": false,
+                    "value": 0,
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        0,
+                        1,
+                        2,
+                        3
+                    ]
+                }
+            ]
+        },
+        {
+            "group_name": "/brightness",
+            "options": [
+                {
+                    "name": "Brightness",
+                    "type": "int",
+                    "value": 50,
+                    "default_value": 50,
+                    "min_value": 0,
+                    "max_value": 100,
+                    "step_value": 1
+                }
+            ]
+        },
+        {
+            "group_name": "/key_bindings/SettingsLocomotion",
+            "options": [
+                {
+                    "name": "forward",
+                    "type": "name",
+                    "value": "IK_W",
+                    "default_value": "IK_W"
+                },
+                {
+                    "name": "back",
+                    "type": "name",
+                    "value": "IK_S",
+                    "default_value": "IK_S"
+                },
+                {
+                    "name": "left",
+                    "type": "name",
+                    "value": "IK_A",
+                    "default_value": "IK_A"
+                },
+                {
+                    "name": "right",
+                    "type": "name",
+                    "value": "IK_D",
+                    "default_value": "IK_D"
+                },
+                {
+                    "name": "jump",
+                    "type": "name",
+                    "value": "IK_Space",
+                    "default_value": "IK_Space"
+                },
+                {
+                    "name": "sprintHold",
+                    "type": "name",
+                    "value": "IK_RShift",
+                    "default_value": "IK_RShift"
+                },
+                {
+                    "name": "sprintToggle",
+                    "type": "name",
+                    "value": "IK_LShift",
+                    "default_value": "IK_LShift"
+                },
+                {
+                    "name": "walkToggle",
+                    "type": "name",
+                    "value": "IK_G",
+                    "default_value": "IK_G"
+                },
+                {
+                    "name": "crouchHold",
+                    "type": "name",
+                    "value": "IK_RControl",
+                    "default_value": "IK_RControl"
+                },
+                {
+                    "name": "crouchToggle",
+                    "type": "name",
+                    "value": "IK_C",
+                    "default_value": "IK_C"
+                },
+                {
+                    "name": "dodgeDash",
+                    "type": "name",
+                    "value": "IK_LControl",
+                    "default_value": "IK_LControl"
+                },
+                {
+                    "name": "switchItem",
+                    "type": "name",
+                    "value": "IK_Alt",
+                    "default_value": "IK_Alt"
+                },
+                {
+                    "name": "nextWeapon",
+                    "type": "name",
+                    "value": "IK_MouseWheelUp",
+                    "default_value": "IK_MouseWheelUp"
+                },
+                {
+                    "name": "previousWeapon",
+                    "type": "name",
+                    "value": "IK_MouseWheelDown",
+                    "default_value": "IK_MouseWheelDown"
+                },
+                {
+                    "name": "holsterWeapon",
+                    "type": "name",
+                    "value": "IK_B",
+                    "default_value": "IK_B"
+                },
+                {
+                    "name": "weapon1",
+                    "type": "name",
+                    "value": "IK_1",
+                    "default_value": "IK_1"
+                },
+                {
+                    "name": "weapon2",
+                    "type": "name",
+                    "value": "IK_2",
+                    "default_value": "IK_2"
+                },
+                {
+                    "name": "weapon3",
+                    "type": "name",
+                    "value": "IK_3",
+                    "default_value": "IK_3"
+                },
+                {
+                    "name": "weapon4",
+                    "type": "name",
+                    "value": "IK_4",
+                    "default_value": "IK_4"
+                },
+                {
+                    "name": "attack",
+                    "type": "name",
+                    "value": "IK_LeftMouse",
+                    "default_value": "IK_LeftMouse"
+                },
+                {
+                    "name": "aim",
+                    "type": "name",
+                    "value": "IK_RightMouse",
+                    "default_value": "IK_RightMouse"
+                },
+                {
+                    "name": "quickmelee",
+                    "type": "name",
+                    "value": "IK_Q",
+                    "default_value": "IK_Q"
+                },
+                {
+                    "name": "dropCarriedObject",
+                    "type": "name",
+                    "value": "IK_Q",
+                    "default_value": "IK_Q"
+                },
+                {
+                    "name": "reload",
+                    "type": "name",
+                    "value": "IK_R",
+                    "default_value": "IK_R"
+                },
+                {
+                    "name": "iconic",
+                    "type": "name",
+                    "value": "IK_E",
+                    "default_value": "IK_E"
+                },
+                {
+                    "name": "combatGadget",
+                    "type": "name",
+                    "value": "IK_MiddleMouse",
+                    "default_value": "IK_MiddleMouse"
+                },
+                {
+                    "name": "useConsumable",
+                    "type": "name",
+                    "value": "IK_X",
+                    "default_value": "IK_X"
+                },
+                {
+                    "name": "visionHold",
+                    "type": "name",
+                    "value": "IK_Tab",
+                    "default_value": "IK_Tab"
+                },
+                {
+                    "name": "visionToggle",
+                    "type": "name",
+                    "value": "IK_CapsLock",
+                    "default_value": "IK_CapsLock"
+                },
+                {
+                    "name": "openPhone",
+                    "type": "name",
+                    "value": "IK_T",
+                    "default_value": "IK_T"
+                },
+                {
+                    "name": "pocketRadio",
+                    "type": "name",
+                    "value": "IK_Z",
+                    "default_value": "IK_Z"
+                },
+                {
+                    "name": "openNotifiation",
+                    "type": "name",
+                    "value": "IK_T",
+                    "default_value": "IK_T"
+                },
+                {
+                    "name": "fastForward",
+                    "type": "name",
+                    "value": "IK_Y",
+                    "default_value": "IK_Y"
+                },
+                {
+                    "name": "photoMode",
+                    "type": "name",
+                    "value": "IK_N",
+                    "default_value": "IK_N"
+                },
+                {
+                    "name": "hub",
+                    "type": "name",
+                    "value": "IK_H",
+                    "default_value": "IK_H"
+                },
+                {
+                    "name": "map",
+                    "type": "name",
+                    "value": "IK_M",
+                    "default_value": "IK_M"
+                },
+                {
+                    "name": "journal",
+                    "type": "name",
+                    "value": "IK_J",
+                    "default_value": "IK_J"
+                },
+                {
+                    "name": "perks",
+                    "type": "name",
+                    "value": "IK_P",
+                    "default_value": "IK_P"
+                },
+                {
+                    "name": "crafting",
+                    "type": "name",
+                    "value": "IK_K",
+                    "default_value": "IK_K"
+                },
+                {
+                    "name": "inventory",
+                    "type": "name",
+                    "value": "IK_I",
+                    "default_value": "IK_I"
+                },
+                {
+                    "name": "selectChoice",
+                    "type": "name",
+                    "value": "IK_F",
+                    "default_value": "IK_F"
+                }
+            ]
+        },
+        {
+            "group_name": "/gallery/favorites",
+            "options": [
+                {
+                    "name": "GalleryFavorites",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        ""
+                    ]
+                }
+            ]
+        },
+        {
+            "group_name": "/controls/fppcamerapad",
+            "options": [
+                {
+                    "name": "FPP_PadX",
+                    "type": "float",
+                    "value": 18.0,
+                    "default_value": 18.0,
+                    "min_value": 1.0,
+                    "max_value": 100.0,
+                    "step_value": 1.0
+                },
+                {
+                    "name": "FPP_PadInvertX",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "FPP_PadY",
+                    "type": "float",
+                    "value": 10.0,
+                    "default_value": 10.0,
+                    "min_value": 1.0,
+                    "max_value": 100.0,
+                    "step_value": 1.0
+                },
+                {
+                    "name": "FPP_PadInvertY",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "FPP_PadZoomFactor",
+                    "type": "float",
+                    "value": 2.0,
+                    "default_value": 2.0,
+                    "min_value": 0.0,
+                    "max_value": 4.0,
+                    "step_value": 0.0500000007
+                },
+                {
+                    "name": "FPP_AdvancedOptions",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "FPP_ResponseCurve",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "CameraMovementA",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "CameraMovementA",
+                        "CameraMovementLinear",
+                        "CameraMovementSensitive",
+                        "CameraMovementDynamic"
+                    ]
+                },
+                {
+                    "name": "FPP_TurningX",
+                    "type": "float",
+                    "value": 0.5,
+                    "default_value": 0.5,
+                    "min_value": 0.0,
+                    "max_value": 3.0,
+                    "step_value": 0.1000000014
+                },
+                {
+                    "name": "FPP_TurningY",
+                    "type": "float",
+                    "value": 0.2000000029,
+                    "default_value": 0.2000000029,
+                    "min_value": 0.0,
+                    "max_value": 3.0,
+                    "step_value": 0.1000000014
+                },
+                {
+                    "name": "FPP_TurningTime",
+                    "type": "float",
+                    "value": 0.0,
+                    "default_value": 0.0,
+                    "min_value": 0.0,
+                    "max_value": 1.0,
+                    "step_value": 0.1000000014
+                },
+                {
+                    "name": "FPP_TurningDelay",
+                    "type": "float",
+                    "value": 0.0,
+                    "default_value": 0.0,
+                    "min_value": 0.0,
+                    "max_value": 1.0,
+                    "step_value": 0.1000000014
+                },
+                {
+                    "name": "FPP_ADSTurningX",
+                    "type": "float",
+                    "value": 0.5,
+                    "default_value": 0.5,
+                    "min_value": 0.0,
+                    "max_value": 2.0,
+                    "step_value": 0.1000000014
+                },
+                {
+                    "name": "FPP_ADSTurningY",
+                    "type": "float",
+                    "value": 0.2000000029,
+                    "default_value": 0.2000000029,
+                    "min_value": 0.0,
+                    "max_value": 2.0,
+                    "step_value": 0.1000000014
+                },
+                {
+                    "name": "FPP_ADSTurningTime",
+                    "type": "float",
+                    "value": 0.0,
+                    "default_value": 0.0,
+                    "min_value": 0.0,
+                    "max_value": 1.0,
+                    "step_value": 0.1000000014
+                },
+                {
+                    "name": "FPP_ADSTurningDelay",
+                    "type": "float",
+                    "value": 0.0,
+                    "default_value": 0.0,
+                    "min_value": 0.0,
+                    "max_value": 1.0,
+                    "step_value": 0.1000000014
+                }
+            ]
+        },
+        {
+            "group_name": "/gameplay/difficulty",
+            "options": [
+                {
+                    "name": "GameDifficulty",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Story",
+                    "index": 0,
+                    "default_index": 2,
+                    "values": [
+                        "Story",
+                        "Easy",
+                        "Hard",
+                        "VeryHard"
+                    ]
+                }
+            ]
+        },
+        {
+            "group_name": "/gameplay/misc",
+            "options": [
+                {
+                    "name": "Tutorials",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "FastForward",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Line",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Line",
+                        "Cont"
+                    ]
+                },
+                {
+                    "name": "OpeningCinematic",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "CensorNudity",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "EnableCloudSaves",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "EnableTelemetry",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "QuickMapFilter",
+                    "type": "int",
+                    "value": 6,
+                    "default_value": 6,
+                    "min_value": 0,
+                    "max_value": 16,
+                    "step_value": 1
+                },
+                {
+                    "name": "CustomMapFilter",
+                    "type": "int",
+                    "value": 0,
+                    "default_value": 0,
+                    "min_value": 0,
+                    "max_value": 10000000,
+                    "step_value": 1
+                },
+                {
+                    "name": "CensorRegion",
+                    "type": "name",
+                    "value": "None",
+                    "default_value": "None"
+                }
+            ]
+        },
+        {
+            "group_name": "/key_bindings/SettingsGeneral",
+            "options": [
+                {
+                    "name": "zoomIn",
+                    "type": "name",
+                    "value": "IK_MouseWheelUp",
+                    "default_value": "IK_MouseWheelUp"
+                },
+                {
+                    "name": "zoomOut",
+                    "type": "name",
+                    "value": "IK_MouseWheelDown",
+                    "default_value": "IK_MouseWheelDown"
+                },
+                {
+                    "name": "tag",
+                    "type": "name",
+                    "value": "IK_MiddleMouse",
+                    "default_value": "IK_MiddleMouse"
+                },
+                {
+                    "name": "quickSave",
+                    "type": "name",
+                    "value": "IK_F5",
+                    "default_value": "IK_F5"
+                },
+                {
+                    "name": "quickLoad",
+                    "type": "name",
+                    "value": "IK_F9",
+                    "default_value": "IK_F9"
+                }
+            ]
+        },
+        {
+            "group_name": "/key_bindings/SettingsBraindance",
+            "options": [
+                {
+                    "name": "braindancePause",
+                    "type": "name",
+                    "value": "IK_Space",
+                    "default_value": "IK_Space"
+                },
+                {
+                    "name": "braindanceForward",
+                    "type": "name",
+                    "value": "IK_E",
+                    "default_value": "IK_E"
+                },
+                {
+                    "name": "braindanceBackward",
+                    "type": "name",
+                    "value": "IK_Q",
+                    "default_value": "IK_Q"
+                },
+                {
+                    "name": "braindanceLayer",
+                    "type": "name",
+                    "value": "IK_LShift",
+                    "default_value": "IK_LShift"
+                },
+                {
+                    "name": "braindanceMode",
+                    "type": "name",
+                    "value": "IK_Tab",
+                    "default_value": "IK_Tab"
+                },
+                {
+                    "name": "braindanceRestart",
+                    "type": "name",
+                    "value": "IK_R",
+                    "default_value": "IK_R"
+                },
+                {
+                    "name": "braindanceExit",
+                    "type": "name",
+                    "value": "IK_X",
+                    "default_value": "IK_X"
+                }
+            ]
+        },
+        {
+            "group_name": "/video/display",
+            "options": [
+                {
+                    "name": "OutputMonitor",
+                    "type": "int_list",
+                    "is_dynamic": true,
+                    "value": 1,
+                    "index": 0
+                },
+                {
+                    "name": "VSync",
+                    "type": "string_list",
+                    "is_dynamic": true,
+                    "value": "30",
+                    "index": 4
+                },
+                {
+                    "name": "MaximumFPS_OnOff",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": false
+                },
+                {
+                    "name": "MaximumFPS_Value",
+                    "type": "int",
+                    "value": 30,
+                    "default_value": 30,
+                    "min_value": 10,
+                    "max_value": 240,
+                    "step_value": 1
+                },
+                {
+                    "name": "WindowMode",
+                    "type": "string_list",
+                    "is_dynamic": true,
+                    "value": "Fullscreen",
+                    "index": 1
+                },
+                {
+                    "name": "Resolution",
+                    "type": "string_list",
+                    "is_dynamic": true,
+                    "value": "1434x660",
+                    "index": 0
+                },
+                {
+                    "name": "HDRModes",
+                    "type": "string_list",
+                    "is_dynamic": true,
+                    "value": "None",
+                    "index": 0
+                },
+                {
+                    "name": "TonemappingMidpoint",
+                    "type": "float",
+                    "value": 2.0,
+                    "default_value": 2.0,
+                    "min_value": 0.1000000014,
+                    "max_value": 3.0,
+                    "step_value": 0.1000000014
+                },
+                {
+                    "name": "MaxMonitorBrightness",
+                    "type": "float",
+                    "value": 100.0,
+                    "default_value": 500.0,
+                    "min_value": 300.0,
+                    "max_value": 3000.0,
+                    "step_value": 10.0
+                },
+                {
+                    "name": "HDR10PlusGaming",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "PaperWhiteLevel",
+                    "type": "float",
+                    "value": 100.0,
+                    "default_value": 300.0,
+                    "min_value": 100.0,
+                    "max_value": 500.0,
+                    "step_value": 10.0
+                },
+                {
+                    "name": "Saturation",
+                    "type": "float",
+                    "value": 0.0,
+                    "default_value": 0.0,
+                    "min_value": 0.0,
+                    "max_value": 1.0,
+                    "step_value": 0.0099999997
+                },
+                {
+                    "name": "Gamma",
+                    "type": "float",
+                    "value": 1.0,
+                    "default_value": 1.0,
+                    "min_value": 0.5,
+                    "max_value": 2.0,
+                    "step_value": 0.0099999997
+                }
+            ]
+        },
+        {
+            "group_name": "/gameplay/hud",
+            "options": [
+                {
+                    "name": "HudScaling",
+                    "type": "int",
+                    "value": 100,
+                    "default_value": 100,
+                    "min_value": 0,
+                    "max_value": 125,
+                    "step_value": 1
+                },
+                {
+                    "name": "AutosaveInterval",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Every 5 minutes",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Every 5 minutes",
+                        "Every 10 minutes",
+                        "Every 30 minutes"
+                    ]
+                }
+            ]
+        },
+        {
+            "group_name": "/controls/controller",
+            "options": [
+                {
+                    "name": "InputSchemesMode",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "UI-Settings-Interface-InputSchemeAlternative",
+                    "index": 2,
+                    "default_index": 2,
+                    "values": [
+                        "UI-Settings-Interface-InputSchemeLegacy",
+                        "UI-Settings-Interface-InputSchemeAgile",
+                        "UI-Settings-Interface-InputSchemeAlternative"
+                    ]
+                }
+            ]
+        },
+        {
+            "group_name": "/graphics/advanced",
+            "options": [
+                {
+                    "name": "ContactShadows",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": true
+                },
+                {
+                    "name": "FacialTangentUpdates",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": true
+                },
+                {
+                    "name": "Anisotropy",
+                    "type": "int_list",
+                    "is_dynamic": false,
+                    "value": 1,
+                    "index": 0,
+                    "default_index": 1,
+                    "values": [
+                        1,
+                        4,
+                        8,
+                        16
+                    ]
+                },
+                {
+                    "name": "ShadowMeshQuality",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Low",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Low",
+                        "Medium",
+                        "High"
+                    ]
+                },
+                {
+                    "name": "LocalShadowsQuality",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Off",
+                    "index": 0,
+                    "default_index": 1,
+                    "values": [
+                        "Off",
+                        "Low",
+                        "Medium",
+                        "High"
+                    ]
+                },
+                {
+                    "name": "CascadedShadowsRange",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Low",
+                    "index": 0,
+                    "default_index": 1,
+                    "values": [
+                        "Low",
+                        "Medium",
+                        "High"
+                    ]
+                },
+                {
+                    "name": "CascadedShadowsResolution",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Low",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Low",
+                        "Medium",
+                        "High"
+                    ]
+                },
+                {
+                    "name": "DistantShadowsResolution",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Low",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Low",
+                        "High"
+                    ]
+                },
+                {
+                    "name": "VolumetricFogResolution",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Low",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Low",
+                        "Medium",
+                        "High",
+                        "Ultra"
+                    ]
+                },
+                {
+                    "name": "VolumetricCloudsQuality",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Off",
+                    "index": 0,
+                    "default_index": 1,
+                    "values": [
+                        "Off",
+                        "Medium",
+                        "High",
+                        "Ultra"
+                    ]
+                },
+                {
+                    "name": "MaxDynamicDecals",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Low",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Low",
+                        "Medium",
+                        "High",
+                        "Ultra"
+                    ]
+                },
+                {
+                    "name": "ScreenSpaceReflectionsQuality",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Off",
+                    "index": 0,
+                    "default_index": 1,
+                    "values": [
+                        "Off",
+                        "Low",
+                        "Medium",
+                        "High",
+                        "Ultra",
+                        "Insane"
+                    ]
+                },
+                {
+                    "name": "SubsurfaceScatteringQuality",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Low",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Low",
+                        "Medium",
+                        "High"
+                    ]
+                },
+                {
+                    "name": "AmbientOcclusion",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Off",
+                    "index": 0,
+                    "default_index": 1,
+                    "values": [
+                        "Off",
+                        "Low",
+                        "Medium",
+                        "High"
+                    ]
+                },
+                {
+                    "name": "ColorPrecision",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Medium",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Medium",
+                        "High"
+                    ]
+                },
+                {
+                    "name": "GlobaIlluminationRange",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "High",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "High",
+                        "Ultra"
+                    ]
+                },
+                {
+                    "name": "MirrorQuality",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Low",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Low",
+                        "Medium",
+                        "High"
+                    ]
+                },
+                {
+                    "name": "LODPreset",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Low",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Low",
+                        "Medium",
+                        "High"
+                    ]
+                },
+                {
+                    "name": "AntiAliasing",
+                    "type": "string_list",
+                    "is_dynamic": true,
+                    "value": "",
+                    "index": -1
+                }
+            ]
+        },
+        {
+            "group_name": "/gameplay/dlcContent",
+            "options": [
+                {
+                    "name": "JohnnySilverhandAltApp",
+                    "type": "int_list",
+                    "is_dynamic": false,
+                    "value": 0,
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        0,
+                        1
+                    ]
+                }
+            ]
+        },
+        {
+            "group_name": "/graphics/performance",
+            "options": [
+                {
+                    "name": "CrowdDensity",
+                    "type": "name_list",
+                    "is_dynamic": false,
+                    "value": "Low",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "Low",
+                        "Medium",
+                        "High"
+                    ]
+                }
+            ]
+        },
+        {
+            "group_name": "/interface",
+            "options": [
+                {
+                    "name": "DamageDigitsMode",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "UI-Settings-Interface-DamageNumbers-Mode4",
+                    "index": 3,
+                    "default_index": 3,
+                    "values": [
+                        "UI-Settings-Interface-DamageNumbers-Mode1",
+                        "UI-Settings-Interface-DamageNumbers-Mode2",
+                        "UI-Settings-Interface-DamageNumbers-Mode3",
+                        "UI-Settings-Interface-DamageNumbers-Mode4"
+                    ]
+                },
+                {
+                    "name": "DamageDigitsStickingMode",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "UI-Settings-Interface-DamageNumbers-StickingMode1",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "UI-Settings-Interface-DamageNumbers-StickingMode1",
+                        "UI-Settings-Interface-DamageNumbers-StickingMode2",
+                        "UI-Settings-Interface-DamageNumbers-StickingMode3",
+                        "UI-Settings-Interface-DamageNumbers-StickingMode4"
+                    ]
+                },
+                {
+                    "name": "DamageDigitsInterpolation",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "HitIndicator",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "DamageIndicatorMode",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "UI-Settings-Interface-DamageIndicator-Mode3",
+                    "index": 2,
+                    "default_index": 2,
+                    "values": [
+                        "UI-Settings-Interface-DamageIndicator-Mode1",
+                        "UI-Settings-Interface-DamageIndicator-Mode2",
+                        "UI-Settings-Interface-DamageIndicator-Mode3"
+                    ]
+                },
+                {
+                    "name": "CenterStamina",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "CrowdsOnMinimap",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "SpeedometerUnits",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "UI-Settings-UnitImperial",
+                    "index": 1,
+                    "default_index": 1,
+                    "values": [
+                        "UI-Settings-UnitMetric",
+                        "UI-Settings-UnitImperial"
+                    ]
+                }
+            ]
+        },
+        {
+            "group_name": "/ui_to_remove",
+            "options": [
+                {
+                    "name": "PadPointerShowHoweredWidget",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "PadPointerAxisesDiff",
+                    "type": "float",
+                    "value": 0.699999988,
+                    "default_value": 0.699999988,
+                    "min_value": 0.0,
+                    "max_value": 1.0,
+                    "step_value": 0.0500000007
+                },
+                {
+                    "name": "PadPointerSnapSpeed",
+                    "type": "float",
+                    "value": 0.6000000238,
+                    "default_value": 0.6000000238,
+                    "min_value": 0.0,
+                    "max_value": 1.0,
+                    "step_value": 0.0500000007
+                },
+                {
+                    "name": "PadPointerMagnetismTime",
+                    "type": "float",
+                    "value": 0.699999988,
+                    "default_value": 0.699999988,
+                    "min_value": 0.0,
+                    "max_value": 1.0,
+                    "step_value": 0.0500000007
+                },
+                {
+                    "name": "PadPointerLeaveMinMult",
+                    "type": "float",
+                    "value": 0.699999988,
+                    "default_value": 0.699999988,
+                    "min_value": 0.0,
+                    "max_value": 1.0,
+                    "step_value": 0.0500000007
+                },
+                {
+                    "name": "PadPointerDeceleration",
+                    "type": "float",
+                    "value": 2000.0,
+                    "default_value": 2000.0,
+                    "min_value": 50.0,
+                    "max_value": 10000.0,
+                    "step_value": 50.0
+                },
+                {
+                    "name": "PadPointerOnLeaveAcceleration",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "PadPointerSpeedMin",
+                    "type": "float",
+                    "value": 1500.0,
+                    "default_value": 1500.0,
+                    "min_value": 50.0,
+                    "max_value": 5000.0,
+                    "step_value": 50.0
+                },
+                {
+                    "name": "PadPointerOnEnterDeceleration",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "PadPointerInteractionAcceleration",
+                    "type": "float",
+                    "value": 3350.0,
+                    "default_value": 3350.0,
+                    "min_value": 50.0,
+                    "max_value": 5000.0,
+                    "step_value": 50.0
+                },
+                {
+                    "name": "PadPointerInteractionSpeedMax",
+                    "type": "float",
+                    "value": 3000.0,
+                    "default_value": 3000.0,
+                    "min_value": 50.0,
+                    "max_value": 5000.0,
+                    "step_value": 50.0
+                },
+                {
+                    "name": "PadVibration",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "PadPointerProcessingType",
+                    "type": "int",
+                    "value": 1,
+                    "default_value": 1,
+                    "min_value": 0,
+                    "max_value": 4,
+                    "step_value": 1
+                },
+                {
+                    "name": "PadPointerAccelereation",
+                    "type": "float",
+                    "value": 2500.0,
+                    "default_value": 2500.0,
+                    "min_value": 50.0,
+                    "max_value": 5000.0,
+                    "step_value": 50.0
+                },
+                {
+                    "name": "PadPointerInteractionSpeedMin",
+                    "type": "float",
+                    "value": 700.0,
+                    "default_value": 700.0,
+                    "min_value": 50.0,
+                    "max_value": 5000.0,
+                    "step_value": 50.0
+                },
+                {
+                    "name": "PadPointerLeaveMaxMult",
+                    "type": "float",
+                    "value": 0.75,
+                    "default_value": 0.75,
+                    "min_value": 0.0,
+                    "max_value": 1.0,
+                    "step_value": 0.0500000007
+                },
+                {
+                    "name": "PadPointerSpeedMax",
+                    "type": "float",
+                    "value": 3000.0,
+                    "default_value": 3000.0,
+                    "min_value": 50.0,
+                    "max_value": 5000.0,
+                    "step_value": 50.0
+                }
+            ]
+        },
+        {
+            "group_name": "/interface/hud",
+            "options": [
+                {
+                    "name": "hud_presets",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "WholeHUDVisible",
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        "WholeHUDVisible",
+                        "WholeHUDHidden",
+                        "Custom"
+                    ]
+                },
+                {
+                    "name": "minimap",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "healthbar",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "stamina_oxygen",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "npc_healthbar",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "ammo_counter",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "input_hints",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "action_buttons",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "activity_log",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "crosshairs",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "quest_tracker",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "johnny_hud",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "object_markers",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "npc_names",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "wanted_level",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "npc_nameplates",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "crouch_indicator",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "vehicle_hud",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "hud_markers",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                }
+            ]
+        },
+        {
+            "group_name": "/key_bindings/SettingsUI",
+            "options": [
+                {
+                    "name": "quickhackInfo",
+                    "type": "name",
+                    "value": "IK_Z",
+                    "default_value": "IK_Z"
+                },
+                {
+                    "name": "selectChoiceUI",
+                    "type": "name",
+                    "value": "IK_F",
+                    "default_value": "IK_F"
+                },
+                {
+                    "name": "secondaryChoiceUI",
+                    "type": "name",
+                    "value": "IK_R",
+                    "default_value": "IK_R"
+                },
+                {
+                    "name": "prevItem",
+                    "type": "name",
+                    "value": "IK_1",
+                    "default_value": "IK_1"
+                },
+                {
+                    "name": "nextItem",
+                    "type": "name",
+                    "value": "IK_3",
+                    "default_value": "IK_3"
+                },
+                {
+                    "name": "prevItemSecondary",
+                    "type": "name",
+                    "value": "IK_W",
+                    "default_value": "IK_W"
+                },
+                {
+                    "name": "nextItemSecondary",
+                    "type": "name",
+                    "value": "IK_S",
+                    "default_value": "IK_S"
+                },
+                {
+                    "name": "previousOption",
+                    "type": "name",
+                    "value": "IK_A",
+                    "default_value": "IK_A"
+                },
+                {
+                    "name": "nextOption",
+                    "type": "name",
+                    "value": "IK_D",
+                    "default_value": "IK_D"
+                },
+                {
+                    "name": "selectUp",
+                    "type": "name",
+                    "value": "IK_Q",
+                    "default_value": "IK_Q"
+                },
+                {
+                    "name": "selectDown",
+                    "type": "name",
+                    "value": "IK_E",
+                    "default_value": "IK_E"
+                },
+                {
+                    "name": "selectUpSecondary",
+                    "type": "name",
+                    "value": "IK_Up",
+                    "default_value": "IK_Up"
+                },
+                {
+                    "name": "selectDownSecondary",
+                    "type": "name",
+                    "value": "IK_Down",
+                    "default_value": "IK_Down"
+                },
+                {
+                    "name": "selectLeftSecondary",
+                    "type": "name",
+                    "value": "IK_Left",
+                    "default_value": "IK_Left"
+                },
+                {
+                    "name": "selectRightSecondary",
+                    "type": "name",
+                    "value": "IK_Right",
+                    "default_value": "IK_Right"
+                }
+            ]
+        },
+        {
+            "group_name": "/audio/misc",
+            "options": [
+                {
+                    "name": "MuteDetectionUISounds",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "StreamerMode",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "NoSpatialAudio",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "UseXAudio",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "HeadTracking",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "MuteInBackground",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                }
+            ]
+        },
+        {
+            "group_name": "/accessibility/subtitles",
+            "options": [
+                {
+                    "name": "Cinematic",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "Radio",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "CinematicForceKiroshiTexts",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "TextSize",
+                    "type": "int_list",
+                    "is_dynamic": false,
+                    "value": 52,
+                    "index": 2,
+                    "default_index": 2,
+                    "values": [
+                        32,
+                        42,
+                        52,
+                        58,
+                        60,
+                        62
+                    ]
+                },
+                {
+                    "name": "Overheads",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "OverheadsForceKiroshiTexts",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "ChattersTextSize",
+                    "type": "int_list",
+                    "is_dynamic": false,
+                    "value": 32,
+                    "index": 0,
+                    "default_index": 0,
+                    "values": [
+                        32,
+                        36,
+                        42,
+                        56,
+                        62
+                    ]
+                },
+                {
+                    "name": "BackgroundOpacity",
+                    "type": "float",
+                    "value": 30.0,
+                    "default_value": 30.0,
+                    "min_value": 0.0,
+                    "max_value": 100.0,
+                    "step_value": 10.0
+                }
+            ]
+        },
+        {
+            "group_name": "/graphics/basic",
+            "options": [
+                {
+                    "name": "FieldOfView",
+                    "type": "float",
+                    "value": 80.0,
+                    "default_value": 80.0,
+                    "min_value": 70.0,
+                    "max_value": 100.0,
+                    "step_value": 5.0
+                },
+                {
+                    "name": "FilmGrain",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "ChromaticAberration",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "DepthOfField",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                },
+                {
+                    "name": "LensFlares",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": true
+                },
+                {
+                    "name": "MotionBlur",
+                    "type": "string_list",
+                    "is_dynamic": false,
+                    "value": "Off",
+                    "index": 0,
+                    "default_index": 1,
+                    "values": [
+                        "Off",
+                        "Low",
+                        "High"
+                    ]
+                },
+                {
+                    "name": "Vignette",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                }
+            ]
+        },
+        {
+            "group_name": "/gameplay/muteholocalls",
+            "options": [
+                {
+                    "name": "ncpd_dispatcher",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "fixer_briefs_and_debriefs",
+                    "type": "bool",
+                    "value": false,
+                    "default_value": false
+                }
+            ]
+        },
+        {
+            "group_name": "/key_bindings/SettingsVehicle",
+            "options": [
+                {
+                    "name": "vehicleAccelerate",
+                    "type": "name",
+                    "value": "IK_W",
+                    "default_value": "IK_W"
+                },
+                {
+                    "name": "vehicleDecelrate",
+                    "type": "name",
+                    "value": "IK_S",
+                    "default_value": "IK_S"
+                },
+                {
+                    "name": "vehicleSteerLeft",
+                    "type": "name",
+                    "value": "IK_A",
+                    "default_value": "IK_A"
+                },
+                {
+                    "name": "vehicleSteerRight",
+                    "type": "name",
+                    "value": "IK_D",
+                    "default_value": "IK_D"
+                },
+                {
+                    "name": "vehicleAccelerate2",
+                    "type": "name",
+                    "value": "IK_Up",
+                    "default_value": "IK_Up"
+                },
+                {
+                    "name": "vehicleDecelerate2",
+                    "type": "name",
+                    "value": "IK_Down",
+                    "default_value": "IK_Down"
+                },
+                {
+                    "name": "vehicleSteerLeft2",
+                    "type": "name",
+                    "value": "IK_Left",
+                    "default_value": "IK_Left"
+                },
+                {
+                    "name": "vehicleSteerRight2",
+                    "type": "name",
+                    "value": "IK_Right",
+                    "default_value": "IK_Right"
+                },
+                {
+                    "name": "vehicleLeanForward",
+                    "type": "name",
+                    "value": "IK_LShift",
+                    "default_value": "IK_LShift"
+                },
+                {
+                    "name": "vehicleLeanBackward",
+                    "type": "name",
+                    "value": "IK_LControl",
+                    "default_value": "IK_LControl"
+                },
+                {
+                    "name": "vehicleToggleCam",
+                    "type": "name",
+                    "value": "IK_Q",
+                    "default_value": "IK_Q"
+                },
+                {
+                    "name": "vehicleReverseCam",
+                    "type": "name",
+                    "value": "IK_MiddleMouse",
+                    "default_value": "IK_MiddleMouse"
+                },
+                {
+                    "name": "vehicleCameraReset",
+                    "type": "name",
+                    "value": "IK_C",
+                    "default_value": "IK_C"
+                },
+                {
+                    "name": "exitVehicle",
+                    "type": "name",
+                    "value": "IK_F",
+                    "default_value": "IK_F"
+                },
+                {
+                    "name": "vehicleCycleLights",
+                    "type": "name",
+                    "value": "IK_V",
+                    "default_value": "IK_V"
+                },
+                {
+                    "name": "vehicleHandbrake",
+                    "type": "name",
+                    "value": "IK_Space",
+                    "default_value": "IK_Space"
+                },
+                {
+                    "name": "vehicleHorn",
+                    "type": "name",
+                    "value": "IK_Z",
+                    "default_value": "IK_Z"
+                },
+                {
+                    "name": "radio",
+                    "type": "name",
+                    "value": "IK_R",
+                    "default_value": "IK_R"
+                },
+                {
+                    "name": "vehicleShootPrimary",
+                    "type": "name",
+                    "value": "IK_LeftMouse",
+                    "default_value": "IK_LeftMouse"
+                },
+                {
+                    "name": "vehicleShootSecondary",
+                    "type": "name",
+                    "value": "IK_RightMouse",
+                    "default_value": "IK_RightMouse"
+                },
+                {
+                    "name": "vehicleShootTertiary",
+                    "type": "name",
+                    "value": "IK_LControl",
+                    "default_value": "IK_LControl"
+                },
+                {
+                    "name": "callVehicle",
+                    "type": "name",
+                    "value": "IK_V",
+                    "default_value": "IK_V"
+                },
+                {
+                    "name": "crystalCoat",
+                    "type": "name",
+                    "value": "IK_Y",
+                    "default_value": "IK_Y"
+                },
+                {
+                    "name": "vehicleAutodrive",
+                    "type": "name",
+                    "value": "IK_G",
+                    "default_value": "IK_G"
+                }
+            ]
+        },
+        {
+            "group_name": "/accessibility/controls",
+            "options": [
+                {
+                    "name": "PadVibration",
+                    "type": "int",
+                    "value": 100,
+                    "default_value": 100,
+                    "min_value": 0,
+                    "max_value": 100,
+                    "step_value": 10
+                },
+                {
+                    "name": "AdaptiveTriggersIntensity",
+                    "type": "float",
+                    "value": 1.0,
+                    "default_value": 1.0,
+                    "min_value": 0.2000000029,
+                    "max_value": 1.0,
+                    "step_value": 0.0099999997
+                },
+                {
+                    "name": "EnableAdaptiveTriggerEffects",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "UIControllerVibrations",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                },
+                {
+                    "name": "AllowCycleToFistCyberware",
+                    "type": "bool",
+                    "value": true,
+                    "default_value": true
+                }
+            ]
+        }
+    ]
+}
