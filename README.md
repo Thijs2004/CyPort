@@ -64,7 +64,7 @@ M-series iPads have more RAM and better cooling and should run it as well or bet
    **Increased Memory Limit**, register your device, and download a *development* provisioning profile for it.
 2. **Build** on the Mac:
    ```bash
-   git clone https://github.com/<you>/CyPort && cd CyPort
+   git clone https://github.com/Thijs2004/CyPort && cd CyPort
    REBUILD_SHIM=1 \
    GAME_APP="/path/to/Cyberpunk 2077/Cyberpunk2077.app" \
    BUNDLE_ID=com.yourname.cyport \
