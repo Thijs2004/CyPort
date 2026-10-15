@@ -55,7 +55,7 @@ M-series iPads have more RAM and better cooling and should run it as well or bet
     A newer game version will need updated patches.
 - An **Apple account to sign it with**:
   - **Paid Apple Developer account** ($99/year) – recommended: gives both *Increased Memory Limit* and *Extended Virtual Address Space*.
-  - **Free Apple ID** with SideStore or LiveContainer – works with **GetMoreRam** for the memory limit (see [Free Apple ID](#free-apple-id-sidestore--livecontainer)).
+  - **Free Apple ID** with SideStore (LiveContainer *maybe* – untested) – works with **GetMoreRam** for the memory limit (see [Free Apple ID](#free-apple-id-sidestore--livecontainer)).
     Extended virtual addressing is paid-only; without it CyPort packs the engine's memory pools into the normal address space
     (**experimental**). The increased memory limit is **required** either way – the game uses ~5 GB.
 
@@ -97,7 +97,7 @@ A free account can't turn on *Increased Memory Limit* by itself, and SideStore n
 2. Install GetMoreRam, sign in with the **same** Apple ID → refresh App IDs → pick CyPort's App ID → **Add Increased Memory Limit**.
 3. Back in SideStore: **reinstall** CyPort (or refresh it), so it fetches a new profile that has the capability.
 
-**LiveContainer**
+**LiveContainer** *(maybe – not tested yet; reports welcome)*
 The game runs *inside* LiveContainer's process, so LiveContainer itself needs the capability (it already asks for it):
 1. In GetMoreRam pick **LiveContainer's** App ID (with SideStore's built-in LiveContainer: that one) → **Add Increased Memory Limit**.
 2. Refresh/reinstall LiveContainer in SideStore.

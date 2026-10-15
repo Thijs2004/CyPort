@@ -6,3 +6,4 @@ Payload/
 *.dSYM
 .DS_Store
 *.bak*
+build-signed/
