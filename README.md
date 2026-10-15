@@ -19,6 +19,7 @@ No emulation, no streaming: the Apple Silicon Mac build runs directly on iOS / i
 | On-screen controls (virtual gamepad + touch-as-mouse in menus) | ✅ works |
 | Bluetooth / MFi controllers (Xbox, DualSense, DualShock 4) | ✅ works, on-screen pad hides automatically |
 | Resolution picker up to native (2868 × 1320 on iPhone 16 Pro Max) | ✅ works |
+| AirPlay screen mirroring / USB-C → HDMI to a TV (game on the TV, phone as controller) | ✅ new |
 | Performance | ⚠️ ~30–60 FPS at 1434 × 660 with low settings + MetalFX on an iPhone 16 Pro Max; the phone gets hot and throttles in long sessions |
 | Cloud saves (GOG, Steam, Epic) – carry on where you left off on your PC/Mac and back | 🧪 new: GOG download tested, sending and Steam/Epic untested |
 | Download the game data in the app (Steam, GOG, Epic account) | 🧪 new: untested with signed-in accounts |
@@ -119,6 +120,7 @@ M-series iPads have more RAM and better cooling and should run it as well or bet
 | `TouchControls` = NO / `VirtualController` = NO | no on-screen controls / keyboard-only pad |
 | `ShowStatus` = NO | no loading / FPS overlay at all |
 | `YieldBackoff` = NO, `BackgroundFreeze` = NO, `RestartPopup` = NO | turn individual fixes off |
+| `TVOut` = NO / `TVShape` = NO | keep the game on the phone with a TV connected / keep the phone's shape on the TV |
 | `RealtimeThreads` = YES | keep the Mac's real-time scheduling for engine threads (CyPort runs them as normal threads at the same priority) |
 | `MetalFXForce` = NO | don't answer "supported" when the game asks whether this GPU can do MetalFX |
 | `WorkerSampler` = NO | no worker-thread profile lines in the log |
