@@ -5,6 +5,7 @@ import SwiftUI
 import UIKit
 
 private let cyberYellow = Color(red: 0.99, green: 0.93, blue: 0.04)
+
 private let cyberRed = Color(red: 1.0, green: 0.0, blue: 0.24)
 
 private final class LauncherModel: ObservableObject {
@@ -13,6 +14,35 @@ private final class LauncherModel: ObservableObject {
     @Published var resolution: Int
     @Published var overlay: Int
     @Published var starting = false
+    @Published var source = CloudSource.preferred
+    @Published var cloudOn = CloudSource.preferred.signedIn
+    @Published var cloudStatus: String?
+    @Published var cloudFailed = false
+    @Published var syncing = false
+    @Published var signingIn = false
+    func setSource(_ s: CloudSource) {
+        CloudSource.preferred = s; source = s; cloudOn = s.signedIn; cloudStatus = nil; cloudFailed = false
+        if cloudOn { sync() }
+    }
+    /// runs when the start screen opens and after signing in: the phone gets what's new in the cloud (and, for GOG,
+    /// the cloud gets what's new on the phone)
+    func sync() {
+        guard cloudOn, !syncing else { return }
+        syncing = true; cloudFailed = false
+        let s = source
+        Task { @MainActor in
+            do {
+                let r = try await GameCloud.sync(s) { p in Task { @MainActor in self.cloudStatus = p } }
+                cloudStatus = r.summary
+            } catch {
+                cloudStatus = error.localizedDescription; cloudFailed = true
+                GameCloud.log("\(s.rawValue) sync failed: \(error.localizedDescription)")
+            }
+            syncing = false
+        }
+    }
+    func signedInNow() { signingIn = false; cloudOn = source.signedIn; if cloudOn { sync() } }
+    func signOut() { source.signOut(); cloudOn = false; cloudStatus = nil; cloudFailed = false }
     let onPlay: (Int, Int) -> Void
     init(resolutions: [String], notes: [String], resolution: Int, overlay: Int, onPlay: @escaping (Int, Int) -> Void) {
         self.resolutions = resolutions; self.notes = notes; self.resolution = resolution; self.overlay = overlay; self.onPlay = onPlay
@@ -21,6 +51,8 @@ private final class LauncherModel: ObservableObject {
 
 private struct LauncherView: View {
     @ObservedObject var model: LauncherModel
+    /// swipe-to-look speed, read by the shim when the game starts (MSLookSensitivity)
+    @AppStorage("CyPortLookSensitivity") private var lookSensitivity = 1.5
 
     var body: some View {
         ZStack {
@@ -48,7 +80,8 @@ private struct LauncherView: View {
                         .padding(.top, 14)
                 }
 
-                VStack(alignment: .leading, spacing: 18) {
+                ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 14) {
                     VStack(alignment: .leading, spacing: 8) {
                         Label("Resolution", systemImage: "rectangle.on.rectangle")
                             .font(.subheadline.weight(.semibold))
@@ -88,9 +121,57 @@ private struct LauncherView: View {
                         .frame(width: 300)
                     }
 
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Label("Look sensitivity", systemImage: "hand.draw")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.white.opacity(0.7))
+                            Spacer()
+                            Text(String(format: "%.1f×", lookSensitivity)).font(.subheadline.monospacedDigit().weight(.semibold)).foregroundStyle(cyberYellow)
+                        }
+                        .frame(width: 300)
+                        Slider(value: $lookSensitivity, in: 0.25...4, step: 0.05)
+                            .tint(cyberYellow).frame(width: 300)
+                    }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("Cloud saves", systemImage: "icloud")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.white.opacity(0.7))
+                        Picker("Store", selection: Binding(get: { model.source }, set: { model.setSource($0) })) {
+                            ForEach(CloudSource.allCases) { Text($0.rawValue).tag($0) }
+                        }
+                        .pickerStyle(.segmented).frame(width: 300).disabled(model.syncing)
+                        HStack {
+                            if model.syncing { ProgressView().controlSize(.small) }
+                            Text(model.cloudStatus ?? (model.cloudOn ? "Signed in\(model.source.account.map { " as \($0)" } ?? "")"
+                                                                     : "Sign in to get your \(model.source.rawValue) saves (optional)"))
+                                .font(.caption).foregroundStyle(model.cloudFailed ? cyberRed : .white.opacity(0.75)).lineLimit(3)
+                            Spacer()
+                            if model.cloudOn {
+                                Button("Sync now") { model.sync() }
+                                    .font(.caption.weight(.semibold)).foregroundStyle(cyberYellow).disabled(model.syncing)
+                            } else {
+                                Button("Sign in…") { model.signingIn = true }
+                                    .font(.caption.weight(.semibold)).foregroundStyle(cyberYellow)
+                            }
+                        }
+                        .frame(width: 300)
+                        if model.cloudOn && !model.syncing {
+                            HStack {
+                                Text("Syncs both ways with \(model.source.rawValue) - your PC and Mac get your phone saves")
+                                    .font(.caption2).foregroundStyle(.white.opacity(0.45))
+                                Spacer()
+                                Button("Sign out") { model.signOut() }.font(.caption2).foregroundStyle(.white.opacity(0.5))
+                            }
+                            .frame(width: 300)
+                        }
+                    }
+
                     Button {
-                        guard !model.starting else { return }
+                        guard !model.starting, !model.syncing else { return }
                         model.starting = true
+                        GameCloud.startWatching()
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                         model.onPlay(model.resolution, model.overlay)
                     } label: {
@@ -103,13 +184,19 @@ private struct LauncherView: View {
                         .background(cyberYellow, in: RoundedRectangle(cornerRadius: 12))
                         .shadow(color: cyberYellow.opacity(0.35), radius: 12)
                     }
-                    .disabled(model.starting)
+                    .disabled(model.starting || model.syncing)
                     .padding(.top, 4)
+                }
+                .padding(.vertical, 16)
                 }
             }
             .padding(.horizontal, 24)
         }
         .preferredColorScheme(.dark)
+        .onAppear { model.sync() }
+        .sheet(isPresented: $model.signingIn) {
+            LoginSheet(store: model.source.store) { model.signedInNow() }
+        }
         .persistentSystemOverlays(.hidden)
         .statusBarHidden(true)
     }

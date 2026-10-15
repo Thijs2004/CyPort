@@ -114,7 +114,8 @@ EXPORT uint32_t CGDisplayModeIsUsableForDesktopGUI(void *m)       { (void)m; ret
 /* mouse cursor control -> UIKit pointer lock (see MacShim.m) */
 EXPORT int32_t CGAssociateMouseAndMouseCursorPosition(uint32_t connected) { MacShimSetPointerLocked(!connected); return 0; }
 typedef struct { double x, y; } MSPoint;
-EXPORT int32_t CGWarpMouseCursorPosition(MSPoint p) { (void)p; return 0; }           /* iPadOS cannot warp the pointer */
+void MacShimWarpCursor(double x, double y);
+EXPORT int32_t CGWarpMouseCursorPosition(MSPoint p) { MacShimWarpCursor(p.x, p.y); return 0; }   /* iOS can't move the pointer: the shim's mouse position follows */
 EXPORT void *CGEventSourceCreate(int32_t stateID) {                                 /* any real CF object, so CFRelease() is safe */
     static void *s; (void)stateID; if (!s) s = CFStringCreateWithCString(0, "MacShimEventSource", 0x08000100);
     return CFRetain(s);

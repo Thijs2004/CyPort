@@ -41,6 +41,9 @@ REROUTE = {"__NSGetExecutablePath", "_sysctlbyname", "_mmap", "_munmap", "_madvi
            "_BinkRegisterFrameBuffers", "_BinkGetFrameBuffersInfo",
            # thread priorities: Mac values park engine threads on the iPhone's efficiency cores (ThreadQoS switch)
            "_pthread_set_qos_class_self_np",
+           # SCHED_RR (fixed priority 41-47) on engine threads: on 6 cores they starved the threads that bring mouse and
+           # keyboard input in -> made timeshare at the same priority (RealtimeThreads switch)
+           "_pthread_setschedparam", "_pthread_attr_setschedpolicy",
            # spinlock waits: back-to-back yields become short sleeps (less heat/throttling; YieldBackoff switch)
            "_sched_yield"}
 DYLIB_CMDS = (LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_LOAD_UPWARD)

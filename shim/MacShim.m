@@ -20,6 +20,7 @@
 #include <stdatomic.h>
 #include <crt_externs.h>
 #include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 #include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -55,6 +56,8 @@ static NSDictionary *MSConfig(void);
 static NSInteger MSPref(NSString *k, NSInteger def);
 static void MSStatusCreate(void);
 static void MSTouchPadCreate(UIWindowScene *sc);
+static void MSTVRoute(void); static void MSTVObserve(void);
+@class NSWindow; static __weak NSWindow *g_gameWin;
 
 static void MSLogf(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 static BOOL g_cursorHidden = NO, g_pointerLocked = NO;
@@ -84,8 +87,26 @@ static void MSMainAsync(dispatch_block_t b) { CFRunLoopPerformBlock(CFRunLoopGet
 
 /* ---------------------------------------------------------------- screen info (C side uses this) */
 static double g_sw = 1366, g_sh = 1024, g_ss = 2, g_fps = 120;
+static double g_tvAspect;                    /* > 0: a TV was connected at launch, the game gets its shape (TV out) */
+static UIScreen *MSExternalScreen(void) { for (UIScreen *s in UIScreen.screens) if (s != UIScreen.mainScreen) return s; return nil; }
 static void MSRefreshScreen(void) {
-    MSOnMain(^{ UIScreen *s = UIScreen.mainScreen; g_sw = s.bounds.size.width; g_sh = s.bounds.size.height; g_ss = s.nativeScale; g_fps = (double)s.maximumFramesPerSecond; });
+    MSOnMain(^{
+        UIScreen *s = UIScreen.mainScreen; g_sw = s.bounds.size.width; g_sh = s.bounds.size.height; g_ss = s.nativeScale; g_fps = (double)s.maximumFramesPerSecond;
+        /* decided once, so the size the game was told never changes under it: same height (= same pixel cost) as
+           the phone, the TV's width:height. TVOut = NO / TVShape = NO in macshim.plist turn it off. */
+        static dispatch_once_t o; dispatch_once(&o, ^{
+            UIScreen *x = MSExternalScreen();
+            if (x && x.bounds.size.height > 0 && MSCfgD(@"TVOut", 1) != 0 && MSCfgD(@"TVShape", 1) != 0) g_tvAspect = x.bounds.size.width / x.bounds.size.height;
+        });
+        if (g_tvAspect > 0) g_sw = round(g_sh * g_tvAspect);
+    });
+}
+/* the phone's own window scene; with a second screen UIKit adds a scene for it, which must never get the game's
+   windows (iOS only sends touches to windows in the app's scene) */
+static UIWindowScene *MSAppScene(void) {
+    for (UIScene *x in UIApplication.sharedApplication.connectedScenes)
+        if ([x isKindOfClass:UIWindowScene.class] && (((UIWindowScene *)x).screen == UIScreen.mainScreen || [x.session.role isEqualToString:UIWindowSceneSessionRoleApplication])) return (UIWindowScene *)x;
+    return nil;
 }
 void MacShimScreenInfo(double *w, double *h, double *s, double *f) {
     static dispatch_once_t once; dispatch_once(&once, ^{ MSRefreshScreen(); });
@@ -356,12 +377,16 @@ static _Atomic int g_galaxyFailures;
 - (void)msClick:(CGPoint)p right:(BOOL)r;
 - (void)msScrollBy:(CGPoint)d at:(CGPoint)p;
 - (void)msMouseDelta:(CGPoint)d;
+- (NSEvent *)msEvent:(NSUInteger)type at:(CGPoint)p;
+- (void)msButton:(BOOL)down right:(BOOL)r at:(CGPoint)p;
+- (void)msTouches:(NSSet<UITouch *> *)ts phase:(int)ph event:(UIEvent *)ev;
 @end
+static _Atomic int g_gcmCount;                   /* GameController mice connected (see MSAttachMouse) */
 @interface MSRootVC : UIViewController @end
 @implementation MSRootVC
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
-- (BOOL)prefersPointerLocked { return g_pointerLocked; }
+- (BOOL)prefersPointerLocked { return g_pointerLocked || g_gcmCount > 0; }   /* a locked pointer is what makes iOS send raw mouse motion */
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
 @end
@@ -402,6 +427,11 @@ static void MSOpenMouseGate(void) {
     volatile uint8_t *g = (volatile uint8_t *)(MS_MOUSE_GATE + MSExeSlide());
     if (!*g) { *g = 1; static int n; if (n++ < 5) MSLogf(@"mouse gate opened (touch = mouse)"); }
 }
+static _Atomic long long g_gcmMoves, g_gcmHovers; static _Atomic double g_gcmLastMoveAt;
+static CGPoint g_gcmCursor; static BOOL g_gcmCursorSet;  /* where menu mouse events point (view points) */
+static void MSGCMouseMove(MSHostView *h, CGPoint d);
+static CGPoint MSGCMouseAt(MSHostView *h);
+static CGPoint g_gcmPending; static BOOL g_gcmLeft, g_gcmRight;
 static __weak MSHostView *g_hostView;           /* the game's view, for the AutoKeys test aid */
 /* camera swipe -> mouse look. Touches come in bursts (whenever the game's loop lets the run loop turn), so sending
    them as they arrive gave the camera uneven steps (jitter). The pad adds all finger movement (coalesced touches,
@@ -412,8 +442,19 @@ static CGPoint g_lookPending; static os_unfair_lock g_lookLock = OS_UNFAIR_LOCK_
 static int g_lookStick = -1;                          /* 1: swipe drives the right stick (default), 0: mouse look */
 static double g_lookFingerAt;                         /* last time the look finger moved */
 static void MSLookFlushStick(double dt);
+static void MSGCMouseFlush(void);
+static double MSLookSensitivity(void);
 static void MSLookAdd(CGPoint d) { os_unfair_lock_lock(&g_lookLock); g_lookPending.x += d.x; g_lookPending.y += d.y; os_unfair_lock_unlock(&g_lookLock); }
 
+/* a touch's position on the game's view. A touch on another screen (the phone while the picture is on a TV) maps
+   by position: the whole phone screen covers the whole picture. */
+static CGPoint MSTouchIn(UITouch *t, UIView *host) {
+    UIView *v = t.view;
+    if (!v || !host || v.window.screen == host.window.screen) return [t locationInView:host];
+    CGPoint p = [t locationInView:v]; CGSize s = v.bounds.size, h = host.bounds.size;
+    if (s.width < 1 || s.height < 1) return p;
+    return CGPointMake(p.x / s.width * h.width, p.y / s.height * h.height);
+}
 @implementation MSHostView
 - (instancetype)initWithFrame:(CGRect)f {
     self = [super initWithFrame:f]; if (!self) return nil;
@@ -438,6 +479,7 @@ static void MSLookAdd(CGPoint d) { os_unfair_lock_lock(&g_lookLock); g_lookPendi
  * frame); drag = scroll wheel (the user agreement must be scrolled to the end); hold still 0.35 s, then drag = mouse
  * drag (sliders); two-finger tap = right click. ScrollSpeed (default 1.5) scales the scrolling. */
 static UITouch *g_fTouch; static CGPoint g_fStart, g_fLast; static int g_fMode, g_fFingers; static unsigned g_fGen; static BOOL g_fEntered;
+static double g_fBeganAt, g_gcmButtonAt;          /* AssistiveTouch: a mouse click also arrives as a tap - keep only the click */
 static void MSAfter(double s, dispatch_block_t b) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(s * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{ MSMainAsync(b); });
 }
@@ -459,9 +501,41 @@ static void MSAfter(double s, dispatch_block_t b) {
     MSDispatch([self msEvent:MSMouseMoved at:p]);
     MSAfter(0.07, ^{ [self msButton:YES right:r at:p]; MSAfter(0.07, ^{ [self msButton:NO right:r at:p]; }); });
 }
-- (void)msFinger:(UITouch *)t phase:(int)ph event:(UIEvent *)ev {
-    CGPoint p = [t locationInView:self];
+/* iPhone + mouse: iOS passes a mouse on only through AssistiveTouch. The left button reaches the app either as a real
+   GameController button or as a tap at AssistiveTouch's pointer (not where the game's blue cursor is) - seen both ways.
+   Either one presses the left button at the blue cursor (screen centre in gameplay); when both come for one click,
+   the first wins. A press is held at least 80 ms (the game reads buttons once per frame and missed shorter ones). */
+static UITouch *g_atTouch; static BOOL g_atIgnore; static double g_leftDownAt; static int g_leftBy;   /* 1 = tap, 2 = GC */
+static void MSLeftPress(int by, BOOL down) {
+    MSHostView *h = g_hostView; if (!h) return;
+    if (down) {
+        if (g_leftBy) return;                              /* already down (the other source's twin) */
+        g_leftBy = by; g_leftDownAt = CACurrentMediaTime(); g_gcmLeft = YES;
+        MSOpenMouseGate(); MSGCMouseFlush(); [h msButton:YES right:NO at:MSGCMouseAt(h)];
+        return;
+    }
+    if (g_leftBy != by) return;
+    g_leftBy = 0;
+    double held = CACurrentMediaTime() - g_leftDownAt;
+    dispatch_block_t up = ^{ if (g_leftBy) return; g_gcmLeft = NO; MSHostView *hh = g_hostView; if (hh) [hh msButton:NO right:NO at:MSGCMouseAt(hh)]; };
+    if (held < 0.08) MSAfter(0.08 - held, up); else up();
+}
+- (void)msMouseTap:(UITouch *)t phase:(int)ph {
     if (ph == 0) {
+        if (g_atTouch) return;
+        g_atTouch = t; g_atIgnore = g_leftBy != 0;          /* the GC button got this click first */
+        static int n; if (n++ < 6) MSLogf(@"mouse: tap (left click)%@", g_atIgnore ? @" - twin of a button press, ignored" : @"");
+        if (!g_atIgnore) MSLeftPress(1, YES);
+        return;
+    }
+    if (t != g_atTouch || ph == 1) return;                 /* movement comes from the mouse itself */
+    g_atTouch = nil; if (!g_atIgnore) MSLeftPress(1, NO);
+}
+- (void)msFinger:(UITouch *)t phase:(int)ph event:(UIEvent *)ev {
+    if (g_gcmCount) { [self msMouseTap:t phase:ph]; return; }
+    CGPoint p = MSTouchIn(t, self);
+    if (ph == 0) {
+        g_fBeganAt = CACurrentMediaTime();
         MSOpenMouseGate();
         if (!g_fEntered) { g_fEntered = YES; MSDispatch([self msEvent:MSEnter at:p]); }     /* the game tracks "cursor in view" */
         if (g_fTouch) { if (g_fMode == 0) g_fFingers = 2; return; }                         /* second finger: right click on release */
@@ -488,7 +562,7 @@ static void MSAfter(double s, dispatch_block_t b) {
 - (void)msTouches:(NSSet<UITouch *> *)ts phase:(int)ph event:(UIEvent *)ev {
     for (UITouch *f in ts) if (f.type == UITouchTypeDirect) [self msFinger:f phase:ph event:ev];
     UITouch *t = nil; for (UITouch *x in ts) if (x.type == UITouchTypeIndirectPointer) t = x;
-    if (!t) return; CGPoint p = [t locationInView:self];                /* mouse / trackpad: straight through */
+    if (!t || g_gcmCount) return; CGPoint p = MSTouchIn(t, self);  /* mouse / trackpad: straight through (unless GCMouse has it) */
     MSOpenMouseGate();
     BOOL right = (t.type == UITouchTypeIndirectPointer) && (ev.buttonMask & UIEventButtonMaskSecondary);
     NSUInteger down = right ? MSRDown : MSLDown, up = right ? MSRUp : MSLUp, drag = right ? MSRDrag : MSLDrag;
@@ -500,7 +574,18 @@ static void MSAfter(double s, dispatch_block_t b) {
 - (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e     { [self msTouches:t phase:2 event:e]; }
 - (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self msTouches:t phase:2 event:e]; }
 - (void)msHover:(UIHoverGestureRecognizer *)g {
-    CGPoint p = [g locationInView:self]; MSOpenMouseGate();
+    CGPoint p = [g locationInView:self];
+    if (g_gcmCount) {                   /* a mouse is connected: raw motion moves the cursor; if none arrives (AssistiveTouch
+                                           keeps it for its own pointer), follow that pointer instead */
+        if (CACurrentMediaTime() - g_gcmLastMoveAt < 1.0 || g_pointerLocked) return;
+        static CGPoint last; static BOOL have;
+        if (g.state == UIGestureRecognizerStateBegan || !have) { last = p; have = YES; }
+        CGPoint d = CGPointMake(p.x - last.x, p.y - last.y); last = p; g_gcmHovers++;
+        if (g.state == UIGestureRecognizerStateEnded) have = NO;
+        if (d.x != 0 || d.y != 0) MSGCMouseMove(self, d);
+        return;
+    }
+    MSOpenMouseGate();
     if (g.state == UIGestureRecognizerStateBegan) MSDispatch([self msEvent:MSEnter at:p]);
     if (g.state == UIGestureRecognizerStateChanged) MSDispatch([self msEvent:MSMouseMoved at:p]);
     if (g.state == UIGestureRecognizerStateEnded) MSDispatch([self msEvent:MSExit at:p]);
@@ -577,8 +662,7 @@ static void MSAfter(double s, dispatch_block_t b) {
     MSOnMain(^{
         /* in the app's window scene: iOS only delivers touches to windows that belong to a scene (one made with
            initWithFrame: is drawn but never gets a touch - touch-as-mouse never reached the game) */
-        UIWindowScene *sc = nil;
-        for (UIScene *x in UIApplication.sharedApplication.connectedScenes) if ([x isKindOfClass:UIWindowScene.class]) { sc = (UIWindowScene *)x; break; }
+        UIWindowScene *sc = MSAppScene();
         self->_uiWindow = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
         MSLogf(@"game window created %@", sc ? @"in the app's scene" : @"WITHOUT a scene (no touches)");
         self->_uiWindow.rootViewController = [MSRootVC new]; self->_uiWindow.backgroundColor = UIColor.blackColor;
@@ -594,6 +678,7 @@ static void MSAfter(double s, dispatch_block_t b) {
         UIView *root = self->_uiWindow.rootViewController.view; v.host.frame = root.bounds; [root addSubview:v.host];
         v.host.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     });
+    MSOnMain(^{ MSTVRoute(); });
     [v msLayoutFromHost];
     if ([v respondsToSelector:@selector(viewDidMoveToWindow)]) ((void (*)(id, SEL))objc_msgSend)(v, @selector(viewDidMoveToWindow));
 }
@@ -608,9 +693,9 @@ static void MSAfter(double s, dispatch_block_t b) {
 - (void)makeKeyAndOrderFront:(id)s {
     MSLogf(@"window makeKeyAndOrderFront");
     _isVisible = YES; MSOnMain(^{
-        if (!self->_uiWindow.windowScene) for (UIScene *x in UIApplication.sharedApplication.connectedScenes)
-            if ([x isKindOfClass:UIWindowScene.class]) { self->_uiWindow.windowScene = (UIWindowScene *)x; break; }
+        if (!self->_uiWindow.windowScene) self->_uiWindow.windowScene = MSAppScene();
         [self->_uiWindow makeKeyAndVisible];
+        g_gameWin = self; MSTVObserve(); MSTVRoute();
     });
     [self msBecameKey];
 }
@@ -656,6 +741,89 @@ static void MSAfter(double s, dispatch_block_t b) {
 }
 - (void)miniaturize:(id)s {} - (void)deminiaturize:(id)s {} - (void)zoom:(id)s {}
 @end
+
+
+/* ---------------------------------------------------------------- TV out (AirPlay screen mirroring, USB-C/HDMI)
+ * With a second screen the game's view moves into a window on that screen, scaled to fill it. The phone keeps the
+ * touch controls (their own window, on top) and the rest of its screen becomes a touch surface for the cursor
+ * (MSTouchIn: the phone screen maps onto the whole picture). Connected before Play: the game renders in the TV's shape
+ * (g_tvAspect); connected later, the picture keeps the phone's shape, letterboxed. Unplugging brings it back. The
+ * view keeps its bounds (the size AppKit was told), only a transform scales it, so the engine never sees a resize.
+ * TVOut = NO in macshim.plist turns this off. */
+static UIWindow *g_tvWin; static UIView *g_tvPad;
+@interface MSTVPadView : UIView @end
+@implementation MSTVPadView
+- (instancetype)initWithFrame:(CGRect)f {
+    self = [super initWithFrame:f]; if (!self) return nil;
+    self.multipleTouchEnabled = YES; self.backgroundColor = UIColor.blackColor;
+    self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    UILabel *l = [UILabel new]; l.numberOfLines = 2; l.textAlignment = NSTextAlignmentCenter;
+    l.text = @"Playing on the external display\nTouch here to move the cursor";
+    l.textColor = [UIColor colorWithWhite:1 alpha:0.35]; l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    l.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:l];
+    [l.centerXAnchor constraintEqualToAnchor:self.centerXAnchor].active = YES;
+    [l.topAnchor constraintEqualToAnchor:self.safeAreaLayoutGuide.topAnchor constant:16].active = YES;
+    return self;
+}
+- (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e     { [g_hostView msTouches:t phase:0 event:e]; }
+- (void)touchesMoved:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e     { [g_hostView msTouches:t phase:1 event:e]; }
+- (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e     { [g_hostView msTouches:t phase:2 event:e]; }
+- (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [g_hostView msTouches:t phase:2 event:e]; }
+@end
+static void MSFitHost(UIView *host, UIView *into) {
+    double w, h; MacShimScreenInfo(&w, &h, 0, 0);
+    if (host.superview != into) [into insertSubview:host atIndex:0];
+    host.autoresizingMask = UIViewAutoresizingNone; host.transform = CGAffineTransformIdentity;
+    host.bounds = CGRectMake(0, 0, w, h);
+    CGSize c = into.bounds.size; CGFloat k = MIN(c.width / w, c.height / h); if (!(k > 0)) k = 1;
+    host.center = CGPointMake(c.width / 2, c.height / 2); host.transform = CGAffineTransformMakeScale(k, k);
+}
+static void MSTVRoute(void) {                                     /* main thread */
+    NSWindow *gw = g_gameWin; MSHostView *host = gw.contentView.host; UIView *phone = gw.uiWindow.rootViewController.view;
+    if (!host || !phone || MSCfgD(@"TVOut", 1) == 0) return;
+    UIScreen *ext = MSExternalScreen();
+    if (ext) {
+        if (!g_tvWin || g_tvWin.screen != ext) {
+            g_tvWin.hidden = YES; g_tvWin = nil;
+            UIWindowScene *sc = nil;
+            for (UIScene *x in UIApplication.sharedApplication.connectedScenes)
+                if ([x isKindOfClass:UIWindowScene.class] && ((UIWindowScene *)x).screen == ext) sc = (UIWindowScene *)x;
+            if (sc) g_tvWin = [[UIWindow alloc] initWithWindowScene:sc];
+            else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                g_tvWin = [[UIWindow alloc] initWithFrame:ext.bounds]; g_tvWin.screen = ext;     /* no scene for it (yet) */
+#pragma clang diagnostic pop
+            }
+            g_tvWin.backgroundColor = UIColor.blackColor; g_tvWin.userInteractionEnabled = NO;
+            g_tvWin.rootViewController = [MSRootVC new]; g_tvWin.rootViewController.view.backgroundColor = UIColor.blackColor;
+            g_tvWin.hidden = NO;
+            MSLogf(@"TV out: external display %.0fx%.0f pt @%.0fx, %@, game picture %.0fx%.0f moved there", ext.bounds.size.width, ext.bounds.size.height,
+                   ext.scale, sc ? @"own scene" : @"no scene (screen property)", g_sw, g_sh);
+        }
+        UIView *root = g_tvWin.rootViewController.view; root.frame = g_tvWin.bounds;
+        MSFitHost(host, root);
+        if (!g_tvPad) g_tvPad = [[MSTVPadView alloc] initWithFrame:phone.bounds];
+        if (g_tvPad.superview != phone) { g_tvPad.frame = phone.bounds; [phone addSubview:g_tvPad]; }
+    } else if (g_tvWin || host.superview != phone || (g_tvAspect > 0 && host.autoresizingMask != UIViewAutoresizingNone)) {
+        [g_tvPad removeFromSuperview];
+        MSFitHost(host, phone);
+        g_tvWin.hidden = YES; g_tvWin = nil;
+        MSLogf(@"TV out: external display gone, game back on the phone");
+    }
+}
+static void MSTVObserve(void) {
+    static BOOL done; if (done) return; done = YES;
+    /* the screen and its scene arrive one after the other; route again shortly after each */
+    for (NSString *n in @[ UIScreenDidConnectNotification, UIScreenDidDisconnectNotification, UIScreenModeDidChangeNotification,
+                           UISceneWillConnectNotification, UISceneDidDisconnectNotification ])
+        [NSNotificationCenter.defaultCenter addObserverForName:n object:nil queue:nil usingBlock:^(NSNotification *x) {
+            MSMainAsync(^{ MSTVRoute(); });
+            MSAfter(0.5, ^{ MSTVRoute(); });
+        }];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIScreenDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification *x) {
+        if (MSCfgD(@"TVOut", 1) != 0) MSLogf(@"TV out: display connected"); }];
+}
 
 @interface NSWindowController : MSBase
 @property(nonatomic, strong) NSWindow *window;
@@ -750,6 +918,7 @@ static BOOL MSCalledFromGameMain(void *ret);
                 g_lookPending.x -= d.x; g_lookPending.y -= d.y; os_unfair_lock_unlock(&g_lookLock);
                 if (d.x != 0 || d.y != 0) { MSHostView *h = g_hostView; if (h) [h msMouseDelta:d]; lastFlush = tn; }
             }
+            MSGCMouseFlush();
         }
         double now = CACurrentMediaTime();
         if (g_mqAsked > g_mqBeat && now - g_mqAsked > 0.25) {         /* main queue starved: run its blocks here */
@@ -848,6 +1017,93 @@ static void MSKey(GCKeyCode code, BOOL pressed) {
 static void MSAttachKeyboard(GCKeyboard *kb) {
     kb.keyboardInput.keyChangedHandler = ^(GCKeyboardInput *k, GCControllerButtonInput *b, GCKeyCode code, BOOL pressed) { MSKey(code, pressed); };
 }
+/* hardware mouse through GameController (GCMouse): an iPhone has no UIKit pointer, so this is the only way a mouse reaches
+   the game there. Gameplay (pointer locked): relative motion for the camera, sent once per game frame. Menus: moves a
+   cursor over the game view (buttons held = drag). Left/right button and the wheel go to the game view. Speed follows
+   the start screen's Look sensitivity (its default 1.5 = 1x) times MouseSpeed (plist, default 1). While a GCMouse is
+   connected, UIKit pointer events (iPad) are ignored so nothing arrives twice. */
+static os_unfair_lock g_gcmLock = OS_UNFAIR_LOCK_INIT;
+static CGPoint MSGCMouseAt(MSHostView *h) {
+    if (g_pointerLocked) return CGPointMake(h.bounds.size.width / 2, h.bounds.size.height / 2);
+    if (!g_gcmCursorSet) { g_gcmCursor = CGPointMake(h.bounds.size.width / 2, h.bounds.size.height / 2); g_gcmCursorSet = YES; }
+    return g_gcmCursor;
+}
+/* menus: the game hides the system cursor and moves its own (blue) cursor by the event's deltaX/deltaY, so every
+   menu mouse event carries the motion as well as a position */
+static void MSGCMouseMove(MSHostView *h, CGPoint d) {
+    CGPoint c = MSGCMouseAt(h);
+    c.x = fmin(fmax(c.x + d.x, 0), h.bounds.size.width - 1); c.y = fmin(fmax(c.y + d.y, 0), h.bounds.size.height - 1);
+    g_gcmCursor = c; MSOpenMouseGate();
+    NSEvent *e = [h msEvent:(g_gcmLeft ? MSLDrag : g_gcmRight ? MSRDrag : MSMouseMoved) at:c];
+    double k = MSAKScale(); e.deltaX = d.x * k; e.deltaY = d.y * k;
+    MSDispatch(e);
+}
+/* the game moved the (hidden) system cursor - e.g. centred it for a menu. Its blue cursor is there now, so the shim's
+   mouse position (where clicks go) follows. Global display coordinates, top-left origin, AppKit points. */
+void MacShimWarpCursor(double x, double y) {
+    static int n; if (n++ < 6) MSLogf(@"mouse: game moved the cursor to %.0f,%.0f", x, y);
+    MSMainAsync(^{
+        MSHostView *h = g_hostView; if (!h) return;
+        double k = MSAKScale(); CGPoint c = CGPointMake(x / k, y / k);
+        c.x = fmin(fmax(c.x, 0), h.bounds.size.width - 1); c.y = fmin(fmax(c.y, 0), h.bounds.size.height - 1);
+        g_gcmCursor = c; g_gcmCursorSet = YES; g_mouse = MSToCocoa(c, h);
+    });
+}
+static void MSGCMouseFlush(void) {
+    if (!g_gcmCount) return;
+    MSHostView *h = g_hostView; if (!h) return;
+    /* AssistiveTouch hands mouse motion over unevenly (often 10-30 times a second), so part of what's pending is kept
+       for the next frame to even it out. Time based (MouseSmoothMs, default 10 ms; 0 = off): at 60 FPS ~a third is
+       kept, at low FPS (long frames) almost nothing - the game only reads input once per frame, so holding motion back
+       on a slow frame was felt as lag. */
+    static double tau = -1, last; if (tau < 0) { tau = MSCfgD(@"MouseSmoothMs", 10) / 1000; if (tau < 0) tau = 0; }
+    double now = CACurrentMediaTime(), dt = last ? now - last : 1 / 60.0; last = now;
+    double keep = tau > 0 ? exp(-dt / tau) : 0;
+    os_unfair_lock_lock(&g_gcmLock);
+    CGPoint all = g_gcmPending, d = CGPointMake(all.x * (1 - keep), all.y * (1 - keep));
+    if (fabs(all.x) < 0.5 && fabs(all.y) < 0.5) d = all;  /* the tail: send the rest */
+    g_gcmPending.x -= d.x; g_gcmPending.y -= d.y;
+    os_unfair_lock_unlock(&g_gcmLock);
+    if (d.x == 0 && d.y == 0) return;
+    if (g_pointerLocked) [h msMouseDelta:d]; else MSGCMouseMove(h, d);
+}
+static _Atomic long long g_gcmClicks; static _Atomic double g_gcmConnectAt;
+static void MSGCMouseButton(BOOL right, BOOL down) {
+    if (down) g_gcmClicks++;
+    BOOL stray = !right && down && CACurrentMediaTime() - g_gcmConnectAt < 0.5;   /* AssistiveTouch's virtual mouse sends a
+                                                                                  left-down (never released) as it appears */
+    static int n; if (n++ < 10) MSLogf(@"mouse: %@ button %@%@", right ? @"right" : @"left", down ? @"down" : @"up", stray ? @" (stray, ignored)" : @"");
+    if (stray) return;
+    if (!right) { MSMainAsync(^{ MSLeftPress(2, down); }); return; }
+    MSMainAsync(^{
+        MSHostView *h = g_hostView; if (!h) return;
+        MSGCMouseFlush();                                     /* motion first, so the click lands where the cursor is */
+        if (down) g_gcmButtonAt = CACurrentMediaTime();
+        if (right) g_gcmRight = down; else g_gcmLeft = down;
+        MSOpenMouseGate(); [h msButton:down right:right at:MSGCMouseAt(h)];
+    });
+}
+static void MSAttachMouse(GCMouse *m) {
+    GCMouseInput *in = m.mouseInput; if (!in) return;
+    g_gcmCount++; g_gcmConnectAt = CACurrentMediaTime();
+    static dispatch_queue_t q; if (!q) q = dispatch_queue_create("cyport.mouse", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+    m.handlerQueue = q;                                    /* handlers run at once, off the busy main thread */
+    static double speed; if (!speed) speed = MSCfgD(@"MouseSpeed", 1.0);
+    in.mouseMovedHandler = ^(GCMouseInput *mi, float dx, float dy) {
+        double k = speed * MSLookSensitivity() / 1.5;
+        g_gcmMoves++; g_gcmLastMoveAt = CACurrentMediaTime();
+        static int logged; if (logged++ < 3) MSLogf(@"mouse: motion %+.1f %+.1f", dx, dy);
+        os_unfair_lock_lock(&g_gcmLock); g_gcmPending.x += dx * k; g_gcmPending.y -= dy * k; os_unfair_lock_unlock(&g_gcmLock);   /* GC: +y is up */
+    };
+    in.leftButton.pressedChangedHandler = ^(GCControllerButtonInput *b, float v, BOOL pressed) { MSGCMouseButton(NO, pressed); };
+    in.rightButton.pressedChangedHandler = ^(GCControllerButtonInput *b, float v, BOOL pressed) { MSGCMouseButton(YES, pressed); };
+    in.scroll.valueChangedHandler = ^(GCControllerDirectionPad *pad, float x, float y) {
+        if (x == 0 && y == 0) return;
+        MSMainAsync(^{ MSHostView *h = g_hostView; if (h) { MSOpenMouseGate(); [h msScrollBy:CGPointMake(x * 10, y * 10) at:MSGCMouseAt(h)]; } });
+    };
+    MacShimSetPointerLocked(g_pointerLocked);                 /* re-evaluates prefersPointerLocked */
+    MSLogf(@"mouse connected: %@ (GameController) - touch controls hidden while it's connected", m.vendorName ?: @"mouse");
+}
 static void MSDispatch(NSEvent *e) {
     NSArray *ms; @synchronized (g_monitors) { ms = [g_monitors copy]; }
     for (MSMonitor *m in ms) if (m.mask & (1ULL << e.type)) {
@@ -934,7 +1190,7 @@ static NSString *MSGB(uint64_t b) { return [NSString stringWithFormat:@"%.1f GB"
 
 @interface MSSetupVC : UIViewController <UIDocumentPickerDelegate>
 @property(nonatomic, strong) UILabel *info, *status; @property(nonatomic, strong) UIProgressView *bar;
-@property(nonatomic, strong) UIButton *importBtn, *ssdBtn; @property(nonatomic) BOOL pickForSSD, copying;
+@property(nonatomic, strong) UIButton *importBtn, *ssdBtn, *storeBtn; @property(nonatomic) BOOL pickForSSD, copying;
 @end
 @implementation MSSetupVC
 - (void)viewDidLoad {
@@ -947,7 +1203,12 @@ static NSString *MSGB(uint64_t b) { return [NSString stringWithFormat:@"%.1f GB"
     _ssdBtn.titleLabel.font = [UIFont systemFontOfSize:15]; [_ssdBtn addTarget:self action:@selector(ssdTapped) forControlEvents:UIControlEventTouchUpInside];
     _bar = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault]; _bar.hidden = YES;
     _status = [UILabel new]; _status.numberOfLines = 0; _status.textColor = UIColor.systemOrangeColor; _status.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightRegular];
-    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[ title, _info, _importBtn, _bar, _status ]];   /* no "play from SSD": import only */
+    /* sign in to Steam / GOG / Epic and download the game data (shim/StoresUI.swift) */
+    _storeBtn = [UIButton buttonWithType:UIButtonTypeSystem]; _storeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:20];
+    [_storeBtn setTitle:@"Download from Steam, GOG or Epic…" forState:UIControlStateNormal];
+    [_storeBtn addTarget:self action:@selector(storeTapped) forControlEvents:UIControlEventTouchUpInside];
+    _storeBtn.hidden = NSClassFromString(@"MSStoreUI") == nil;
+    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[ title, _info, _storeBtn, _importBtn, _bar, _status ]];   /* no "play from SSD": import only */
     st.axis = UILayoutConstraintAxisVertical; st.spacing = 20; st.translatesAutoresizingMaskIntoConstraints = NO; [self.view addSubview:st];
     [NSLayoutConstraint activateConstraints:@[
         [st.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor], [st.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
@@ -955,7 +1216,7 @@ static NSString *MSGB(uint64_t b) { return [NSString stringWithFormat:@"%.1f GB"
     BOOL resume = [NSFileManager.defaultManager fileExistsAtPath:MSImportRoot()];
     _info.text = resume
         ? @"The game import didn't finish. Plug in the SSD and tap Continue - files that are already copied are skipped."
-        : @"Import the game into the app: pick the GOG \"Cyberpunk 2077\" folder (with archive, engine and r6 inside), e.g. on your SSD. "
+        : @"Download the game from the store you bought it on (Steam, GOG or Epic), or import it: pick the \"Cyberpunk 2077\" folder (with archive, engine and r6 inside), e.g. on your SSD. "
           @"It is copied to this iPhone (about 61 GB). Keep the app open while it copies.\n\n"
           @"You can also copy the \"Cyberpunk 2077\" folder yourself with the Files app into On My iPhone > this app.";
     [_importBtn setTitle:resume ? @"Continue import" : @"Import game…" forState:UIControlStateNormal];
@@ -965,6 +1226,16 @@ static NSString *MSGB(uint64_t b) { return [NSString stringWithFormat:@"%.1f GB"
     NSURL *src = [NSFileManager.defaultManager fileExistsAtPath:MSImportRoot()] ? MSResolveBookmarkKey(kImportSrcKey) : nil;
     if (src) { [self startImportFrom:src]; return; }      /* resume without asking again */
     _pickForSSD = NO; [self pick];
+}
+- (void)storeTapped {
+    if (_copying) return;
+    Class c = NSClassFromString(@"MSStoreUI"); if (!c) return;
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    UIViewController *vc = ((UIViewController *(*)(id, SEL, NSString *, NSString *, NSString *))objc_msgSend)(c,
+        NSSelectorFromString(@"makeWithDownloadRoot:internalRoot:bookmarkKey:"),
+        [docs stringByAppendingPathComponent:@"Cyberpunk 2077 (downloading)"], MSInternalRoot(), kBookmarkKey);
+    MSLogf(@"store screen opened");
+    [self presentViewController:vc animated:YES completion:nil];
 }
 - (void)ssdTapped { if (!_copying) { _pickForSSD = YES; [self pick]; } }
 - (void)pick {
@@ -1159,6 +1430,28 @@ static void MSSetOpt(NSMutableDictionary *o, id value) {
    (the game is offered only that mode). Everything else stays as the game saved it, so in-game settings survive a
    restart. First run (no UserSettings.json yet): the bundled DefaultUserSettings.json (every graphics option at its
    lowest) is copied in first and all choices are written. */
+/* text edit of one option in UserSettings.json: its "value" (and "index" when >= 0); value nil = only read. NO if the
+   option or its value isn't there. The current value is returned through `was`. */
+static BOOL MSTextSetOption(NSMutableString *txt, NSString *name, NSString *value, NSInteger index, NSString **was) {
+    NSRange nr = [txt rangeOfString:[NSString stringWithFormat:@"\"name\"\\s*:\\s*\"%@\"", name] options:NSRegularExpressionSearch];
+    if (nr.location == NSNotFound) return NO;
+    NSRange open = [txt rangeOfString:@"{" options:NSBackwardsSearch range:NSMakeRange(0, nr.location)];
+    NSRange close = [txt rangeOfString:@"}" options:0 range:NSMakeRange(nr.location, txt.length - nr.location)];
+    if (open.location == NSNotFound || close.location == NSNotFound) return NO;
+    NSRange obj = NSMakeRange(open.location, close.location - open.location + 1);
+    NSRegularExpression *vre = [NSRegularExpression regularExpressionWithPattern:@"(\"value\"\\s*:\\s*\")([^\"]*)(\")" options:0 error:nil];
+    NSTextCheckingResult *vm = [vre firstMatchInString:txt options:0 range:obj];
+    if (!vm) return NO;
+    if (was) *was = [txt substringWithRange:[vm rangeAtIndex:2]];
+    if (!value) return YES;
+    if (index >= 0) {                                          /* the index first: it sits after the value, ranges stay valid */
+        NSRegularExpression *ire = [NSRegularExpression regularExpressionWithPattern:@"(\"index\"\\s*:\\s*)(\\d+)" options:0 error:nil];
+        NSTextCheckingResult *im = [ire firstMatchInString:txt options:0 range:obj];
+        if (im && [im rangeAtIndex:2].location > [vm rangeAtIndex:2].location) [txt replaceCharactersInRange:[im rangeAtIndex:2] withString:[NSString stringWithFormat:@"%ld", (long)index]];
+    }
+    [txt replaceCharactersInRange:[vm rangeAtIndex:2] withString:value];
+    return YES;
+}
 static void MSApplyGameSettings(NSSet *keys) {
     /* Only the resolution is written, as a text edit of its "value" (the game is offered only that one mode); the rest of
        the file stays byte for byte as the game wrote it. Re-serialising the whole file (NSJSONSerialization escapes every
@@ -1186,6 +1479,19 @@ static void MSApplyGameSettings(NSSet *keys) {
             NSTextCheckingResult *m = [re firstMatchInString:txt options:0 range:obj];
             if (m && ![[txt substringWithRange:[m rangeAtIndex:2]] isEqualToString:want]) { [txt replaceCharactersInRange:[m rangeAtIndex:2] withString:want]; changed = YES; }
         }
+    }
+    /* once: the Mac build's upscaler names don't match its menu labels - value "FSR2" is MetalFX in the menu and in the
+       engine (the MetalFX scaler is made for it), value "MetalFX" is FSR 3.1. An earlier CyPort (and its first-run
+       template) wrote "MetalFX" meaning MetalFX, so the game ran FSR 3.1. Put it on real MetalFX, Performance. */
+    if (![NSUserDefaults.standardUserDefaults boolForKey:@"CyPortUpscalerNamesFixed"]) {
+        NSString *was = nil;
+        if (MSTextSetOption(txt, @"ResolutionScaling", nil, -1, &was) && [was isEqualToString:@"MetalFX"]) {
+            MSTextSetOption(txt, @"ResolutionScaling", @"FSR2", 1, NULL);
+            MSTextSetOption(txt, @"FSR2", @"Performance", 3, NULL);
+            MSTextSetOption(txt, @"MetalFX", @"Performance", 3, NULL);
+            changed = YES; MSLogf(@"upscaler: was FSR 3.1 (value \"MetalFX\"), now MetalFX Performance (value \"FSR2\")");
+        }
+        [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"CyPortUpscalerNamesFixed"];
     }
     if (changed && [txt writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil])
         MSLogf(@"start screen: resolution %@ (text edit%@)", want, unesc ? [NSString stringWithFormat:@", %lu escaped slashes repaired", (unsigned long)unesc] : @"");
@@ -1304,8 +1610,7 @@ static void MSSyncStartScreenFrom(NSDictionary *v) {
 static UIWindow *g_restartWin;
 static void MSShowRestartPopup(NSArray *changed) {
     if (g_restartWin) return;                                    /* already showing */
-    UIWindowScene *sc = nil;
-    for (UIScene *x in UIApplication.sharedApplication.connectedScenes) if ([x isKindOfClass:UIWindowScene.class]) { sc = (UIWindowScene *)x; break; }
+    UIWindowScene *sc = MSAppScene();
     g_restartWin = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     g_restartWin.windowLevel = UIWindowLevelAlert + 20; g_restartWin.backgroundColor = UIColor.clearColor;
     g_restartWin.rootViewController = [MSRestartVC new]; g_restartWin.rootViewController.view.backgroundColor = UIColor.clearColor;
@@ -1526,6 +1831,26 @@ int ms_pthread_set_qos_class_self_np(qos_class_t q, int rel) {
  * 20 us after 32 yields in a row, 100 us after 256. The count resets once the thread stops yielding for 1 ms (it got
  * the lock / found work), so real work never waits. YieldBackoff = NO turns it off. */
 _Atomic long long g_yields, g_yieldSleeps;
+/* engine threads ask for SCHED_RR (fixed "real-time" priority 41-47, see the priority table at 0x104a4c9f0). On a Mac
+   with 8+ cores that's fine; on the iPhone's 6 they fill every core above the system threads that deliver mouse and
+   keyboard input, so above ~30 FPS input arrived late and jittery. They run as normal (timeshare) threads at the same
+   priority instead, which the scheduler shares fairly. RealtimeThreads = YES keeps the Mac policy. */
+static int MSThreadPolicy(int policy) {
+    static int keep = -1; if (keep < 0) keep = [MSConfig()[@"RealtimeThreads"] boolValue];
+    if (keep || (policy != SCHED_RR && policy != SCHED_FIFO)) return policy;
+    static _Atomic int n; if (n++ < 3) MSLogf(@"threads: engine asked for %s scheduling - using normal scheduling at the same priority", policy == SCHED_RR ? "round-robin real-time" : "FIFO real-time");
+    return SCHED_OTHER;
+}
+int ms_pthread_attr_setschedpolicy(pthread_attr_t *a, int policy) __asm("_pthread_attr_setschedpolicy");
+int ms_pthread_attr_setschedpolicy(pthread_attr_t *a, int policy) {
+    static int (*real)(pthread_attr_t *, int); if (!real) real = (int (*)(pthread_attr_t *, int))dlsym(RTLD_NEXT, "pthread_attr_setschedpolicy");
+    return real(a, MSThreadPolicy(policy));
+}
+int ms_pthread_setschedparam(pthread_t t, int policy, const struct sched_param *p) __asm("_pthread_setschedparam");
+int ms_pthread_setschedparam(pthread_t t, int policy, const struct sched_param *p) {
+    static int (*real)(pthread_t, int, const struct sched_param *); if (!real) real = (int (*)(pthread_t, int, const struct sched_param *))dlsym(RTLD_NEXT, "pthread_setschedparam");
+    return real(t, MSThreadPolicy(policy), p);
+}
 int ms_sched_yield(void) __asm("_sched_yield");
 int ms_sched_yield(void) {
     static int (*real)(void); static int on = -1;
@@ -1905,8 +2230,7 @@ static void MSBanner(NSString *text) {
         static UIWindow *w;
         if (!text) { [g_driveBanner removeFromSuperview]; g_driveBanner = nil; w.hidden = YES; return; }
         if (!w) {
-            UIWindowScene *sc = nil;
-            for (UIScene *s in UIApplication.sharedApplication.connectedScenes) if ([s isKindOfClass:UIWindowScene.class]) { sc = (UIWindowScene *)s; break; }
+            UIWindowScene *sc = MSAppScene();
             if (!sc) return;
             w = [[UIWindow alloc] initWithWindowScene:sc]; w.windowLevel = UIWindowLevelAlert + 10; w.userInteractionEnabled = NO;
             w.backgroundColor = UIColor.clearColor; w.rootViewController = [UIViewController new];
@@ -2105,6 +2429,92 @@ static NSString *MSThreadCPUReport(void) {
     NSMutableArray *out = [NSMutableArray array]; for (NSArray *r in rows) { if (out.count >= 10) break; [out addObject:r[1]]; }
     return [out componentsJoinedByString:@", "];
 }
+/* where the engine's worker threads (redDispatcher*) spend their time: 2 s of PC samples (~250 Hz per thread), top
+   code addresses as the exe's own addresses (0x1xxxxxxxx, as in a disassembler) or library+offset. WorkerSampler=NO off. */
+static NSString *MSWhere(uint64_t pc, intptr_t exeSlide, uint64_t exeLo, uint64_t exeHi) {
+    if (pc >= exeLo && pc < exeHi) return [NSString stringWithFormat:@"%#llx", pc - (uint64_t)exeSlide];
+    Dl_info di; if (dladdr((void *)pc, &di) && di.dli_fname) {
+        const char *b = strrchr(di.dli_fname, '/'); b = b ? b + 1 : di.dli_fname;
+        if (di.dli_sname) return [NSString stringWithFormat:@"%s:%s+%#lx", b, di.dli_sname, (unsigned long)(pc - (uint64_t)di.dli_saddr)];
+        return [NSString stringWithFormat:@"%s+%#lx", b, (unsigned long)(pc - (uint64_t)di.dli_fbase)];
+    }
+    return [NSString stringWithFormat:@"%#llx", pc];
+}
+static NSString *MSSampleWorkers(void) {
+    if ([MSConfig()[@"WorkerSampler"] isEqual:@NO]) return nil;
+    intptr_t slide = 0; uint64_t lo = 0, hi = 0;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *n = _dyld_get_image_name(i); if (!n || !strstr(n, "/Cyberpunk2077.app/Cyberpunk2077")) continue;
+        slide = _dyld_get_image_vmaddr_slide(i); unsigned long sz = 0;
+        uint8_t *t = getsectiondata((const struct mach_header_64 *)_dyld_get_image_header(i), "__TEXT", "__text", &sz);
+        lo = (uint64_t)t; hi = lo + sz; break;
+    }
+    thread_act_array_t th; mach_msg_type_number_t n = 0; if (task_threads(mach_task_self(), &th, &n) != KERN_SUCCESS) return nil;
+    thread_act_t w[16]; int nw = 0;
+    for (mach_msg_type_number_t k = 0; k < n; k++) {
+        char nm[64] = ""; pthread_t pt = pthread_from_mach_thread_np(th[k]); if (pt) pthread_getname_np(pt, nm, sizeof nm);
+        if (nw < 16 && strncmp(nm, "redDispatcher", 13) == 0) w[nw++] = th[k]; else mach_port_deallocate(mach_task_self(), th[k]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)th, n * sizeof *th);
+    if (!nw) return nil;
+    NSCountedSet *pcs = [NSCountedSet set], *lrs = [NSCountedSet set]; int total = 0, running = 0;
+    for (int round = 0; round < 500; round++) {
+        for (int k = 0; k < nw; k++) {
+            if (thread_suspend(w[k]) != KERN_SUCCESS) continue;
+            arm_thread_state64_t st; mach_msg_type_number_t c = ARM_THREAD_STATE64_COUNT;
+            thread_basic_info_data_t bi; mach_msg_type_number_t cb = THREAD_BASIC_INFO_COUNT;
+            kern_return_t kr = thread_get_state(w[k], ARM_THREAD_STATE64, (thread_state_t)&st, &c);
+            BOOL run = thread_info(w[k], THREAD_BASIC_INFO, (thread_info_t)&bi, &cb) == KERN_SUCCESS && bi.run_state == TH_STATE_RUNNING;
+            thread_resume(w[k]);
+            if (kr != KERN_SUCCESS) continue;
+            total++; if (!run) continue;                       /* only time actually spent on a CPU */
+            running++;
+            [pcs addObject:@((uint64_t)arm_thread_state64_get_pc(st))];
+            [lrs addObject:@((uint64_t)arm_thread_state64_get_lr(st))];
+        }
+        usleep(4000);
+    }
+    for (int k = 0; k < nw; k++) mach_port_deallocate(mach_task_self(), w[k]);
+    NSString *(^top)(NSCountedSet *) = ^NSString *(NSCountedSet *set) {
+        NSArray *all = [set.allObjects sortedArrayUsingComparator:^NSComparisonResult(id a, id b) { return [@([set countForObject:b]) compare:@([set countForObject:a])]; }];
+        NSMutableArray *o = [NSMutableArray array];
+        for (NSNumber *v in all) { if (o.count >= 12) break; [o addObject:[NSString stringWithFormat:@"%@ %.0f%%", MSWhere(v.unsignedLongLongValue, slide, lo, hi), 100.0 * [set countForObject:v] / MAX(1, running)]]; }
+        return [o componentsJoinedByString:@", "];
+    };
+    return [NSString stringWithFormat:@"%d workers, %d samples, %.0f%% on CPU | top code: %@ | called from: %@", nw, total, 100.0 * running / MAX(1, total), top(pcs), top(lrs)];
+}
+/* MetalFX: the game asks MTLFXTemporalScalerDescriptor whether this GPU can do MetalFX and falls back to FSR when it
+   says no (seen: the game saved "ResolutionScaling MetalFX -> FSR2" ~60 s after starting). Every answer is logged; the
+   support check is answered YES on an Apple GPU (A14 and later all do MetalFX). MetalFXForce = NO keeps the real answer. */
+static IMP g_fxSupports, g_fxMin, g_fxMax, g_fxNew;
+static BOOL ms_fxSupports(id self, SEL c, id dev) {
+    BOOL real = ((BOOL (*)(id, SEL, id))g_fxSupports)(self, c, dev);
+    BOOL force = ![MSConfig()[@"MetalFXForce"] isEqual:@NO] && [dev respondsToSelector:@selector(supportsFamily:)] && [dev supportsFamily:MTLGPUFamilyApple7];
+    static int n; if (n++ < 6) MSLogf(@"MetalFX: %@ supportsDevice:%@ -> %@%@", self, [dev name], real ? @"YES" : @"NO", !real && force ? @" (answered YES)" : @"");
+    return real || force;
+}
+static float ms_fxMin(id self, SEL c, id dev) { float v = ((float (*)(id, SEL, id))g_fxMin)(self, c, dev); static int n; if (n++ < 3) MSLogf(@"MetalFX: min input scale %.2f", v); return v; }
+static float ms_fxMax(id self, SEL c, id dev) { float v = ((float (*)(id, SEL, id))g_fxMax)(self, c, dev); static int n; if (n++ < 3) MSLogf(@"MetalFX: max input scale %.2f", v); return v; }
+static id ms_fxNew(id self, SEL c, id dev) {
+    id r = ((id (*)(id, SEL, id))g_fxNew)(self, c, dev);
+    static int n; if (n++ < 6) MSLogf(@"MetalFX: temporal scaler %@ (input %lux%lu -> output %lux%lu)", r ? @"created" : @"FAILED",
+        [[self valueForKey:@"inputWidth"] unsignedLongValue], [[self valueForKey:@"inputHeight"] unsignedLongValue],
+        [[self valueForKey:@"outputWidth"] unsignedLongValue], [[self valueForKey:@"outputHeight"] unsignedLongValue]);
+    return r;
+}
+static void MSHookMetalFX(const struct mach_header *mh, intptr_t slide) {
+    static BOOL done; if (done) return;
+    Class d = NSClassFromString(@"MTLFXTemporalScalerDescriptor"); if (!d) return;
+    done = YES;
+    Method m;
+    if ((m = class_getClassMethod(d, @selector(supportsDevice:)))) g_fxSupports = method_setImplementation(m, (IMP)ms_fxSupports);
+    if ((m = class_getClassMethod(d, NSSelectorFromString(@"supportedInputContentMinScaleForDevice:")))) g_fxMin = method_setImplementation(m, (IMP)ms_fxMin);
+    if ((m = class_getClassMethod(d, NSSelectorFromString(@"supportedInputContentMaxScaleForDevice:")))) g_fxMax = method_setImplementation(m, (IMP)ms_fxMax);
+    if ((m = class_getInstanceMethod(d, NSSelectorFromString(@"newTemporalScalerWithDevice:")))) g_fxNew = method_setImplementation(m, (IMP)ms_fxNew);
+    MSLogf(@"MetalFX: hooks in (supports %d, scaler %d)", g_fxSupports != NULL, g_fxNew != NULL);
+}
+__attribute__((constructor)) static void MSInstallMetalFXHooks(void) { _dyld_register_func_for_add_image(MSHookMetalFX); }
+
 static long long MSYieldRate(int slept) {             /* per second since the last call (each kind) */
     extern _Atomic long long g_yields, g_yieldSleeps;
     static long long lastY, lastS; static double lastT[2]; double t = CACurrentMediaTime(), dt = lastT[slept] ? t - lastT[slept] : 0; lastT[slept] = t;
@@ -2254,10 +2664,16 @@ static void MSPadSetStick(GCControllerDirectionPad *d, float x, float y) {
 /* once per game frame: finger speed over the last frame -> right stick. Smoothed (the touch samples and the game's frames
    don't line up), with a response curve so slow swipes still turn (the game squares small stick values), and it eases
    back to centre when the finger stops or lifts. LookSpeed scales it (default 1; full deflection at ~650 pt/s). */
+/* the start screen's Look sensitivity slider (NSUserDefaults CyPortLookSensitivity, 0.25-4, default 1.5) */
+static double MSLookSensitivity(void) {
+    double v = [NSUserDefaults.standardUserDefaults doubleForKey:@"CyPortLookSensitivity"];
+    return v >= 0.25 && v <= 4 ? v : 1.5;
+}
 static void MSLookFlushStick(double dt) {
     static float vx, vy; static double full = 0, curve = 0;
     if (!g_pad) return;
-    if (!full) { id ls = MSConfig()[@"LookSpeed"]; double sp = ls ? [ls doubleValue] : 1; if (sp <= 0) sp = 1; full = 650 / sp; curve = MSCfgD(@"LookCurve", 0.6); }
+    if (!full) { id ls = MSConfig()[@"LookSpeed"]; double sp = ls ? [ls doubleValue] : 1; if (sp <= 0) sp = 1; full = 650 / (sp * MSLookSensitivity());
+             MSLogf(@"look sensitivity %.2fx", MSLookSensitivity()); curve = MSCfgD(@"LookCurve", 0.6); }
     if (dt < 1 / 240.0) dt = 1 / 240.0; if (dt > 0.1) dt = 0.1;
     os_unfair_lock_lock(&g_lookLock); CGPoint d = g_lookPending; g_lookPending = CGPointZero; os_unfair_lock_unlock(&g_lookLock);
     BOOL fingerMoving = g_lookFingerAt && CACurrentMediaTime() - g_lookFingerAt < 0.06;
@@ -2423,7 +2839,7 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
                frame; per-display-frame sampling gave a spike and then zeros = jerky camera); ~700 pt/s is full */
             {   /* camera swipe: finger movement is collected (coalesced touches, full touch rate) and handed to the game once
                    per game frame - as the right stick (default) or as mouse motion (LookMode = mouse) */
-                static double scale; if (!scale) scale = MSCfgD(@"LookMouseScale", 2.0);
+                static double scale; if (!scale) scale = MSCfgD(@"LookMouseScale", 2.0) * MSLookSensitivity();
                 double k = g_lookStick ? 1 : scale * _lookSpeed;
                 CGPoint q = p; NSArray *cs = [e coalescedTouchesForTouch:t]; if (cs.count) q = [cs.lastObject locationInView:self];
                 MSLookAdd(CGPointMake((q.x - _lookLast.x) * k, (q.y - _lookLast.y) * k));
@@ -2462,7 +2878,7 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
 - (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
     for (UITouch *t in ts) {
         if ((t == _moveTouch || t == _rTouch) && !g_pointerLocked && t.timestamp - _stickT0 < 0.25 && _stickMax < 12) {
-            MSHostView *h = g_hostView; CGPoint q = [t locationInView:h];     /* quick tap on a stick in a menu: a click */
+            MSHostView *h = g_hostView; CGPoint q = MSTouchIn(t, h);     /* quick tap on a stick in a menu: a click */
             if (h) [h msClick:q right:NO];
         }
         if (t == _moveTouch) {
@@ -2481,7 +2897,7 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
 }
 - (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self touchesEnded:ts withEvent:e]; }
 - (void)msTick:(CADisplayLink *)l {
-    BOOL want = g_frames > 60 && !MSRealControllerConnected();
+    BOOL want = g_frames > 60 && !MSRealControllerConnected() && !g_gcmCount;
     if (want != _shown) { _shown = want; self.hidden = !want; if (want) MSLogf(@"touch controls shown"); }
     if (!want) return;
     [self msLayout];
@@ -2621,8 +3037,8 @@ static void MSStatusCreate(void) {                    /* main thread, before the
     if ([MSConfig()[@"ShowStatus"] isEqual:@NO]) return;
     Method m = class_getInstanceMethod(CAMetalLayer.class, @selector(nextDrawable));
     if (m && !g_origNextDrawable) g_origNextDrawable = method_setImplementation(m, (IMP)ms_nextDrawable);
-    UIWindowScene *sc = nil;
-    for (UIWindow *w in UIApplication.sharedApplication.windows) if (w.windowScene) { sc = w.windowScene; break; }
+    UIWindowScene *sc = MSAppScene();
+    if (!sc) for (UIWindow *w in UIApplication.sharedApplication.windows) if (w.windowScene) { sc = w.windowScene; break; }
     g_statusWin = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     g_statusWin.windowLevel = UIWindowLevelAlert + 5; g_statusWin.userInteractionEnabled = NO;
     g_statusWin.backgroundColor = UIColor.clearColor; g_statusWin.rootViewController = [UIViewController new];
@@ -2733,6 +3149,8 @@ static void MSStartReadProgress(void) {
                            now - t0, b / 1073741824.0, c, mbps, idle, cpuPct, mem, fr, fps, MSMouseGate(), g_mqAsked > g_mqBeat ? now - g_mqAsked : 0.0, MSThermal(), MSYieldRate(0), MSYieldRate(1),
                            NSProcessInfo.processInfo.lowPowerModeEnabled ? @", LOW POWER MODE" : @"");
                 if (tick % 60 == 59 && fr > 60) MSLogf(@"threads (CPU over the last 30 s): %@", MSThreadCPUReport());
+                if (g_gcmCount) { static long long lm, lh; static long long lc; MSLogf(@"mouse: %lld motion events, %lld clicks, %lld pointer positions in the last 5 s (%s)", g_gcmMoves - lm, g_gcmClicks - lc, g_gcmHovers - lh, g_pointerLocked ? "gameplay" : "menu"); lm = g_gcmMoves; lh = g_gcmHovers; lc = g_gcmClicks; }
+                if (tick % 120 == 99 && fr > 1500) { NSString *ws = MSSampleWorkers(); if (ws) MSLogf(@"worker samples: %@", ws); }
                 if (tick % 20 == 19) MSLogf(@"pools:%@", MSPoolUsage());
                 if (tick % 20 == 19) MSLogf(@"%@", MSQuarantineStats());
                 if (tick % 20 == 19) MSLogf(@"gpu: %lld noCopy buffers %.0f MB, %lld textures over buffers (%lld bad)", g_noCopyN, g_noCopyBytes / 1048576.0, g_bufTexN, g_bufTexBad);
@@ -3211,6 +3629,16 @@ __attribute__((constructor)) static void MSInit(void) {
         MSMainAsync(^{
             if (GCKeyboard.coalescedKeyboard) MSAttachKeyboard(GCKeyboard.coalescedKeyboard);
             [NSNotificationCenter.defaultCenter addObserverForName:GCKeyboardDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification *n) { MSAttachKeyboard(n.object); }];
+            for (GCMouse *m in GCMouse.mice) MSAttachMouse(m);
+            [NSNotificationCenter.defaultCenter addObserverForName:GCMouseDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification *n) { MSAttachMouse(n.object); }];
+            [NSNotificationCenter.defaultCenter addObserverForName:GCMouseDidDisconnectNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+                if (g_gcmCount > 0) g_gcmCount--; MSLogf(@"mouse disconnected");
+                MSMainAsync(^{                               /* never leave a button held */
+                    MSHostView *h = g_hostView; if (!h) return;
+                    if (g_gcmRight) { g_gcmRight = NO; [h msButton:NO right:YES at:MSGCMouseAt(h)]; }
+                    if (g_leftBy == 2) MSLeftPress(2, NO);
+                });
+            }];
         });
     }
 }

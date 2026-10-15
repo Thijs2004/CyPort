@@ -19,8 +19,10 @@ No emulation, no streaming: the Apple Silicon Mac build runs directly on iOS / i
 | On-screen controls (virtual gamepad + touch-as-mouse in menus) | ✅ works |
 | Bluetooth / MFi controllers (Xbox, DualSense, DualShock 4) | ✅ works, on-screen pad hides automatically |
 | Resolution picker up to native (2868 × 1320 on iPhone 16 Pro Max) | ✅ works |
-| Performance | ⚠️ ~30–60 FPS at 1434 × 660 with low settings on an iPhone 16 Pro Max; CPU-bound, the phone gets hot and throttles in long sessions |
-| Online features (GOG Galaxy, CDPR account, crash upload) | ❌ offline only (stubbed) |
+| Performance | ⚠️ ~30–60 FPS at 1434 × 660 with low settings + MetalFX on an iPhone 16 Pro Max; the phone gets hot and throttles in long sessions |
+| Cloud saves (GOG, Steam, Epic) – carry on where you left off on your PC/Mac and back | 🧪 new: GOG download tested, sending and Steam/Epic untested |
+| Download the game data in the app (Steam, GOG, Epic account) | 🧪 new: untested with signed-in accounts |
+| Online features (GOG Galaxy achievements, crash upload) | ❌ offline only (stubbed) |
 
 Tested on: **iPhone 16 Pro Max (A18 Pro, 8 GB), iOS 27.0.1**, built with Xcode 27.
 
@@ -77,7 +79,9 @@ M-series iPads have more RAM and better cooling and should run it as well or bet
    Or double-click **`Build CyPort.command`** and drag your `Cyberpunk2077.app` into the window (then sign the IPA yourself).
 3. **Import the game data** on the device: open CyPort → **Import game…** → pick your `Cyberpunk 2077` folder
    (e.g. on a USB-C SSD, or in iCloud/Files). It is copied into the app (~65 GB, a few minutes over USB 3; the import can be resumed).
-   Alternatively copy the folder with the Files app to *On My iPhone → CyPort → Cyberpunk 2077*.
+   Alternatively copy the folder with the Files app to *On My iPhone → CyPort → Cyberpunk 2077*, or tap
+   **Download from Steam, GOG or Epic…**, sign in with the account that owns the game and let CyPort download the game data
+   (only the data folders; the program itself always comes from your build).
 4. Open CyPort, pick a resolution, press **PLAY**.
 
 ---
@@ -89,6 +93,12 @@ M-series iPads have more RAM and better cooling and should run it as well or bet
   1434 × 660 is a good start. All other graphics options are set in the game's own **Settings** menu and are kept between launches.
 - **Performance overlay** – Off / FPS / Detailed (FPS, frame time, CPU, RAM; *Detailed* also turns on Apple's Metal HUD).
   The system Metal HUD (Settings → Developer → Graphics HUD) is independent of this.
+- **Look sensitivity** – how fast swiping turns the camera (0.25× – 4×).
+- **Cloud saves** – pick the store you play on (**GOG**, **Steam** or **Epic**) and sign in. Every time CyPort opens it brings the
+  phone and that store's cloud in step, per save slot: the side that changed since the last sync wins (both changed: the newer one).
+  Saves you make on the phone go up while you play, so the game on your PC/Mac continues from them. A replaced phone save is moved
+  to `saves-backup-<date>` first, and before the first upload to a store the whole cloud is copied to the phone. Optional – without
+  signing in everything stays on the phone. With GOG, the game's own CD PROJEKT RED cloud sign-in is set up as well.
 - When you change a setting in-game that needs a restart, CyPort offers to quit; just open it again.
 - First launch uses the lowest graphics settings.
 
@@ -109,6 +119,9 @@ M-series iPads have more RAM and better cooling and should run it as well or bet
 | `TouchControls` = NO / `VirtualController` = NO | no on-screen controls / keyboard-only pad |
 | `ShowStatus` = NO | no loading / FPS overlay at all |
 | `YieldBackoff` = NO, `BackgroundFreeze` = NO, `RestartPopup` = NO | turn individual fixes off |
+| `RealtimeThreads` = YES | keep the Mac's real-time scheduling for engine threads (CyPort runs them as normal threads at the same priority) |
+| `MetalFXForce` = NO | don't answer "supported" when the game asks whether this GPU can do MetalFX |
+| `WorkerSampler` = NO | no worker-thread profile lines in the log |
 | `ResMode` (0–7), `AutoPlay`, `AutoKeys` | testing aids |
 
 Logs: *Files → On My iPhone → CyPort → `macshim.log`* (and `game_output.log`, the engine's own output).
@@ -165,8 +178,14 @@ agent), which did most of the analysis, debugging and implementation in long int
   the game rejects). Set your settings again; from then on they are kept.
 - **Low FPS after some minutes:** the phone is throttling (log line `thermal HOT`). Cap FPS at 40 in-game (even frame pacing on 120 Hz)
   and remove the case / use a cooler.
+- **The game shows FSR 3.1 although you chose MetalFX:** in the Mac build the upscaler's stored names don't match its menu
+  labels (stored `FSR2` = MetalFX, stored `MetalFX` = FSR 3.1). Earlier CyPort builds wrote the wrong one; this one corrects it once
+  on start. Pick MetalFX in the game's menu and it stays.
+- **Cloud saves:** CyPort's log lines start with `cloud:`. Replaced phone saves are in `saves-backup-<date>` next to the saves folder.
 - Look in `macshim.log` first – every fix logs what it does.
 
 ## License
 The CyPort code is **MIT** licensed (see `LICENSE`). It does not include and does not grant any rights to *Cyberpunk 2077* or any
 CD PROJEKT RED content.
+Included decoders for the store downloads: LZMA decoder from the 7-Zip LZMA SDK (public domain, `shim/third_party/lzma`) and the
+zstd decompressor (BSD, `shim/third_party/zstd/LICENSE`).

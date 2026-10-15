@@ -423,8 +423,8 @@
                     "name": "ResolutionScaling",
                     "type": "string_list",
                     "is_dynamic": false,
-                    "value": "MetalFX",
-                    "index": 3,
+                    "value": "FSR2",
+                    "index": 1,
                     "default_index": 1,
                     "values": [
                         "Off",
@@ -437,8 +437,8 @@
                     "name": "FSR2",
                     "type": "string_list",
                     "is_dynamic": false,
-                    "value": "Auto",
-                    "index": 0,
+                    "value": "Performance",
+                    "index": 3,
                     "default_index": 0,
                     "values": [
                         "Auto",
