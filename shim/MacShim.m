@@ -1937,24 +1937,69 @@ static BOOL MSIsPatchedPoolSite(void *ra) {
     const uint32_t *i = (const uint32_t *)ra;               /* ra = instruction after the bl */
     return MSCallerIsMainExe(ra) && i[0] == 0xb100041f && (i[1] & 0xff00001f) == 0x54000000 && i[2] == 0xd503201f;
 }
+/* Without the extended-virtual-addressing entitlement there is no 64 GB region at 0x70_0000_0000, only the normal
+ * (much smaller) address space. Then the pools are sized to fit it ("compact" layout): about CompactShare (default
+ * 0.45) of the address space that can be reserved goes to the pools, the rest stays free for the GPU driver and malloc.
+ * Pools only touch what they hand out (the game used ~0.5-1.2 GB of each 8 GB pool), so smaller caps cost nothing
+ * until a pool really fills. CompactPools = YES forces this layout, NO never uses it. */
+static int g_vaCompact = -1; static double g_vaBudgetGB, g_vaTotalGB;
+static void MSVAInit(void) {
+    if (g_vaCompact >= 0) return;
+    void *t = kmmap((void *)0x7000000000, (size_t)1 << 30, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    BOOL big = t == (void *)0x7000000000; if (t != MAP_FAILED) kmunmap(t, (size_t)1 << 30);
+    id force = MSConfig()[@"CompactPools"]; if (force) big = ![force boolValue];
+    void *maps[256]; size_t sizes[256]; int n = 0; size_t total = 0;      /* reservable address space, 256 MB precision */
+    for (size_t sz = (size_t)512 << 30; sz >= ((size_t)256 << 20) && n < 256; ) {
+        void *p = kmmap(NULL, sz, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p == MAP_FAILED) { sz >>= 1; continue; }
+        maps[n] = p; sizes[n++] = sz; total += sz;
+    }
+    for (int i = 0; i < n; i++) kmunmap(maps[i], sizes[i]);
+    g_vaTotalGB = total / 1073741824.0; g_vaCompact = !big;
+    double share = MSCfgD(@"CompactShare", 0.45); if (share < 0.1) share = 0.1; if (share > 0.8) share = 0.8;
+    g_vaBudgetGB = g_vaTotalGB * share;
+    MSLogf(@"address space: %.1f GB reservable, %@", g_vaTotalGB, big ? @"extended (64 GB region): normal pool layout"
+           : [NSString stringWithFormat:@"no extended-virtual-addressing: compact pools, %.1f GB for them", g_vaBudgetGB]);
+}
+/* compact cap for a pool the engine asked `asked` bytes for: the engine makes 3 big pools (16/32/64 GB), up to ~8 of
+   4 GB and a few of <= 1 GB; the budget is split by weight 4 / 1 / 0.5 */
+static double MSCompactCapGB(size_t asked) {
+    double u = g_vaBudgetGB / (3 * 4 + 8 * 1 + 3 * 0.5), a = asked / 1073741824.0;
+    if (a >= 8) return fmin(fmax(4 * u, 1), 8);
+    if (a >= 2) return fmin(fmax(u, 0.5), a);
+    return fmin(a, fmax(0.25, u / 2));
+}
 static void *MSMmapOld(void *addr, size_t len, int prot, int flags, int fd, off_t off);
 MSMapRet ms_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) __asm("_mmap");
 MSMapRet ms_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     void *ra = __builtin_return_address(0);
     if (!addr && fd < 0 && (flags & MAP_ANON) && !(flags & MAP_FIXED) && len >= ((size_t)1 << 30) && MSIsPatchedPoolSite(ra)) {
+        MSVAInit();
         /* per-pool override: PoolCap16GB, PoolCap64GB, ... (by the size the engine asked for), else PoolCapGB */
-        double capGB = MSCfgD([NSString stringWithFormat:@"PoolCap%zuGB", len >> 30], MSCfgD(@"PoolCapGB", 8));
+        double capGB = MSCfgD([NSString stringWithFormat:@"PoolCap%zuGB", len >> 30], MSCfgD(@"PoolCapGB", g_vaCompact ? MSCompactCapGB(len) : 8));
         size_t cap = (size_t)(capGB * 1073741824.0) & ~(size_t)0x3fff, real = len < cap ? len : cap, min = (size_t)256 << 20;
         /* a shrunk pool gets a no-access guard behind it: an engine that writes past the end it was told then faults
            right there (and the crash log names the pool) instead of silently corrupting the next pool */
-        size_t guard = real < len ? (size_t)(MSCfgD(@"PoolGuardMB", 512) * 1048576.0) & ~(size_t)0x3fff : 0;
+        size_t guard = real < len ? (size_t)(MSCfgD(@"PoolGuardMB", g_vaCompact ? 16 : 512) * 1048576.0) & ~(size_t)0x3fff : 0;
         void *p = MAP_FAILED;
         /* Keep pools below 64 GB like on macOS (where big mmaps land around 0x3_0000_0000): left to itself iOS puts
            them at 0x70_0000_0000+, and the engine's allocators corrupt their free lists with pointers that high
            (tagged/packed pointers that assume ~36-bit addresses). First fit from 8 GB up, 1 GB steps. */
         /* Each pool on a boundary of its own (power-of-two) size, like the engine's allocators may assume when they
            round an address down to find a block header. Placed upward from 0x70_0000_0000 by hint. */
-        if (![MSConfig()[@"PoolAlign"] isEqual:@NO]) {
+        if (g_vaCompact && ![MSConfig()[@"PoolAlign"] isEqual:@NO]) {
+            /* compact: anywhere the kernel has room, still on a boundary of the pool's own (power-of-two) size -
+               over-reserve by the alignment, then give back the head and the tail */
+            size_t al = (size_t)1 << 20; while (al < real && al < ((size_t)8 << 30)) al <<= 1;
+            void *q = kmmap(NULL, real + guard + al, prot, flags, -1, 0);
+            if (q != MAP_FAILED) {
+                uintptr_t a = ((uintptr_t)q + al - 1) & ~(uintptr_t)(al - 1), head = a - (uintptr_t)q, tail = al - head;
+                if (head) kmunmap(q, head);
+                if (tail) kmunmap((void *)(a + real + guard), tail);
+                p = (void *)a;
+            } else MSLogf(@"pool of %.2f GB (+%zu MB alignment): no room - trying smaller", real / 1073741824.0, al >> 20);
+        }
+        if (!g_vaCompact && ![MSConfig()[@"PoolAlign"] isEqual:@NO]) {
             static uintptr_t next = (uintptr_t)0x7000000000;
             size_t al = (size_t)1 << 20; while (al < real && al < ((size_t)8 << 30)) al <<= 1;
             for (int tries = 0; tries < 64 && p == MAP_FAILED; tries++) {

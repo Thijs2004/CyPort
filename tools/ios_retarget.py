@@ -136,6 +136,7 @@ def retarget(src, dst, minos, sdk):
     if not seen: raise SystemExit("no LC_BUILD_VERSION: not a modern macOS build")
     log += reroute_imports(d, m)
     if m["ftype"] == 2: log += patch_pool_end(d, m) + patch_watchdog(d, m) + patch_pool_sizes(d, m) + patch_free_hook(d, m)      # MH_EXECUTE
+    log += dedupe_dylibs(d, m)          # last: it moves load commands, so m["cmds"] offsets are stale afterwards
     open(dst, "wb").write(d)
     return log
 
@@ -165,6 +166,87 @@ def reroute_imports(d, m):
             else:        struct.pack_into("<I", d, p, (v & ~0xff) | ordinal)
             done.append(name)
     return ["rerouted to shim (ordinal %d): %s" % (ordinal, ", ".join(sorted(set(done))))] if done else []
+
+def dedupe_dylibs(d, m):
+    """Several macOS frameworks map to the same @rpath/libMacShim.dylib, which leaves duplicate LC_LOAD_DYLIB commands.
+    The normal app launch tolerates that, but dlopen'ing the executable (LiveContainer) collapses duplicates, so every
+    import ordinal after the first duplicate shifts onto the wrong library ("Symbol not found: _AUGraphAddNode ...
+    Expected in: CoreHaptics"). Keep the first copy of each path, renumber the import ordinals (chained fixups imports +
+    symbol table n_desc), and remove the duplicate commands."""
+    dylibs = [(cmd, off, sz) for cmd, off, sz in m["cmds"] if cmd in DYLIB_CMDS]
+    first, remap, drop = {}, {}, set()
+    for i, (cmd, off, sz) in enumerate(dylibs, 1):
+        path = name_of(d, off, sz)[1]
+        if path in first:
+            j = first[path]; drop.add(off)
+            if cmd != LC_LOAD_WEAK_DYLIB and dylibs[j - 1][0] == LC_LOAD_WEAK_DYLIB:    # a strong duplicate keeps it strong
+                struct.pack_into("<I", d, dylibs[j - 1][1], LC_LOAD_DYLIB)
+            remap[i] = remap[j]
+        else:
+            first[path] = i; remap[i] = len(first)
+    if not drop: return []
+    if max(remap) > 253: raise SystemExit("too many dylibs to renumber")
+    # chained fixups imports
+    fx = [off for cmd, off, sz in m["cmds"] if cmd == LC_DYLD_CHAINED_FIXUPS]
+    for cmd, off, sz in m["cmds"]:
+        if cmd in (0x22, 0x80000022):                                                   # LC_DYLD_INFO(_ONLY): opcode binds
+            _ro, _rs, bo, bs, _wo, _ws, lo, ls = struct.unpack_from("<8I", d, off + 8)
+            remap_bind_opcodes(d, bo, bs, remap); remap_bind_opcodes(d, lo, ls, remap)
+    if fx:
+        dataoff = struct.unpack_from("<I", d, fx[0] + 8)[0]
+        _v, _st, imp_off, _so, count, fmt, _sf = struct.unpack_from("<IIIIIII", d, dataoff)
+        size = {1: 4, 2: 8, 3: 16}[fmt]
+        for i in range(count):
+            p = dataoff + imp_off + i * size
+            if fmt == 3:
+                v = struct.unpack_from("<Q", d, p)[0]; lib = v & 0xffff
+                if lib in remap: struct.pack_into("<Q", d, p, (v & ~0xffff) | remap[lib])
+            else:
+                v = struct.unpack_from("<I", d, p)[0]; lib = v & 0xff
+                if lib in remap: struct.pack_into("<I", d, p, (v & ~0xff) | remap[lib])
+    # symbol table: two-level-namespace library ordinal in the high byte of n_desc (undefined symbols)
+    for cmd, off, sz in m["cmds"]:
+        if cmd != 0x2: continue                                                         # LC_SYMTAB
+        symoff, nsyms = struct.unpack_from("<II", d, off + 8)
+        for i in range(nsyms):
+            e = symoff + 16 * i
+            ntype, desc = d[e + 4], struct.unpack_from("<H", d, e + 6)[0]
+            if ntype & 0xe0 or (ntype & 0x0e) != 0: continue                            # stabs / defined symbols
+            lib = desc >> 8
+            if lib in remap: struct.pack_into("<H", d, e + 6, (desc & 0xff) | (remap[lib] << 8))
+    # remove the duplicate load commands
+    ncmds, sizeofcmds = struct.unpack_from("<II", d, 16)
+    body = b"".join(bytes(d[off:off + sz]) for cmd, off, sz in m["cmds"] if off not in drop)
+    d[32:32 + sizeofcmds] = body + b"\0" * (sizeofcmds - len(body))
+    struct.pack_into("<II", d, 16, ncmds - len(drop), len(body))
+    return ["removed %d duplicate dylib load command(s), import ordinals renumbered" % len(drop)]
+
+def remap_bind_opcodes(d, start, size, remap):
+    """Renumber SET_DYLIB_ORDINAL_IMM / _ULEB in a dyld-info bind stream (same byte length; ordinals only shrink)."""
+    def uleb(i):
+        v = sh = 0
+        while True:
+            b = d[i]; i += 1; v |= (b & 0x7f) << sh; sh += 7
+            if not b & 0x80: return v, i
+    def skip_str(i):
+        while d[i]: i += 1
+        return i + 1
+    i, end = start, start + size
+    while i < end:
+        b = d[i]; op, imm = b & 0xf0, b & 0x0f; i += 1
+        if op == 0x10:                                                                  # SET_DYLIB_ORDINAL_IMM
+            if imm in remap: d[i - 1] = 0x10 | remap[imm]
+        elif op == 0x20:                                                                # SET_DYLIB_ORDINAL_ULEB
+            v, j = uleb(i)
+            if v in remap:
+                n, w = j - i, remap[v]
+                for k in range(n): d[i + k] = ((w >> (7 * k)) & 0x7f) | (0x80 if k < n - 1 else 0)
+            i = j
+        elif op == 0x40: i = skip_str(i)                                                # SET_SYMBOL_TRAILING_FLAGS_IMM
+        elif op in (0x60, 0x70, 0x80, 0xa0): i = uleb(i)[1]                             # SLEB addend / seg+ULEB / ADD_ADDR / DO_BIND_ADD_ADDR_ULEB
+        elif op == 0xc0: i = uleb(uleb(i)[1])[1]                                        # DO_BIND_ULEB_TIMES_SKIPPING_ULEB
+        elif op == 0xf0 and imm == 0: i = uleb(i)[1]                                    # THREADED: SET_BIND_ORDINAL_TABLE_SIZE_ULEB
+        elif op == 0xf0: pass
 
 ARM_NOP, ARM_CMN_X0_1, ARM_ADD_X1_X0_X19 = 0xd503201f, 0xb100041f, 0x8b130001
 

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Embedded in CyPort-unsigned.ipa (ad-hoc signature) so sideloading tools know what the app asks for.
+     SideStore / AltStore sign with (profile entitlements) ∩ (these), so a capability only ends up in the app when
+     BOTH the App ID has it and this file lists it. Free Apple ID: enable "Increased Memory Limit" on the App ID with
+     GetMoreRam (github.com/hugeBlack/GetMoreRam), then refresh/reinstall in SideStore. Extended virtual addressing
+     is paid-account only; without it the shim packs the engine's memory pools into the normal address space. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+	<key>get-task-allow</key><true/>
+	<key>com.apple.developer.kernel.increased-memory-limit</key><true/>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key><true/>
+</dict></plist>

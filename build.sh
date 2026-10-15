@@ -102,7 +102,7 @@ ent = {"application-identifier": team + "." + bid, "com.apple.developer.team-ide
 for k in ("com.apple.developer.kernel.increased-memory-limit", "com.apple.developer.kernel.extended-virtual-addressing"):
     if e.get(k): ent[k] = True
 if "com.apple.developer.kernel.extended-virtual-addressing" not in ent:
-    print("    WARNING: profile has no extended-virtual-addressing: the game will crash before main() (see README)")
+    print("    note: profile has no extended-virtual-addressing - the shim uses its compact memory layout (see README)")
 plistlib.dump(ent, open(out, "wb")); print("    entitlements from profile:", ", ".join(sorted(ent)))
 PY
   fi
@@ -115,13 +115,20 @@ PY
     xcrun devicectl device install app --device "$DEVICE" "$APP"
   fi
 else
+  # ad-hoc signature carrying app/entitlements-sideload.plist: the game binary still has the Mac build's signature and
+  # entitlements, and SideStore/AltStore keep only entitlements the app itself lists (so the memory limit was dropped)
+  if command -v codesign >/dev/null; then
+    for f in "$APP"/Frameworks/*.dylib; do codesign -f -s - "$f" 2>/dev/null; done
+    codesign -f -s - --entitlements "$HERE/app/entitlements-sideload.plist" "$APP" && echo "    ad-hoc signed with app/entitlements-sideload.plist"
+  fi
   (cd "$OUT" && zip -qry CyPort-unsigned.ipa Payload)
   cat <<MSG
 Unsigned IPA ready (sign it with Sideloadly / AltStore / iloader, or by hand): $OUT/CyPort-unsigned.ipa
 Unsigned app folder: $APP
-Sign it yourself, libraries first, then the app (the profile must grant extended-virtual-addressing, see README):
+SideStore / AltStore / Sideloadly can install it as is (free Apple ID: see README "Free Apple ID").
+Or sign it yourself, libraries first, then the app:
   for f in "$APP"/Frameworks/*.dylib; do codesign -f -s "<identity>" "\$f"; done
-  codesign -f -s "<identity>" --entitlements "$ENT" "$APP"
+  codesign -f -s "<identity>" --entitlements "$HERE/app/entitlements-sideload.plist" "$APP"
   (cd "$OUT" && zip -qry CyPort.ipa Payload)
 MSG
 fi

@@ -53,9 +53,11 @@ M-series iPads have more RAM and better cooling and should run it as well or bet
   - Steam / Epic / Mac App Store copies: **untested**. The game data is probably the same for the same version, but CyPort's patches
     target the GOG 2.3.1 executable, the Steam/Epic builds use their own account systems, and the App Store binary is encrypted.
     A newer game version will need updated patches.
-- A **paid Apple Developer account** ($99/year). The game needs two capabilities that free accounts cannot get:
-  `com.apple.developer.kernel.extended-virtual-addressing` (the engine reserves ~100 GB of address space) and
-  `com.apple.developer.kernel.increased-memory-limit`.
+- An **Apple account to sign it with**:
+  - **Paid Apple Developer account** ($99/year) – recommended: gives both *Increased Memory Limit* and *Extended Virtual Address Space*.
+  - **Free Apple ID** with SideStore or LiveContainer – works with **GetMoreRam** for the memory limit (see [Free Apple ID](#free-apple-id-sidestore--livecontainer)).
+    Extended virtual addressing is paid-only; without it CyPort packs the engine's memory pools into the normal address space
+    (**experimental**). The increased memory limit is **required** either way – the game uses ~5 GB.
 
 ---
 
@@ -76,7 +78,7 @@ M-series iPads have more RAM and better cooling and should run it as well or bet
    ./build.sh
    ```
    This writes `build/CyPort.ipa` and installs it on the connected device (`DEVICE=`).
-   Without `SIGN_ID` you get `build/CyPort-unsigned.ipa`; sign it yourself – the signature **must** include the two entitlements above.
+   Without `SIGN_ID` you get `build/CyPort-unsigned.ipa` for SideStore / AltStore / Sideloadly / LiveContainer (see *Free Apple ID* below).
    Or double-click **`Build CyPort.command`** and drag your `Cyberpunk2077.app` into the window (then sign the IPA yourself).
 3. **Import the game data** on the device: open CyPort → **Import game…** → pick your `Cyberpunk 2077` folder
    (e.g. on a USB-C SSD, or in iCloud/Files). It is copied into the app (~65 GB, a few minutes over USB 3; the import can be resumed).
@@ -84,6 +86,25 @@ M-series iPads have more RAM and better cooling and should run it as well or bet
    **Download from Steam, GOG or Epic…**, sign in with the account that owns the game and let CyPort download the game data
    (only the data folders; the program itself always comes from your build).
 4. Open CyPort, pick a resolution, press **PLAY**.
+
+### Free Apple ID (SideStore / LiveContainer)
+A free account can't turn on *Increased Memory Limit* by itself, and SideStore never adds it for free accounts.
+[GetMoreRam](https://github.com/hugeBlack/GetMoreRam) switches it on for an App ID; SideStore then signs the app with it, because
+`CyPort-unsigned.ipa` asks for it (`app/entitlements-sideload.plist`). Build the IPA without `SIGN_ID` (step 2), then:
+
+**SideStore**
+1. Install `CyPort-unsigned.ipa` with SideStore (this creates its App ID on your account).
+2. Install GetMoreRam, sign in with the **same** Apple ID → refresh App IDs → pick CyPort's App ID → **Add Increased Memory Limit**.
+3. Back in SideStore: **reinstall** CyPort (or refresh it), so it fetches a new profile that has the capability.
+
+**LiveContainer**
+The game runs *inside* LiveContainer's process, so LiveContainer itself needs the capability (it already asks for it):
+1. In GetMoreRam pick **LiveContainer's** App ID (with SideStore's built-in LiveContainer: that one) → **Add Increased Memory Limit**.
+2. Refresh/reinstall LiveContainer in SideStore.
+3. Add `CyPort-unsigned.ipa` in LiveContainer and launch it.
+
+Check that it took: CyPort's log (`Documents/macshim.log`) has an `address space:` line at the start, and the game must not be killed
+while loading. If it is killed with no crash log, the memory limit is still the default one – repeat steps 2–3.
 
 ---
 
@@ -173,8 +194,10 @@ agent), which did most of the analysis, debugging and implementation in long int
 ---
 
 ## Troubleshooting
-- **Crashes right at launch / before the start screen:** the profile lacks *Extended Virtual Address Space* – check the entitlements
-  of the installed app (`codesign -d --entitlements - CyPort.app`).
+- **Crashes right at launch / before the start screen:** check the entitlements of the installed app
+  (`codesign -d --entitlements - CyPort.app`) – *Increased Memory Limit* must be there (free Apple ID: see *Free Apple ID*).
+- **LiveContainer: `Symbol not found: _AUGraphAddNode … Expected in: CoreHaptics`:** the IPA was built with an older CyPort;
+  rebuild it with this version and add it to LiveContainer again.
 - **Killed after a while (no crash log):** out of memory – close other apps, lower the resolution/textures, 8 GB devices only.
 - **"Corrupt settings" message:** can appear once after updating from an old CyPort build (they rewrote the settings file in a format
   the game rejects). Set your settings again; from then on they are kept.
