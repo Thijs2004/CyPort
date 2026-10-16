@@ -20,7 +20,7 @@ No emulation, no streaming: the Apple Silicon Mac build runs directly on iOS / i
 | Bluetooth / MFi controllers (Xbox, DualSense, DualShock 4) | ✅ works, on-screen pad hides automatically |
 | Resolution picker up to native (2868 × 1320 on iPhone 16 Pro Max) | ✅ works |
 | AirPlay screen mirroring / USB-C → HDMI to a TV (game on the TV, phone as controller) | ✅ new |
-| Performance | ⚠️ ~30–60 FPS at 1434 × 660 with low settings + MetalFX on an iPhone 16 Pro Max; the phone gets hot and throttles in long sessions |
+| Performance | ⚠️ ~30 FPS in the open world at 1434 × 660 with low settings + MetalFX on an iPhone 16 Pro Max (more indoors); v1.2 keeps the phone cooler for longer, but it still throttles in long sessions – see [Performance tips](#performance-tips) |
 | Cloud saves (GOG, Steam, Epic) – carry on where you left off on your PC/Mac and back | 🧪 new: GOG download tested, sending and Steam/Epic untested |
 | Download the game data in the app (Steam, GOG, Epic account) | 🧪 new: untested with signed-in accounts |
 | Online features (GOG Galaxy achievements, crash upload) | ❌ offline only (stubbed) |
@@ -112,7 +112,8 @@ while loading. If it is killed with no crash log, the memory limit is still the 
 
 ### Start screen
 - **Resolution** – the size the game renders and outputs at: 717 × 330 … 2868 × 1320 (native) on an iPhone 16 Pro Max.
-  1434 × 660 is a good start. All other graphics options are set in the game's own **Settings** menu and are kept between launches.
+  1434 × 660 is a good start; the higher ones are marked because they make the phone hot quickly. All other graphics options,
+  including the frame rate (VSync / Maximum FPS), are set in the game's own **Settings** menu and are kept between launches.
 - **Performance overlay** – Off / FPS / Detailed (FPS, frame time, CPU, RAM; *Detailed* also turns on Apple's Metal HUD).
   The system Metal HUD (Settings → Developer → Graphics HUD) is independent of this.
 - **Look sensitivity** – how fast swiping turns the camera (0.25× – 4×).
@@ -133,6 +134,14 @@ while loading. If it is killed with no crash log, the memory limit is still the 
 - Game Mode turns on automatically (lower controller latency, priority CPU/GPU).
 - Going to the Home Screen freezes the game (no sound, no CPU use); opening the app again continues, if iOS kept it in memory.
 
+### Performance tips
+- **Resolution 1434 × 660** on the start screen. Every step up costs GPU time, and GPU heat adds to the CPU's: at 1912 × 880 an
+  iPhone 16 Pro Max throttles within about 1.5 minutes of driving.
+- **Maximum FPS 30** in the game's graphics settings. A steady 30 looks smoother than a frame rate that jumps between 25 and 50,
+  and the phone stays cool much longer. 40 works indoors and while the phone is cool.
+- Leave **frame generation off** – it adds GPU work and input delay.
+- A clip-on phone cooler helps more than any setting: heat, not raw speed, is what limits the phone.
+
 ### Options – `Documents/Cyberpunk 2077/macshim.plist`
 | Key | Effect |
 |---|---|
@@ -144,7 +153,15 @@ while loading. If it is killed with no crash log, the memory limit is still the 
 | `TVOut` = NO / `TVShape` = NO | keep the game on the phone with a TV connected / keep the phone's shape on the TV |
 | `RealtimeThreads` = YES | keep the Mac's real-time scheduling for engine threads (CyPort runs them as normal threads at the same priority) |
 | `MetalFXForce` = NO | don't answer "supported" when the game asks whether this GPU can do MetalFX |
-| `WorkerSampler` = NO | no worker-thread profile lines in the log |
+| `CoolMode` = NO | keep all of the engine's job workers on the performance cores (by default 3 of the 5 run on the efficiency cores) |
+| `CoolFastWorkers` (number, default 2) | how many job workers stay on the performance cores in cool mode |
+| `StreamingTweaks` = NO | the engine's own open-world streaming limits (12 ms / 300 nodes per frame) instead of CyPort's `user.ini` |
+| `StreamingMsPerFrame` (default 6), `StreamingNodesPerFrame` (default 200) | CyPort's streaming limits |
+| `FrameRate` = 30 / 40 / 60 | CyPort holds this frame rate itself (with even frame pacing) instead of the game's setting |
+| `FramePacing` = NO | no frame pacing hooks at all |
+| `Diagnostics` = YES | memory pool / GPU memory statistics in the log every 10 s |
+| `WorkerSampler` = YES | worker-thread profile in the log every ~60 s (pauses the workers briefly – causes a hitch) |
+| `GPUSampler` = NO, `ConsoleLog` = YES | no GPU busy-time lines / also send the log to the system console |
 | `ResMode` (0–7), `AutoPlay`, `AutoKeys` | testing aids |
 
 Logs: *Files → On My iPhone → CyPort → `macshim.log`* (and `game_output.log`, the engine's own output).
@@ -176,6 +193,11 @@ IOKit / CoreAudio stubs, macOS-only Metal selectors added at runtime, an offline
   a virtual `GCController` drives the game's gamepad callbacks; all pending input is delivered every frame.
 - **Display:** the engine outputs at the size of the screen it is told about, so `NSScreen`/display modes report exactly the
   resolution picked on the start screen.
+- **Heat and frame times:** the engine's 5 job workers ask for the highest thread priority, which keeps them on the A18 Pro's
+  2 performance cores – the phone throttled within a minute. CyPort moves 3 of them to the 4 efficiency cores (2 stay fast, so the
+  game thread doesn't wait on slow cores), runs the engine's real-time threads as normal threads so input isn't starved, backs off
+  spin-waits, and writes `engine/config/platform/mac/user.ini` to spread open-world streaming over more frames (the engine's
+  desktop default is up to 12 ms of streaming in one frame).
 - **Online services:** the GOG Galaxy sign-in reports success offline; the curl stub completes every request with "couldn't connect"
   (an early stub left requests hanging, which corrupted memory and crashed the game after the main menu).
 - **Files:** case-insensitive path lookup (the Mac build assumes a case-insensitive disk), robust reads, resumable import.

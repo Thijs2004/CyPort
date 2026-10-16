@@ -1452,7 +1452,88 @@ static BOOL MSTextSetOption(NSMutableString *txt, NSString *name, NSString *valu
     [txt replaceCharactersInRange:[vm rangeAtIndex:2] withString:value];
     return YES;
 }
+/* ---------------------------------------------------------------- frame pacing
+ * The frame rate is the game's own setting (Settings > Graphics: VSync / Maximum FPS). macshim.plist FrameRate = 30 / 40 / 60
+ * makes CyPort hold it instead (a test aid).
+ * 30/40/60 are whole multiples of the 120 Hz ProMotion refresh (4/3/2 refreshes), so every frame stays on screen
+ * equally long - an uncapped 45-55 FPS looks less smooth than a steady 40 and heats the phone up faster.
+ * Two parts: the game's render thread is held to the beat in nextDrawable (a frame limiter: less CPU/GPU work, less
+ * heat), and each present asks Metal to keep the previous frame up for one beat (even frame times on the display). */
+static _Atomic double g_paceT;                      /* seconds per frame CyPort holds the game to, 0 = not pacing */
+static int g_paceMode = -1;                         /* 0 game, 1 auto, 30/40/60 fixed */
+static _Atomic int g_paceFPS;                       /* what g_paceT means, for the overlay/log */
+static int MSFrameRateChoice(void) {
+    id c = MSConfig()[@"FrameRate"]; return [c respondsToSelector:@selector(intValue)] ? [c intValue] : 0;
+}
+static void MSPaceSet(int fps, NSString *why) {
+    double t = fps > 0 ? 1.0 / fps : 0; if (t == g_paceT) return;
+    g_paceT = t; g_paceFPS = fps;
+    MSLogf(@"frame pacing: %@ (%@)", fps > 0 ? [NSString stringWithFormat:@"%d FPS", fps] : @"off", why);
+}
+static void MSPaceWait(void) {                      /* nextDrawable, on the game's render thread */
+    double T = g_paceT; static __thread uint64_t next;
+    if (T <= 0) { next = 0; return; }
+    static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
+    uint64_t per = (uint64_t)(T * 1e9 * tb.denom / tb.numer), early = (uint64_t)(0.0007 * 1e9 * tb.denom / tb.numer);
+    uint64_t now = mach_absolute_time();
+    if (!next || now > next + per) next = now;      /* first frame, or more than a frame late: new beat from now */
+    else if (now + early < next) mach_wait_until(next - early);
+    next += per;
+}
+
+/* unquoted values (bool/int): "value": true / "value": 30 */
+static BOOL MSTextSetRaw(NSMutableString *txt, NSString *name, NSString *value, NSString **was) {
+    NSRange nr = [txt rangeOfString:[NSString stringWithFormat:@"\"name\"\\s*:\\s*\"%@\"", name] options:NSRegularExpressionSearch];
+    if (nr.location == NSNotFound) return NO;
+    NSRange open = [txt rangeOfString:@"{" options:NSBackwardsSearch range:NSMakeRange(0, nr.location)];
+    NSRange close = [txt rangeOfString:@"}" options:0 range:NSMakeRange(nr.location, txt.length - nr.location)];
+    if (open.location == NSNotFound || close.location == NSNotFound) return NO;
+    NSRegularExpression *vre = [NSRegularExpression regularExpressionWithPattern:@"(\"value\"\\s*:\\s*)([^,\\s}\"]+)" options:0 error:nil];
+    NSTextCheckingResult *vm = [vre firstMatchInString:txt options:0 range:NSMakeRange(open.location, close.location - open.location + 1)];
+    if (!vm) return NO;
+    NSString *old = [txt substringWithRange:[vm rangeAtIndex:2]]; if (was) *was = old;
+    if (!value || [old isEqualToString:value]) return NO;
+    [txt replaceCharactersInRange:[vm rangeAtIndex:2] withString:value]; return YES;
+}
+/* at Play: pick the pacing mode and set the game's own frame limiter to match (it sleeps early in the frame, which
+   keeps input latency low; CyPort's limiter only steps in below it, e.g. Auto dropping to 30). Frame generation
+   presents made-up frames in between, so with it on CyPort leaves pacing to the game. */
+static BOOL MSApplyFrameRate(NSMutableString *txt) {
+    int c = MSFrameRateChoice(); if (c != 30 && c != 40 && c != 60) c = 0;
+    NSString *fg = nil, *fg3 = nil; MSTextSetOption(txt, @"FrameGeneration", nil, -1, &fg); MSTextSetRaw(txt, @"FSR3_FrameGeneration", nil, &fg3);
+    BOOL frameGen = (fg && ![fg isEqualToString:@"Off"]) || [fg3 isEqualToString:@"true"];
+    if (frameGen && c) { MSLogf(@"frame rate: frame generation is on - pacing left to the game"); c = 0; }
+    g_paceMode = c;
+    if (!c) { MSPaceSet(0, @"the game's own setting"); return NO; }
+    BOOL ch = MSTextSetRaw(txt, @"MaximumFPS_OnOff", @"true", NULL);
+    ch |= MSTextSetRaw(txt, @"MaximumFPS_Value", [NSString stringWithFormat:@"%d", c], NULL);
+    MSPaceSet(c, @"macshim.plist FrameRate");
+    return ch;
+}
+/* ---------------------------------------------------------------- open-world streaming (engine/config/platform/mac/user.ini)
+ * The engine streams the city in on the game thread: by default up to 12 ms and 300 nodes per frame (Streaming/
+ * TimeLimitStreamedPerFrame, MaxNodesPerFrame - defaults read from the exe's config table at 0x106b47af0). Tuned for a
+ * desktop CPU; on a phone (throttled, at 30 FPS = 33 ms per frame) that much in one frame is the FPS drop you see while
+ * driving. Spread over more frames instead: steadier frame times, things appear a little later. Loading screens keep
+ * the engine's own limits. The file is CyPort's while its first line says so; StreamingTweaks = NO removes it. */
+static void MSWriteStreamingIni(void) {
+    NSString *root = g_root; if (!root) return;
+    NSString *dir = [root stringByAppendingPathComponent:@"engine/config/platform/mac"], *p = [dir stringByAppendingPathComponent:@"user.ini"];
+    NSString *mark = @"; CyPort performance settings";
+    NSString *old = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+    if (old && ![old hasPrefix:mark]) { MSLogf(@"streaming: %@ is the user's own - left alone", p.lastPathComponent); return; }
+    if ([MSConfig()[@"StreamingTweaks"] isEqual:@NO]) { if (old) [NSFileManager.defaultManager removeItemAtPath:p error:nil]; MSLogf(@"streaming: engine defaults (StreamingTweaks = NO)"); return; }
+    double ms = MSCfgD(@"StreamingMsPerFrame", 6); long nodes = (long)MSCfgD(@"StreamingNodesPerFrame", 200);
+    NSString *ini = [NSString stringWithFormat:@"%@ (written by CyPort at every start - delete this line to keep your own edits)\n"
+                     "; engine defaults 12 ms / 300 nodes per frame; spread over more frames for steadier FPS in the open world\n"
+                     "[Streaming]\nTimeLimitStreamedPerFrame = %.1f\nMaxNodesPerFrame = %ld\n", mark, ms, nodes];
+    if ([old isEqualToString:ini]) return;
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    if ([ini writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]) MSLogf(@"streaming: at most %.1f ms and %ld nodes per frame (user.ini)", ms, nodes);
+    else MSLogf(@"streaming: could not write %@", p);
+}
 static void MSApplyGameSettings(NSSet *keys) {
+    MSWriteStreamingIni();
     /* Only the resolution is written, as a text edit of its "value" (the game is offered only that one mode); the rest of
        the file stays byte for byte as the game wrote it. Re-serialising the whole file (NSJSONSerialization escapes every
        "/" as "\/" and reorders keys) made the game report corrupt settings at every start and reset them.
@@ -1493,6 +1574,7 @@ static void MSApplyGameSettings(NSSet *keys) {
         }
         [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"CyPortUpscalerNamesFixed"];
     }
+    if (MSApplyFrameRate(txt)) changed = YES;
     if (changed && [txt writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil])
         MSLogf(@"start screen: resolution %@ (text edit%@)", want, unesc ? [NSString stringWithFormat:@", %lu escaped slashes repaired", (unsigned long)unesc] : @"");
 }
@@ -1511,7 +1593,7 @@ static NSDictionary *MSRestartSettingsSnapshot(void); static void MSSyncStartScr
 }
 - (void)msBuildResMenu {
     NSMutableArray *acts = [NSMutableArray array]; int cur = MacShimCurrentMode();
-    NSArray *notes = @[ @"fastest", @"", @"", @"recommended", @"", @"", @"", @"native" ];
+    NSArray *notes = @[ @"fastest", @"", @"", @"recommended", @"sharper, warmer", @"gets hot", @"very hot", @"native, very hot" ];
     for (int i = MacShimModeCount() - 1; i >= 0; i--) {
         NSString *t = [MSModeName(i) stringByReplacingOccurrencesOfString:@"x" withString:@" × "];
         if ([notes[i] length]) t = [t stringByAppendingFormat:@"  (%@)", notes[i]];
@@ -1654,6 +1736,9 @@ static void MSWatchGameSettings(void) {
            the baseline moves */
         if (g_frames > 60 && !drawingSince) drawingSince = CACurrentMediaTime();
         if (!base || !drawingSince || CACurrentMediaTime() - drawingSince < 5) { base = now; return; }
+        if (base && g_paceMode > 0 && (![now[@"MaximumFPS_OnOff"] isEqual:base[@"MaximumFPS_OnOff"]] || ![now[@"MaximumFPS_Value"] isEqual:base[@"MaximumFPS_Value"]] || ![now[@"VSync"] isEqual:base[@"VSync"]])) {
+            static int said; if (!said++) MSLogf(@"frame rate changed in the game's menu - CyPort keeps pacing at %d FPS (macshim.plist FrameRate)", (int)g_paceFPS);
+        }
         NSMutableArray *changed = [NSMutableArray array];
         NSSet *live = [NSSet setWithArray:@[ @"MaximumFPS_OnOff", @"MaximumFPS_Value", @"QuickPresets" ]];   /* apply without a restart */
         for (NSString *k in now) if (![now[k] isEqual:base[k]] && ![live containsObject:k]) [changed addObject:k];
@@ -1692,7 +1777,7 @@ static void MSWatchGameSettings(void) {
     Class sw = NSClassFromString(@"MSSwiftLauncher"); UIViewController *svc = nil;
     if (sw) {
         NSMutableArray *names = [NSMutableArray array], *notes = [NSMutableArray array];
-        NSArray *n8 = @[ @"fastest", @"", @"", @"recommended", @"", @"", @"", @"native" ];
+        NSArray *n8 = @[ @"fastest", @"", @"", @"recommended", @"sharper, warmer", @"gets hot", @"very hot", @"native, very hot" ];
         for (int i = 0; i < MacShimModeCount(); i++) { [names addObject:[MSModeName(i) stringByReplacingOccurrencesOfString:@"x" withString:@" × "]]; [notes addObject:i < (int)n8.count ? n8[i] : @""]; }
         void (^onPlay)(NSInteger, NSInteger) = ^(NSInteger res, NSInteger ov) {
             [NSUserDefaults.standardUserDefaults setInteger:res forKey:@"MacShimResMode2"];
@@ -1783,6 +1868,17 @@ int ms_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, s
         if (*oldlenp >= sizeof(long long)) { long long v = cpus; memcpy(oldp, &v, sizeof v); *oldlenp = sizeof v; } else { memcpy(oldp, &cpus, sizeof cpus); *oldlenp = sizeof cpus; }
         return 0;
     }
+    /* A18 Pro: perflevel0 = 2 performance cores, perflevel1 = 4 efficiency cores; with CPUCount keep them consistent */
+    if (cpus > 0 && !newp && oldp && oldlenp && *oldlenp >= sizeof(int) && !strncmp(name, "hw.perflevel", 12) &&
+        (strstr(name, "logicalcpu") || strstr(name, "physicalcpu"))) {
+        int real = 0; size_t rl = sizeof real;
+        static int (*rs)(const char *, void *, size_t *, void *, size_t); if (!rs) rs = (int (*)(const char *, void *, size_t *, void *, size_t))dlsym(RTLD_NEXT, "sysctlbyname");
+        if (rs && rs("hw.perflevel0.logicalcpu", &real, &rl, NULL, 0) != 0) real = 2;
+        int p0 = MIN(real, cpus), v = name[12] == '0' ? p0 : MAX(0, cpus - p0);
+        if (*oldlenp >= sizeof(long long)) { long long w = v; memcpy(oldp, &w, sizeof w); *oldlenp = sizeof w; } else { memcpy(oldp, &v, sizeof v); *oldlenp = sizeof v; }
+        static int said; if (said++ < 4) MSLogf(@"sysctl %s -> %d (CPUCount %d)", name, v, cpus);
+        return 0;
+    }
     if (fake && !newp) {
         size_t n = strlen(fake) + 1;
         if (oldp && oldlenp) { if (*oldlenp < n) { *oldlenp = n; errno = ENOMEM; return -1; } memcpy(oldp, fake, n); }
@@ -1820,7 +1916,19 @@ int ms_pthread_set_qos_class_self_np(qos_class_t q, int rel) {
     if (boost < 0) boost = ![MSConfig()[@"ThreadQoS"] isEqual:@NO];
     qos_class_t want = q;
     if (boost && (q == QOS_CLASS_UTILITY || q == QOS_CLASS_DEFAULT || q == QOS_CLASS_UNSPECIFIED)) want = QOS_CLASS_USER_INITIATED;
-    static _Atomic int n; if (n++ < 40) { char nm[64] = ""; pthread_getname_np(pthread_self(), nm, sizeof nm);
+    /* Cool mode (always on; macshim.plist CoolMode = NO turns it off): the 5 job
+       workers (redDispatcher*) ask for user-interactive QoS, which keeps them on the A18 Pro's 2 performance cores
+       next to the game and render threads - the phone throttles within a minute or two. At utility QoS iOS runs them
+       on the 4 efficiency cores, which do the same parallel work for a fraction of the power; the game and render
+       threads keep the performance cores. All 5 there made frame times uneven (the game thread waits for their jobs every
+       frame, and the slow cores answer late), while the 2 performance cores still had room: workers 1-2 stay on
+       them, the rest go to the efficiency cores (CoolFastWorkers, default 2). */
+    char nm[64] = ""; pthread_getname_np(pthread_self(), nm, sizeof nm);
+    static int cool = -1;
+    if (cool < 0) cool = ![MSConfig()[@"CoolMode"] isEqual:@NO];
+    static int fastW = -1; if (fastW < 0) fastW = (int)MAX(0, MSCfgD(@"CoolFastWorkers", 2));
+    if (cool && !strncmp(nm, "redDispatcher", 13) && q > QOS_CLASS_UTILITY) want = atoi(nm + 13) <= fastW ? QOS_CLASS_USER_INITIATED : QOS_CLASS_UTILITY;
+    static _Atomic int n; if (n++ < 40) {
         MSLogf(@"thread '%s' asks QoS %#x%@", nm, q, want != q ? [NSString stringWithFormat:@" -> %#x", want] : @""); }
     return real ? real(want, rel) : 0;
 }
@@ -2475,7 +2583,7 @@ static NSString *MSThreadCPUReport(void) {
     return [out componentsJoinedByString:@", "];
 }
 /* where the engine's worker threads (redDispatcher*) spend their time: 2 s of PC samples (~250 Hz per thread), top
-   code addresses as the exe's own addresses (0x1xxxxxxxx, as in a disassembler) or library+offset. WorkerSampler=NO off. */
+   code addresses as the exe's own addresses (0x1xxxxxxxx, as in a disassembler) or library+offset. WorkerSampler=YES on. */
 static NSString *MSWhere(uint64_t pc, intptr_t exeSlide, uint64_t exeLo, uint64_t exeHi) {
     if (pc >= exeLo && pc < exeHi) return [NSString stringWithFormat:@"%#llx", pc - (uint64_t)exeSlide];
     Dl_info di; if (dladdr((void *)pc, &di) && di.dli_fname) {
@@ -2486,7 +2594,7 @@ static NSString *MSWhere(uint64_t pc, intptr_t exeSlide, uint64_t exeLo, uint64_
     return [NSString stringWithFormat:@"%#llx", pc];
 }
 static NSString *MSSampleWorkers(void) {
-    if ([MSConfig()[@"WorkerSampler"] isEqual:@NO]) return nil;
+    if (![MSConfig()[@"WorkerSampler"] boolValue]) return nil;        /* opt-in: suspending the workers stalls the job system */
     intptr_t slide = 0; uint64_t lo = 0, hi = 0;
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *n = _dyld_get_image_name(i); if (!n || !strstr(n, "/Cyberpunk2077.app/Cyberpunk2077")) continue;
@@ -2581,7 +2689,7 @@ static double MSFootprintMB(void) {
  * (4 GB until one has). Once the game draws frames itself the panel shrinks to a strip and then goes away. */
 _Atomic long long g_frames;
 static IMP g_origNextDrawable;
-static id ms_nextDrawable(id self, SEL _cmd) { g_frames++; return ((id (*)(id, SEL))g_origNextDrawable)(self, _cmd); }
+static id ms_nextDrawable(id self, SEL _cmd) { MSPaceWait(); g_frames++; return ((id (*)(id, SEL))g_origNextDrawable)(self, _cmd); }
 static UIWindow *g_statusWin; static CGFloat g_stPad; static CALayer *g_stRoot, *g_stBg, *g_stTrack, *g_stFill; static CATextLayer *g_stTitle, *g_stHead, *g_stLog;
 static CATextLayer *MSTextLayer(CGFloat size, BOOL mono, UIColor *color) {
     CATextLayer *t = [CATextLayer layer]; t.contentsScale = UIScreen.mainScreen.scale; t.foregroundColor = color.CGColor;
@@ -3078,10 +3186,70 @@ static void MSTouchPadCreate(UIWindowScene *sc) {                 /* main thread
            g_pad.rightThumbstickButton != nil, g_pad.buttonOptions != nil);
 }
 
-static void MSStatusCreate(void) {                    /* main thread, before the game's main() */
-    if ([MSConfig()[@"ShowStatus"] isEqual:@NO]) return;
+static IMP g_oCBPresent, g_oDrPresent, g_oCBPresentMin, g_oDrPresentMin, g_oCBCommit;
+/* GPU busy time: for 1 s every 30 s each committed command buffer reports its GPU start/end; the merged intervals
+   say how much of that second the GPU was working (logged as "gpu: busy N%"). GPUSampler = NO turns it off. */
+static _Atomic BOOL g_gpuSampling; static os_unfair_lock g_gpuLock = OS_UNFAIR_LOCK_INIT;
+static double g_gpuIv[4096][2]; static int g_gpuN;
+static void ms_cbCommit(id self, SEL c) {
+    if (g_gpuSampling) {
+        [(id<MTLCommandBuffer>)self addCompletedHandler:^(id<MTLCommandBuffer> b) {
+            CFTimeInterval a = b.GPUStartTime, e = b.GPUEndTime; if (e <= a || a <= 0) return;
+            os_unfair_lock_lock(&g_gpuLock); if (g_gpuN < 4096) { g_gpuIv[g_gpuN][0] = a; g_gpuIv[g_gpuN][1] = e; g_gpuN++; } os_unfair_lock_unlock(&g_gpuLock);
+        }];
+    }
+    ((void (*)(id, SEL))g_oCBCommit)(self, c);
+}
+static int MSCmpIv(const void *x, const void *y) { double a = ((const double *)x)[0], b = ((const double *)y)[0]; return a < b ? -1 : a > b; }
+static NSString *MSGPUSample(void) {                    /* progress thread: blocks ~1.2 s */
+    if (!g_oCBCommit) return nil;
+    os_unfair_lock_lock(&g_gpuLock); g_gpuN = 0; os_unfair_lock_unlock(&g_gpuLock);
+    long long f0 = g_frames; double t0 = CACurrentMediaTime(); g_gpuSampling = YES; usleep(1000000); g_gpuSampling = NO;
+    double t1 = CACurrentMediaTime(); long long frames = g_frames - f0; usleep(200000);     /* late completions */
+    os_unfair_lock_lock(&g_gpuLock); int n = g_gpuN; static double iv[4096][2]; memcpy(iv, g_gpuIv, sizeof(double) * 2 * n); os_unfair_lock_unlock(&g_gpuLock);
+    if (!n || !frames) return nil;
+    qsort(iv, n, sizeof iv[0], MSCmpIv);
+    double busy = 0, cs = iv[0][0], ce = iv[0][1];
+    for (int i = 1; i < n; i++) { if (iv[i][0] > ce) { busy += ce - cs; cs = iv[i][0]; ce = iv[i][1]; } else if (iv[i][1] > ce) ce = iv[i][1]; }
+    busy += ce - cs;
+    return [NSString stringWithFormat:@"gpu: busy %.0f%% of the last second (%.1f ms per frame, %lld frames, %d command buffers)",
+            100 * busy / (t1 - t0), 1000 * busy / frames, frames, n];
+}
+static void ms_cbPresentMin(id self, SEL c, id d, CFTimeInterval t) {   /* the game's VSync setting uses this one */
+    double T = g_paceT; static int said; if (!said++) MSLogf(@"frame pacing: game presents with presentDrawable:afterMinimumDuration: %.4f", t);
+    ((void (*)(id, SEL, id, CFTimeInterval))g_oCBPresentMin)(self, c, d, T > 0 ? MAX(t, T - 0.002) : t);
+}
+static void ms_drPresentMin(id self, SEL c, CFTimeInterval t) {
+    double T = g_paceT; ((void (*)(id, SEL, CFTimeInterval))g_oDrPresentMin)(self, c, T > 0 ? MAX(t, T - 0.002) : t);
+}
+static void ms_cbPresent(id self, SEL c, id d) {                /* -[MTLCommandBuffer presentDrawable:] */
+    double T = g_paceT; static int said; if (!said++) MSLogf(@"frame pacing: game presents with presentDrawable:");
+    if (T > 0) ((void (*)(id, SEL, id, CFTimeInterval))(g_oCBPresentMin ?: class_getMethodImplementation(object_getClass(self), @selector(presentDrawable:afterMinimumDuration:))))(self, @selector(presentDrawable:afterMinimumDuration:), d, T - 0.002);
+    else ((void (*)(id, SEL, id))g_oCBPresent)(self, c, d);
+}
+static void ms_drPresent(id self, SEL c) {                      /* -[CAMetalDrawable present] */
+    double T = g_paceT; static int said; if (!said++) MSLogf(@"frame pacing: game presents with [drawable present]");
+    if (T > 0) ((void (*)(id, SEL, CFTimeInterval))(g_oDrPresentMin ?: class_getMethodImplementation(object_getClass(self), @selector(presentAfterMinimumDuration:))))(self, @selector(presentAfterMinimumDuration:), T - 0.002);
+    else ((void (*)(id, SEL))g_oDrPresent)(self, c);
+}
+static void MSInstallPacing(void) {
+    if ([MSConfig()[@"FramePacing"] isEqual:@NO]) { MSLogf(@"frame pacing: off (FramePacing = NO)"); return; }
     Method m = class_getInstanceMethod(CAMetalLayer.class, @selector(nextDrawable));
     if (m && !g_origNextDrawable) g_origNextDrawable = method_setImplementation(m, (IMP)ms_nextDrawable);
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice(); id<MTLCommandBuffer> cb = [[dev newCommandQueue] commandBuffer];
+    Method p = cb ? class_getInstanceMethod(object_getClass(cb), @selector(presentDrawable:)) : NULL;
+    Method cm = cb ? class_getInstanceMethod(object_getClass(cb), @selector(commit)) : NULL;
+    if (cm && !g_oCBCommit && ![MSConfig()[@"GPUSampler"] isEqual:@NO]) g_oCBCommit = method_setImplementation(cm, (IMP)ms_cbCommit);
+    Method pm = cb ? class_getInstanceMethod(object_getClass(cb), @selector(presentDrawable:afterMinimumDuration:)) : NULL;
+    if (p && pm && !g_oCBPresent) { g_oCBPresent = method_setImplementation(p, (IMP)ms_cbPresent); g_oCBPresentMin = method_setImplementation(pm, (IMP)ms_cbPresentMin); }
+    Class D = NSClassFromString(@"CAMetalDrawable"); Method dp = D ? class_getInstanceMethod(D, @selector(present)) : NULL;
+    Method dpm = D ? class_getInstanceMethod(D, @selector(presentAfterMinimumDuration:)) : NULL;
+    if (dp && dpm && !g_oDrPresent) { g_oDrPresent = method_setImplementation(dp, (IMP)ms_drPresent); g_oDrPresentMin = method_setImplementation(dpm, (IMP)ms_drPresentMin); }
+    MSLogf(@"frame pacing hooks: nextDrawable %d, command buffer %@ %d, drawable %d", g_origNextDrawable != NULL, NSStringFromClass(object_getClass(cb)), g_oCBPresent != NULL, g_oDrPresent != NULL);
+}
+static void MSStatusCreate(void) {                    /* main thread, before the game's main() */
+    MSInstallPacing();
+    if ([MSConfig()[@"ShowStatus"] isEqual:@NO]) return;
     UIWindowScene *sc = MSAppScene();
     if (!sc) for (UIWindow *w in UIApplication.sharedApplication.windows) if (w.windowScene) { sc = w.windowScene; break; }
     g_statusWin = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
@@ -3193,12 +3361,14 @@ static void MSStartReadProgress(void) {
                     MSLogf(@"progress: %.0f s, %.2f GB read in %lld reads, %.1f MB/s, last read %.0f s ago, CPU %.0f%%, memory %.0f MB, %lld frames, %.0f FPS, mouse gate %d, main queue lag %.1f s, thermal %s, yields %lld/s (%lld slept)%@",
                            now - t0, b / 1073741824.0, c, mbps, idle, cpuPct, mem, fr, fps, MSMouseGate(), g_mqAsked > g_mqBeat ? now - g_mqAsked : 0.0, MSThermal(), MSYieldRate(0), MSYieldRate(1),
                            NSProcessInfo.processInfo.lowPowerModeEnabled ? @", LOW POWER MODE" : @"");
+                static int diag = -1; if (diag < 0) diag = [MSConfig()[@"Diagnostics"] boolValue];
+                if (tick % 60 == 29 && fr > 300) { NSString *g = MSGPUSample(); if (g) MSLogf(@"%@", g); }
                 if (tick % 60 == 59 && fr > 60) MSLogf(@"threads (CPU over the last 30 s): %@", MSThreadCPUReport());
                 if (g_gcmCount) { static long long lm, lh; static long long lc; MSLogf(@"mouse: %lld motion events, %lld clicks, %lld pointer positions in the last 5 s (%s)", g_gcmMoves - lm, g_gcmClicks - lc, g_gcmHovers - lh, g_pointerLocked ? "gameplay" : "menu"); lm = g_gcmMoves; lh = g_gcmHovers; lc = g_gcmClicks; }
                 if (tick % 120 == 99 && fr > 1500) { NSString *ws = MSSampleWorkers(); if (ws) MSLogf(@"worker samples: %@", ws); }
-                if (tick % 20 == 19) MSLogf(@"pools:%@", MSPoolUsage());
-                if (tick % 20 == 19) MSLogf(@"%@", MSQuarantineStats());
-                if (tick % 20 == 19) MSLogf(@"gpu: %lld noCopy buffers %.0f MB, %lld textures over buffers (%lld bad)", g_noCopyN, g_noCopyBytes / 1048576.0, g_bufTexN, g_bufTexBad);
+                if (diag && tick % 20 == 19) MSLogf(@"pools:%@", MSPoolUsage());
+                if (diag && tick % 20 == 19) MSLogf(@"%@", MSQuarantineStats());
+                if (diag && tick % 20 == 19) MSLogf(@"gpu: %lld noCopy buffers %.0f MB, %lld textures over buffers (%lld bad)", g_noCopyN, g_noCopyBytes / 1048576.0, g_bufTexN, g_bufTexBad);
                 if (b != b5) quiet = 0;
                 b5 = b;
             }
@@ -3215,12 +3385,15 @@ static void MSStartReadProgress(void) {
             if (done) {                                                 /* from now on: the overlay picked on the start screen */
                 static NSInteger ov = -1; if (ov < 0) ov = MSPref(@"MacShimOverlay", 1);
                 if (ov == 0) {                                          /* Off */
-                    if (!g_stBg.hidden) { [CATransaction begin]; [CATransaction setDisableActions:YES]; g_stBg.hidden = YES; [CATransaction commit]; [CATransaction flush]; }
+                    if (!g_stBg.hidden) { [CATransaction begin]; [CATransaction setDisableActions:YES]; g_stBg.hidden = YES; [CATransaction commit]; [CATransaction flush];
+                        MSMainAsync(^{ g_statusWin.hidden = YES; }); }            /* no window left over the game: nothing to composite */
                     continue;
                 }
-                NSString *f = ov == 2 ? [NSString stringWithFormat:@"%.0f FPS   %.1f ms   CPU %.0f%%   RAM %.2f GB", fps, fps > 0.5 ? 1000 / fps : 0, cpuPct, mem / 1024]
-                                      : [NSString stringWithFormat:@"%.0f FPS  %.1f ms   RAM %.1f GB", fps, fps > 0.5 ? 1000 / fps : 0, mem / 1024];
-                CGFloat pw = ov == 2 ? 290 : 190;
+                int pf = g_paceFPS; NSString *fs = pf > 0 && g_paceT > 0 ? [NSString stringWithFormat:@"%.0f/%d FPS", fps, pf] : [NSString stringWithFormat:@"%.0f FPS", fps];
+                NSString *f = ov == 2 ? [NSString stringWithFormat:@"%@   %.1f ms   CPU %.0f%%   RAM %.2f GB   %s", fs, fps > 0.5 ? 1000 / fps : 0, cpuPct, mem / 1024, MSThermal()]
+                                      : [NSString stringWithFormat:@"%@  %.1f ms   RAM %.1f GB%@", fs, fps > 0.5 ? 1000 / fps : 0, mem / 1024,
+                                         NSProcessInfo.processInfo.thermalState >= NSProcessInfoThermalStateSerious ? @"   HOT" : @""];
+                CGFloat pw = ov == 2 ? 400 : 210;
                 [CATransaction begin]; [CATransaction setDisableActions:YES];
                 CGRect R = g_stRoot.bounds;
                 g_stBg.frame = CGRectMake(R.size.width / 2 - pw / 2, R.size.height - 24, pw, 20); g_stBg.cornerRadius = 10;
@@ -3305,9 +3478,12 @@ static int g_logfd = -1;
 static void MSLogf(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 static void MSLogf(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt); NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap]; va_end(ap);
-    NSLog(@"[MacShim] %@", m);
+    /* no fsync per line (it blocks the calling thread, often a game thread): write() survives an app crash, and the
+       crash handler syncs itself. ConsoleLog = YES also sends every line to the system log. */
+    static int console = -1; if (console < 0) console = [MSConfig()[@"ConsoleLog"] boolValue];
+    if (console) NSLog(@"[MacShim] %@", m);
     if (![m hasPrefix:@"progress:"]) MSTailAdd(m);
-    if (g_logfd >= 0) { NSString *l = [NSString stringWithFormat:@"%.3f %@\n", CACurrentMediaTime(), m]; const char *c = l.UTF8String; write(g_logfd, c, strlen(c)); fsync(g_logfd); }
+    if (g_logfd >= 0) { NSString *l = [NSString stringWithFormat:@"%.3f %@\n", CACurrentMediaTime(), m]; const char *c = l.UTF8String; write(g_logfd, c, strlen(c)); }
 }
 static void MSSignal(int sig);
 static void MSWriteHex(const char *label, uintptr_t v) {
