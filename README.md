@@ -129,7 +129,8 @@ while loading. If it is killed with no crash log, the memory limit is still the 
   to `saves-backup-<date>` first, and before the first upload to a store the whole cloud is copied to the phone. Optional – without
   signing in everything stays on the phone. With GOG, the game's own CD PROJEKT RED cloud sign-in is set up as well.
 - When you change a setting in-game that needs a restart, CyPort offers to quit; just open it again.
-- First launch uses the lowest graphics settings.
+- First launch uses the lowest graphics settings. With smooth frame pacing on (the default) it also sets VSync and Maximum FPS
+  to Off, so smooth pacing picks the frame rate; after that, whatever you set in the game is kept.
 
 ### Controls
 - **On-screen gamepad** (Xbox layout): left stick (fixed, or touch anywhere on the left half), **swipe on the right half to look**,

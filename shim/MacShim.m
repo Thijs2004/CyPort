@@ -1639,24 +1639,34 @@ static BOOL MSApplySteady30(NSMutableString *txt) {
     }
     return ch;
 }
+static BOOL MSSmoothOn(void);
 static void MSApplyGameSettings(NSSet *keys) {
     MSWriteStreamingIni();
     /* Only the resolution is written, as a text edit of its "value" (the game is offered only that one mode); the rest of
        the file stays byte for byte as the game wrote it. Re-serialising the whole file (NSJSONSerialization escapes every
        "/" as "\/" and reorders keys) made the game report corrupt settings at every start and reset them.
        First run (no file yet): the bundled DefaultUserSettings.json (every graphics option at its lowest) is copied in. */
-    (void)keys;
+    (void)keys; BOOL firstRun = NO, firstChanged = NO;
     NSString *p = [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject
                    stringByAppendingPathComponent:@"CD Projekt Red/Cyberpunk 2077/UserSettings.json"];
     if (![NSFileManager.defaultManager fileExistsAtPath:p]) {
         NSString *t = [NSBundle.mainBundle pathForResource:@"DefaultUserSettings" ofType:@"json"];
         [NSFileManager.defaultManager createDirectoryAtPath:[p stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
-        if (t && [NSFileManager.defaultManager copyItemAtPath:t toPath:p error:nil]) MSLogf(@"first run: lowest graphics settings installed");
+        if (t && [NSFileManager.defaultManager copyItemAtPath:t toPath:p error:nil]) { MSLogf(@"first run: lowest graphics settings installed"); firstRun = YES; }
     }
     NSMutableString *txt = [NSMutableString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+    /* first run with smooth frame pacing on (the default): the template caps the game at 30 twice (VSync 30, Maximum FPS
+       30), which leaves smooth pacing nothing to do. VSync Off (index 0 of the game's runtime list Off/120/60/40/30) and
+       Maximum FPS off: smooth pacing then holds the highest even rate the phone keeps up with. Later launches keep
+       whatever the player sets in the game. */
+    if (firstRun && txt && MSSmoothOn()) {
+        BOOL a = MSTextSetOption(txt, @"VSync", @"UI-Settings-Video-QualitySetting-Off", 0, NULL);
+        BOOL b = MSTextSetRaw(txt, @"MaximumFPS_OnOff", @"false", NULL);
+        if (a || b) { firstChanged = YES; MSLogf(@"first run: VSync Off, Maximum FPS off - smooth frame pacing picks the frame rate"); }
+    }
     if (!txt) { MSLogf(@"start screen: no UserSettings.json yet (the game starts in %@)", MSModeName(MacShimCurrentMode())); return; }
     NSUInteger unesc = [txt replaceOccurrencesOfString:@"\\/" withString:@"/" options:0 range:NSMakeRange(0, txt.length)];  /* undo the old escaping */
-    NSString *want = MSModeName(MacShimCurrentMode()); BOOL changed = unesc > 0;
+    NSString *want = MSModeName(MacShimCurrentMode()); BOOL changed = unesc > 0 || firstChanged;
     NSRange nr = [txt rangeOfString:@"\"name\"\\s*:\\s*\"Resolution\"" options:NSRegularExpressionSearch];
     if (nr.location != NSNotFound) {
         NSRange open = [txt rangeOfString:@"{" options:NSBackwardsSearch range:NSMakeRange(0, nr.location)];
