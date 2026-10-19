@@ -57,6 +57,10 @@ static NSInteger MSPref(NSString *k, NSInteger def);
 static void MSStatusCreate(void);
 static void MSTouchPadCreate(UIWindowScene *sc);
 static void MSTVRoute(void); static void MSTVObserve(void);
+static void MSLowLatencyWait(void); static void MSInputReport(void);
+/* TV out: the phone shows the picture too (TVMirror = NO: phone stays black, saves a little power) */
+@class CAMetalLayer; static CAMetalLayer *g_mirrorLayer; static _Atomic BOOL g_mirrorOn;
+static BOOL MSMirrorFit(UIView *v, CGRect *r);
 @class NSWindow; static __weak NSWindow *g_gameWin;
 
 static void MSLogf(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
@@ -453,6 +457,9 @@ static CGPoint MSTouchIn(UITouch *t, UIView *host) {
     if (!v || !host || v.window.screen == host.window.screen) return [t locationInView:host];
     CGPoint p = [t locationInView:v]; CGSize s = v.bounds.size, h = host.bounds.size;
     if (s.width < 1 || s.height < 1) return p;
+    CGRect r;     /* the phone shows the picture too: a touch maps onto where the picture is drawn */
+    if (MSMirrorFit(v, &r)) return CGPointMake(fmin(fmax((p.x - r.origin.x) / r.size.width, 0), 1) * h.width,
+                                               fmin(fmax((p.y - r.origin.y) / r.size.height, 0), 1) * h.height);
     return CGPointMake(p.x / s.width * h.width, p.y / s.height * h.height);
 }
 @implementation MSHostView
@@ -751,19 +758,37 @@ static void MSLeftPress(int by, BOOL down) {
  * view keeps its bounds (the size AppKit was told), only a transform scales it, so the engine never sees a resize.
  * TVOut = NO in macshim.plist turns this off. */
 static UIWindow *g_tvWin; static UIView *g_tvPad;
-@interface MSTVPadView : UIView @end
+/* Mirror: every frame the game presents is also copied (one GPU blit, same command queue, right after the game's
+   command buffer) into a Metal layer on the phone, so the picture is on both screens. Touches map onto the picture. */
+static BOOL MSMirrorFit(UIView *v, CGRect *r) {
+    if (!g_mirrorOn || !v) return NO;
+    CGSize b = v.bounds.size, d = g_mirrorLayer.drawableSize; double a = d.width > 0 && d.height > 0 ? d.width / d.height : g_sw / g_sh;
+    if (b.width < 1 || b.height < 1 || !(a > 0)) return NO;
+    double w = b.width, h = w / a; if (h > b.height) { h = b.height; w = h * a; }
+    *r = CGRectMake((b.width - w) / 2, (b.height - h) / 2, w, h); return YES;
+}
+@interface MSTVPadView : UIView @property(strong) UILabel *note; @end
 @implementation MSTVPadView
 - (instancetype)initWithFrame:(CGRect)f {
     self = [super initWithFrame:f]; if (!self) return nil;
     self.multipleTouchEnabled = YES; self.backgroundColor = UIColor.blackColor;
     self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    UILabel *l = [UILabel new]; l.numberOfLines = 2; l.textAlignment = NSTextAlignmentCenter;
+    if (MSCfgD(@"TVMirror", 1) != 0) {
+        CAMetalLayer *m = [CAMetalLayer layer]; m.device = MTLCreateSystemDefaultDevice(); m.framebufferOnly = NO; m.opaque = YES;
+        m.contentsGravity = kCAGravityResizeAspect; m.maximumDrawableCount = 3; m.contentsScale = UIScreen.mainScreen.scale; m.frame = self.bounds;
+        [self.layer insertSublayer:m atIndex:0]; g_mirrorLayer = m;
+    }
+    UILabel *l = [UILabel new]; l.numberOfLines = 2; l.textAlignment = NSTextAlignmentCenter; self.note = l;
     l.text = @"Playing on the external display\nTouch here to move the cursor";
     l.textColor = [UIColor colorWithWhite:1 alpha:0.35]; l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
     l.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:l];
     [l.centerXAnchor constraintEqualToAnchor:self.centerXAnchor].active = YES;
     [l.topAnchor constraintEqualToAnchor:self.safeAreaLayoutGuide.topAnchor constant:16].active = YES;
     return self;
+}
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    if (g_mirrorLayer) { [CATransaction begin]; [CATransaction setDisableActions:YES]; g_mirrorLayer.frame = self.bounds; [CATransaction commit]; }
 }
 - (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e     { [g_hostView msTouches:t phase:0 event:e]; }
 - (void)touchesMoved:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e     { [g_hostView msTouches:t phase:1 event:e]; }
@@ -804,9 +829,17 @@ static void MSTVRoute(void) {                                     /* main thread
         UIView *root = g_tvWin.rootViewController.view; root.frame = g_tvWin.bounds;
         MSFitHost(host, root);
         if (!g_tvPad) g_tvPad = [[MSTVPadView alloc] initWithFrame:phone.bounds];
-        if (g_tvPad.superview != phone) { g_tvPad.frame = phone.bounds; [phone addSubview:g_tvPad]; }
+        if (g_tvPad.superview != phone) {
+            g_tvPad.frame = phone.bounds; [phone addSubview:g_tvPad];
+            if (g_mirrorLayer) {           /* the picture is on the phone too: the note only shows for a moment */
+                UILabel *l = ((MSTVPadView *)g_tvPad).note; l.text = @"Also on the external display"; l.alpha = 1;
+                MSAfter(4, ^{ [UIView animateWithDuration:0.6 animations:^{ l.alpha = 0; }]; });
+                MSLogf(@"TV out: picture mirrored on the phone too");
+            }
+        }
+        g_mirrorOn = g_mirrorLayer != nil;
     } else if (g_tvWin || host.superview != phone || (g_tvAspect > 0 && host.autoresizingMask != UIViewAutoresizingNone)) {
-        [g_tvPad removeFromSuperview];
+        g_mirrorOn = NO; [g_tvPad removeFromSuperview];
         MSFitHost(host, phone);
         g_tvWin.hidden = YES; g_tvWin = nil;
         MSLogf(@"TV out: external display gone, game back on the phone");
@@ -902,6 +935,8 @@ static BOOL MSCalledFromGameMain(void *ret);
             while (g_inBackground) @autoreleasepool { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, false); }
             MSLogf(@"foreground: game continues");
         }
+        static BOOL awake; if (!awake) { awake = YES; UIApplication.sharedApplication.idleTimerDisabled = YES; }  /* a controller doesn't count as touching the screen: don't auto-lock mid-game */
+        MSLowLatencyWait();
         /* Handle EVERY pending run-loop source, not just one: returnAfterSourceHandled made it one source per game frame,
            so touches queued up behind display-link / timer / block sources and reached the game late - the laggy
            buttons and sticks. Bounded so a flood can't stall the frame. */
@@ -920,6 +955,7 @@ static BOOL MSCalledFromGameMain(void *ret);
             }
             MSGCMouseFlush();
         }
+        MSInputReport();
         double now = CACurrentMediaTime();
         if (g_mqAsked > g_mqBeat && now - g_mqAsked > 0.25) {         /* main queue starved: run its blocks here */
             static int n; if (n++ < 3) MSLogf(@"main dispatch queue not serviced for %.1f s - draining it from the game loop", now - g_mqAsked);
@@ -1532,6 +1568,77 @@ static void MSWriteStreamingIni(void) {
     if ([ini writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]) MSLogf(@"streaming: at most %.1f ms and %ld nodes per frame (user.ini)", ms, nodes);
     else MSLogf(@"streaming: could not write %@", p);
 }
+/* ---------------------------------------------------------------- steady 30 (the game's dynamic resolution)
+ * Hot, the A18 Pro's GPU slows to ~1/3 of its cool speed: at a fixed MetalFX Performance (50 %) the city then takes
+ * 30-40 ms of GPU per frame and drops under 30. The engine's own DRS lowers the render size every frame to hold its
+ * target FPS - but the Mac build's menu stops it at 50 %, exactly where Performance already is, so it could only make
+ * things heavier. Its options.json limit goes down to 25 % (DRSMinLimit), and once (CyPortSteady30) the settings are
+ * set to: MetalFX Dynamic, DRS on, target 30 FPS, 35-50 % (DRSMin / DRSMax). Never above Performance (60 % made the GPU
+ * hotter while the CPU was the limit, and DRS only lowers it when the GPU is); MetalFX refuses input under 1/3 of output. Changed later in the game's menu, the player's choice stays.
+ * Steady30 = NO leaves all of it alone. */
+static void MSPatchDRSRange(void) {
+    NSString *root = g_root; if (!root) return;
+    NSString *p = [root stringByAppendingPathComponent:@"r6/config/settings/platform/mac/options.json"];
+    NSMutableString *t = [NSMutableString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil]; if (!t) return;
+    int lim = (int)MSCfgD(@"DRSMinLimit", 25); if (lim < 10) lim = 10; if (lim > 50) lim = 50;
+    NSRange nr = [t rangeOfString:@"\"name\"\\s*:\\s*\"DRS_MinResolution\"" options:NSRegularExpressionSearch]; if (nr.location == NSNotFound) return;
+    NSRange close = [t rangeOfString:@"}" options:0 range:NSMakeRange(nr.location, t.length - nr.location)]; if (close.location == NSNotFound) return;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"(\"min_value\"\\s*:\\s*)(\\d+)" options:0 error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:t options:0 range:NSMakeRange(nr.location, close.location - nr.location)]; if (!m) return;
+    NSString *want = [NSString stringWithFormat:@"%d", lim], *old = [t substringWithRange:[m rangeAtIndex:2]];
+    if ([old isEqualToString:want]) return;
+    [t replaceCharactersInRange:[m rangeAtIndex:2] withString:want];
+    if ([t writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]) MSLogf(@"steady 30: dynamic resolution may now go down to %@ %% (was %@ %%, options.json)", want, old);
+}
+static void MSRestoreDRSRange(void) {
+    NSString *root = g_root; if (!root) return;
+    NSString *p = [root stringByAppendingPathComponent:@"r6/config/settings/platform/mac/options.json"];
+    NSMutableString *t = [NSMutableString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil]; if (!t) return;
+    NSRange nr = [t rangeOfString:@"\"name\"\\s*:\\s*\"DRS_MinResolution\"" options:NSRegularExpressionSearch]; if (nr.location == NSNotFound) return;
+    NSRange close = [t rangeOfString:@"}" options:0 range:NSMakeRange(nr.location, t.length - nr.location)]; if (close.location == NSNotFound) return;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"(\"min_value\"\\s*:\\s*)(\\d+)" options:0 error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:t options:0 range:NSMakeRange(nr.location, close.location - nr.location)]; if (!m) return;
+    if ([[t substringWithRange:[m rangeAtIndex:2]] isEqualToString:@"50"]) return;
+    [t replaceCharactersInRange:[m rangeAtIndex:2] withString:@"50"]; [t writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+static BOOL MSApplySteady30(NSMutableString *txt) {
+    /* Measured over 4 hot city drives (2026-10-16): fixed MetalFX Performance 26.2 FPS avg (47 % of the time 28+), with the
+       game's DRS 21-23 FPS even at a smaller render size - DRS itself costs frames here. So it is opt-in (Steady30 = YES),
+       and the one CyPort switched on is switched back off once (CyPortDRSReverted). */
+    if (![MSConfig()[@"Steady30"] boolValue]) {
+        NSUserDefaults *u = NSUserDefaults.standardUserDefaults; BOOL ch = NO;
+        if ([u boolForKey:@"CyPortSteady30v2"] && ![u boolForKey:@"CyPortDRSReverted"]) {
+            ch |= MSTextSetRaw(txt, @"DynamicResolutionScaling", @"false", NULL);
+            NSString *q = nil; MSTextSetOption(txt, @"MetalFX", nil, -1, &q);
+            if ([q isEqualToString:@"Dynamic"]) { MSTextSetOption(txt, @"MetalFX", @"Performance", 3, NULL); ch = YES; }
+            ch |= MSTextSetRaw(txt, @"DRS_MinResolution", @"50", NULL);
+            MSRestoreDRSRange();
+            [u setBool:YES forKey:@"CyPortDRSReverted"]; [u removeObjectForKey:@"CyPortSteady30v2"];
+            MSLogf(@"steady 30: dynamic resolution switched back off, MetalFX Performance (measured faster)");
+        }
+        return ch;
+    }
+    MSPatchDRSRange();
+    NSString *up = nil; MSTextSetOption(txt, @"ResolutionScaling", nil, -1, &up);
+    if (![up isEqualToString:@"FSR2"]) { MSLogf(@"steady 30: upscaler is %@, not MetalFX - left alone", up); return NO; }
+    int lo = (int)MSCfgD(@"DRSMin", 35), hi = (int)MSCfgD(@"DRSMax", 50); lo = MAX(34, MIN(lo, 100)); hi = MAX(lo, MIN(hi, 100));   /* MetalFX: input >= 1/3 of output */
+    NSUserDefaults *u = NSUserDefaults.standardUserDefaults; BOOL ch = NO;
+    if (![u boolForKey:@"CyPortSteady30v2"]) {
+        ch |= MSTextSetRaw(txt, @"DynamicResolutionScaling", @"true", NULL);
+        NSString *q = nil; MSTextSetOption(txt, @"MetalFX", nil, -1, &q);
+        if (![q isEqualToString:@"Dynamic"]) { MSTextSetOption(txt, @"MetalFX", @"Dynamic", 5, NULL); ch = YES; }
+        ch |= MSTextSetRaw(txt, @"DRS_TargetFPS", @"30", NULL);
+        ch |= MSTextSetRaw(txt, @"DRS_MaxResolution", [NSString stringWithFormat:@"%d", hi], NULL);
+        ch |= MSTextSetRaw(txt, @"DRS_MinResolution", [NSString stringWithFormat:@"%d", lo], NULL);
+        [u setBool:YES forKey:@"CyPortSteady30v2"];
+        MSLogf(@"steady 30: MetalFX dynamic resolution on, target 30 FPS, %d-%d %%", lo, hi);
+    } else {                                                   /* the game clamps to its old 50 % limit when it saves */
+        NSString *on = nil, *mn = nil; MSTextSetRaw(txt, @"DynamicResolutionScaling", nil, &on); MSTextSetRaw(txt, @"DRS_MinResolution", nil, &mn);
+        if ([on isEqualToString:@"true"] && mn.intValue >= 50 && lo < 50) ch |= MSTextSetRaw(txt, @"DRS_MinResolution", [NSString stringWithFormat:@"%d", lo], NULL);
+        MSLogf(@"steady 30: dynamic resolution %@, min %@ %%", [on isEqualToString:@"true"] ? @"on" : @"off (player's choice)", ch ? @(lo) : mn);
+    }
+    return ch;
+}
 static void MSApplyGameSettings(NSSet *keys) {
     MSWriteStreamingIni();
     /* Only the resolution is written, as a text edit of its "value" (the game is offered only that one mode); the rest of
@@ -1575,6 +1682,7 @@ static void MSApplyGameSettings(NSSet *keys) {
         [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"CyPortUpscalerNamesFixed"];
     }
     if (MSApplyFrameRate(txt)) changed = YES;
+    if (MSApplySteady30(txt)) changed = YES;
     if (changed && [txt writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil])
         MSLogf(@"start screen: resolution %@ (text edit%@)", want, unesc ? [NSString stringWithFormat:@", %lu escaped slashes repaired", (unsigned long)unesc] : @"");
 }
@@ -1909,6 +2017,7 @@ __attribute__((constructor(101))) static void MSResolveVM(void) {
  * Values tuned for a Mac's 8+ performance cores make iOS park job/render threads on the 4 efficiency cores of an
  * A18 Pro. Default/utility requests become user-initiated (background stays background: streaming IO, shader
  * caches). ThreadQoS = NO keeps the game's values. */
+static pthread_t g_slowWorker[8]; static _Atomic int g_slowWorkerN;   /* workers cool mode put on the efficiency cores */
 int ms_pthread_set_qos_class_self_np(qos_class_t q, int rel) __asm("_pthread_set_qos_class_self_np");
 int ms_pthread_set_qos_class_self_np(qos_class_t q, int rel) {
     static int (*real)(qos_class_t, int); static int boost = -1;
@@ -1928,10 +2037,89 @@ int ms_pthread_set_qos_class_self_np(qos_class_t q, int rel) {
     if (cool < 0) cool = ![MSConfig()[@"CoolMode"] isEqual:@NO];
     static int fastW = -1; if (fastW < 0) fastW = (int)MAX(0, MSCfgD(@"CoolFastWorkers", 2));
     if (cool && !strncmp(nm, "redDispatcher", 13) && q > QOS_CLASS_UTILITY) want = atoi(nm + 13) <= fastW ? QOS_CLASS_USER_INITIATED : QOS_CLASS_UTILITY;
+    if (want == QOS_CLASS_UTILITY && !strncmp(nm, "redDispatcher", 13)) { int i = g_slowWorkerN; if (i < 8) { g_slowWorker[i] = pthread_self(); g_slowWorkerN = i + 1; } }
     static _Atomic int n; if (n++ < 40) {
         MSLogf(@"thread '%s' asks QoS %#x%@", nm, q, want != q ? [NSString stringWithFormat:@" -> %#x", want] : @""); }
     return real ? real(want, rel) : 0;
 }
+/* ---------------------------------------------------------------- job wake-ups: spin a little before sleeping
+ * Profile of a hot phone in the city (~20 FPS, GPU half idle): the game thread spends 70-95 % of its time waiting for the
+ * frame's jobs (os_sync_wait_on_address from red::Atomic::Wait, 0x10000754c), and the 5 job workers sleep in
+ * dispatch_semaphore_wait as soon as their queue is empty (red job queue 0x103974e34 never spins) and are woken by
+ * dispatch_semaphore_signal for the next job - hundreds of times a frame. On a Mac a wake-up costs microseconds; on a
+ * throttled iPhone, waking a sleeping core costs far more, and 7-15 % of every worker's samples were the sleep/wake itself.
+ * Now workers and the game thread first watch for the new job / the changed value for a few tens of microseconds and
+ * only then sleep. The spin time adapts every 30 s: longer while spins catch the wake-up, shorter while they don't.
+ * Result on the phone: 70-77 % of worker waits caught, hot-city FPS unchanged (22.6 vs 21.3) -> opt-in, JobSpin = YES;
+ * WorkerSpinUs / GameSpinUs set the starting times (default 40 / 60 us). */
+static _Atomic uint64_t g_spinTicks[3];                 /* [1] workers, [2] game thread; mach ticks */
+static _Atomic long long g_spinWaits[3], g_spinHits[3];
+static double g_spinUs[3];
+static __thread int t_spinKind = -1, t_spinCheck;
+static void MSSpinInit(void);
+static int MSSpinKind(void) {
+    if (t_spinKind > 0) return t_spinKind;
+    if (t_spinKind == 0 && (++t_spinCheck & 255)) return 0;        /* not (yet) named: look again now and then */
+    char nm[64] = ""; pthread_getname_np(pthread_self(), nm, sizeof nm);
+    t_spinKind = !strncmp(nm, "redDispatcher", 13) ? 1 : !strcmp(nm, "GameThread") ? 2 : 0;
+    if (t_spinKind) { static dispatch_once_t o; dispatch_once(&o, ^{ MSSpinInit(); }); }
+    return t_spinKind;
+}
+static uint64_t MSUsToTicks(double us) { static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb); return (uint64_t)(us * 1000.0 * tb.denom / tb.numer); }
+static void MSSpinInit(void) {                      /* first wait of a worker / the game thread (the config is readable by then) */
+    if (![MSConfig()[@"JobSpin"] boolValue]) return;            /* opt-in: caught 70 % of waits but no FPS gain (22.6 vs 21.3), costs power */
+    g_spinUs[1] = MSCfgD(@"WorkerSpinUs", 40); g_spinUs[2] = MSCfgD(@"GameSpinUs", 60);
+    for (int k = 1; k < 3; k++) g_spinTicks[k] = g_spinUs[k] > 0 ? MSUsToTicks(g_spinUs[k]) : 0;
+    MSLogf(@"job wake-ups: workers spin %.0f us, game thread %.0f us before sleeping", g_spinUs[1], g_spinUs[2]);
+}
+static void MSSpinPause(void) { for (int i = 0; i < 8; i++) __asm__ volatile("isb" ::: "memory"); }
+long ms_dispatch_semaphore_wait(dispatch_semaphore_t s, dispatch_time_t t) __asm("_dispatch_semaphore_wait");
+long ms_dispatch_semaphore_wait(dispatch_semaphore_t s, dispatch_time_t t) {
+    static long (*real)(dispatch_semaphore_t, dispatch_time_t);
+    if (!real) real = (long (*)(dispatch_semaphore_t, dispatch_time_t))dlsym(dlopen("/usr/lib/system/libdispatch.dylib", RTLD_NOLOAD | RTLD_LAZY), "dispatch_semaphore_wait");
+    uint64_t spin;
+    if (t == DISPATCH_TIME_FOREVER && MSSpinKind() == 1 && (spin = g_spinTicks[1])) {
+        g_spinWaits[1]++;
+        if (real(s, DISPATCH_TIME_NOW) == 0) { g_spinHits[1]++; return 0; }
+        uint64_t end = mach_absolute_time() + spin;
+        do { MSSpinPause(); if (real(s, DISPATCH_TIME_NOW) == 0) { g_spinHits[1]++; return 0; } } while (mach_absolute_time() < end);
+    }
+    return real(s, t);
+}
+int ms_os_sync_wait_on_address(void *a, uint64_t v, size_t sz, uint32_t fl) __asm("_os_sync_wait_on_address");
+int ms_os_sync_wait_on_address(void *a, uint64_t v, size_t sz, uint32_t fl) {
+    static int (*real)(void *, uint64_t, size_t, uint32_t);
+    if (!real) real = (int (*)(void *, uint64_t, size_t, uint32_t))dlsym(dlopen("/usr/lib/system/libsystem_platform.dylib", RTLD_NOLOAD | RTLD_LAZY), "os_sync_wait_on_address");
+    uint64_t spin;
+    if ((sz == 4 || sz == 8) && MSSpinKind() == 2 && (spin = g_spinTicks[2])) {
+        g_spinWaits[2]++;
+        uint64_t end = mach_absolute_time() + spin;
+        do {                                                  /* the caller re-checks its condition: returning early is allowed */
+            uint64_t cur = sz == 4 ? __atomic_load_n((uint32_t *)a, __ATOMIC_ACQUIRE) : __atomic_load_n((uint64_t *)a, __ATOMIC_ACQUIRE);
+            if (cur != (sz == 4 ? (uint32_t)v : v)) { g_spinHits[2]++; return 0; }
+            MSSpinPause();
+        } while (mach_absolute_time() < end);
+    }
+    return real(a, v, sz, fl);
+}
+/* every 30 s: log, and adapt each spin time to what it catches */
+static NSString *MSSpinReport(double dt) {
+    if (!g_spinTicks[1] && !g_spinTicks[2]) return nil;
+    static long long lw[3], lh[3]; NSMutableArray *parts = [NSMutableArray array];
+    const char *names[3] = { "", "workers", "game thread" };
+    for (int k = 1; k < 3; k++) {
+        long long w = g_spinWaits[k] - lw[k], h = g_spinHits[k] - lh[k]; lw[k] = g_spinWaits[k]; lh[k] = g_spinHits[k];
+        if (!g_spinTicks[k] || w <= 0) continue;
+        double rate = (double)h / w, was = g_spinUs[k];
+        if (rate > 0.5 && g_spinUs[k] < 60) g_spinUs[k] = MIN(60, g_spinUs[k] * 1.25);
+        else if (rate < 0.15 && g_spinUs[k] > 10) g_spinUs[k] = MAX(10, g_spinUs[k] * 0.7);
+        g_spinTicks[k] = MSUsToTicks(g_spinUs[k]);
+        [parts addObject:[NSString stringWithFormat:@"%s %.0f waits/s, %.0f%% caught by a %.0f us spin%@", names[k], w / dt, 100 * rate, was,
+                          was != g_spinUs[k] ? [NSString stringWithFormat:@" (now %.0f us)", g_spinUs[k]] : @""]];
+    }
+    return parts.count ? [@"job wake-ups: " stringByAppendingString:[parts componentsJoinedByString:@"; "]] : nil;
+}
+
 /* ---------------------------------------------------------------- sched_yield back-off
  * The engine's spinlocks (~800 sites) spin 16 times, then call sched_yield in a loop while they wait. On a Mac that
  * is cheap; on an iPhone the 5 job workers (each ~43% CPU, evenly - the spinning signature) burn power and heat while
@@ -2636,6 +2824,154 @@ static NSString *MSSampleWorkers(void) {
     };
     return [NSString stringWithFormat:@"%d workers, %d samples, %.0f%% on CPU | top code: %@ | called from: %@", nw, total, 100.0 * running / MAX(1, total), top(pcs), top(lrs)];
 }
+static const char *MSThermal(void); extern _Atomic long long g_frames;
+/* ---------------------------------------------------------------- slow-frame profiler + hot-phone worker test
+ * When the open world runs under 24 FPS, the busy threads are sampled for 1.5 s: share of time on a CPU, where they
+ * run (first exe frames of the stack) and, when not running, what they wait in (system call + exe caller). That shows
+ * which thread a slow frame waits for. FrameProfiler = NO turns it off.
+ * Hot-phone test: cool mode keeps 3 job workers on the efficiency cores (utility QoS). When the phone is hot iOS slows
+ * utility work hardest, and the game thread waits for those workers' jobs every frame. So while hot and slow, the
+ * shim times 15 s blocks with those workers raised to user-initiated and back (off/on/off/on); if raising them gives
+ * 2+ FPS more it stays raised while the phone is hot. Tested 2026-10-16: no gain (19.5 vs 18.5 FPS) -> off by default;
+ * HotBoost = test runs the test, YES always raises them. */
+static NSString *MSSite(uint64_t pc, intptr_t slide, uint64_t lo, uint64_t hi) {
+    if (pc >= lo && pc < hi) return [NSString stringWithFormat:@"%#llx", pc - (uint64_t)slide];
+    Dl_info di; if (dladdr((void *)pc, &di) && di.dli_sname) return @(di.dli_sname);
+    return [NSString stringWithFormat:@"%#llx", pc];
+}
+static void MSExeRange(intptr_t *slide, uint64_t *lo, uint64_t *hi) {
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *n = _dyld_get_image_name(i); if (!n || !strstr(n, "/Cyberpunk2077.app/Cyberpunk2077")) continue;
+        *slide = _dyld_get_image_vmaddr_slide(i); unsigned long sz = 0;
+        uint8_t *t = getsectiondata((const struct mach_header_64 *)_dyld_get_image_header(i), "__TEXT", "__text", &sz);
+        *lo = (uint64_t)t; *hi = *lo + sz; return;
+    }
+}
+/* Raw stack capture: runs while the target thread is SUSPENDED, so it must not take any lock (no malloc, no ObjC, no
+   dladdr - the suspended thread may hold them, and the sampler would then hang with a game thread stopped).
+   f[0] = pc, f[1] = lr, then the frame-pointer chain's return addresses; *run = thread was on a CPU. */
+static int MSRawStack(thread_act_t t, uint64_t stLo, uint64_t stHi, uint64_t *f, int max, BOOL *run) {
+    thread_basic_info_data_t bi; mach_msg_type_number_t cb = THREAD_BASIC_INFO_COUNT;
+    *run = thread_info(t, THREAD_BASIC_INFO, (thread_info_t)&bi, &cb) == KERN_SUCCESS && bi.run_state == TH_STATE_RUNNING;
+    arm_thread_state64_t st; mach_msg_type_number_t c = ARM_THREAD_STATE64_COUNT;
+    if (thread_get_state(t, ARM_THREAD_STATE64, (thread_state_t)&st, &c) != KERN_SUCCESS) return 0;
+    uint64_t fp = (uint64_t)arm_thread_state64_get_fp(st); int nf = 0;
+    f[nf++] = (uint64_t)arm_thread_state64_get_pc(st); f[nf++] = (uint64_t)arm_thread_state64_get_lr(st) & 0xFFFFFFFFFull;
+    (void)stLo; (void)stHi;                                   /* the game's main thread runs on CyPort's own stack */
+    for (int d = 0; nf < max && fp && !(fp & 7); d++) {
+        uint64_t pair[2]; vm_size_t got = 0;              /* a syscall: fails cleanly on a bad pointer, takes no lock */
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, 16, (vm_address_t)pair, &got) != KERN_SUCCESS || got != 16) break;
+        uint64_t nfp = pair[0], ret = pair[1] & 0xFFFFFFFFFull;
+        if (ret) f[nf++] = ret;
+        if (nfp <= fp) break; fp = nfp;
+    }
+    return nf;
+}
+/* after resuming: "inner<outer" for the first 2 exe frames; *wait = the system function it sits in when not in the exe */
+static NSString *MSStackKey(const uint64_t *f, int nf, intptr_t slide, uint64_t lo, uint64_t hi, NSString **wait) {
+    *wait = (f[0] >= lo && f[0] < hi) ? nil : MSSite(f[0], slide, lo, hi);
+    NSMutableArray *ex = [NSMutableArray array];
+    for (int i = 0; i < nf && ex.count < 2; i++) if (f[i] >= lo && f[i] < hi && !(i == 1 && f[1] == f[0])) [ex addObject:MSSite(f[i], slide, lo, hi)];
+    return ex.count ? [ex componentsJoinedByString:@"<"] : @"(no exe frame)";
+}
+static thread_act_t g_mainMach;
+__attribute__((constructor)) static void MSNoteMainThread(void) { g_mainMach = pthread_mach_thread_np(pthread_self()); }
+static double MSThreadCPU(thread_act_t t) {
+    thread_basic_info_data_t bi; mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(t, THREAD_BASIC_INFO, (thread_info_t)&bi, &c) != KERN_SUCCESS) return -1;
+    return bi.user_time.seconds + bi.user_time.microseconds / 1e6 + bi.system_time.seconds + bi.system_time.microseconds / 1e6;
+}
+static void MSProfileFrame(double fps) {
+    intptr_t slide = 0; uint64_t lo = 0, hi = 0; MSExeRange(&slide, &lo, &hi); if (!lo) return;
+    thread_act_array_t th; mach_msg_type_number_t n = 0; if (task_threads(mach_task_self(), &th, &n) != KERN_SUCCESS) return;
+    thread_act_t self = mach_thread_self(), mainT = g_mainMach;
+    double *c0 = calloc(n, sizeof(double)); for (mach_msg_type_number_t k = 0; k < n; k++) c0[k] = MSThreadCPU(th[k]);
+    double t0 = CACurrentMediaTime(); usleep(500000); double dt = CACurrentMediaTime() - t0;
+    enum { MAXT = 20 }; thread_act_t sel[MAXT]; double pct[MAXT]; int ns = 0;
+    for (mach_msg_type_number_t k = 0; k < n; k++) {
+        double p = (MSThreadCPU(th[k]) - c0[k]) / dt * 100;
+        BOOL keep = th[k] != self && (p >= 4 || th[k] == mainT) && ns < MAXT;
+        if (keep) { sel[ns] = th[k]; pct[ns++] = p; } else mach_port_deallocate(mach_task_self(), th[k]);
+    }
+    free(c0); vm_deallocate(mach_task_self(), (vm_address_t)th, n * sizeof *th); mach_port_deallocate(mach_task_self(), self);
+    NSCountedSet *run[MAXT], *wait[MAXT]; int tot[MAXT] = {0}, onCPU[MAXT] = {0};
+    pthread_t pts[MAXT]; uint64_t sLo[MAXT], sHi[MAXT];
+    for (int i = 0; i < ns; i++) {
+        run[i] = [NSCountedSet set]; wait[i] = [NSCountedSet set]; pts[i] = pthread_from_mach_thread_np(sel[i]);
+        sHi[i] = pts[i] ? (uint64_t)pthread_get_stackaddr_np(pts[i]) : 0; sLo[i] = pts[i] ? sHi[i] - pthread_get_stacksize_np(pts[i]) : 0;
+    }
+    for (int round = 0; round < 250; round++) {
+        for (int i = 0; i < ns; i++) {
+            uint64_t f[24]; BOOL r = NO; int nf;
+            if (thread_suspend(sel[i]) != KERN_SUCCESS) continue;
+            nf = MSRawStack(sel[i], sLo[i], sHi[i], f, 24, &r);          /* nothing that can lock in between */
+            thread_resume(sel[i]);
+            if (!nf) continue;
+            @autoreleasepool {
+                NSString *w = nil, *key = MSStackKey(f, nf, slide, lo, hi, &w);
+                tot[i]++; if (r) { onCPU[i]++; [run[i] addObject:key]; } else [wait[i] addObject:w ? [NSString stringWithFormat:@"%@ from %@", w, key] : key];
+            }
+        }
+        usleep(5000);
+    }
+    NSString *(^top)(NSCountedSet *, int) = ^NSString *(NSCountedSet *s, int total) {
+        NSArray *a = [s.allObjects sortedArrayUsingComparator:^NSComparisonResult(id x, id y) { return [@([s countForObject:y]) compare:@([s countForObject:x])]; }];
+        NSMutableArray *o = [NSMutableArray array];
+        for (NSString *k in a) { if (o.count >= 5) break; [o addObject:[NSString stringWithFormat:@"%@ %.0f%%", k, 100.0 * [s countForObject:k] / MAX(1, total)]]; }
+        return o.count ? [o componentsJoinedByString:@", "] : @"-";
+    };
+    MSLogf(@"profile: %.0f FPS, thermal %s, %d busy threads (~1.5 s, %% of each thread's samples)", fps, MSThermal(), ns);
+    for (int i = 0; i < ns; i++) {
+        char nm[64] = ""; if (pts[i]) pthread_getname_np(pts[i], nm, sizeof nm);
+        qos_class_t q = QOS_CLASS_UNSPECIFIED; int rel = 0; if (pts[i]) pthread_get_qos_class_np(pts[i], &q, &rel);
+        MSLogf(@"profile: %s%s qos %#x cpu %.0f%%, running %.0f%% | runs: %@ | waits: %@", sel[i] == mainT ? "MAIN " : "", nm[0] ? nm : "?", q, pct[i],
+               100.0 * onCPU[i] / MAX(1, tot[i]), top(run[i], tot[i]), top(wait[i], tot[i]));
+        mach_port_deallocate(mach_task_self(), sel[i]);
+    }
+}
+static pthread_override_t g_boostOv[8]; static BOOL g_boosted;
+static void MSBoostSlowWorkers(BOOL on) {
+    if (on == g_boosted) return;
+    for (int i = 0, n = MIN(8, (int)g_slowWorkerN); i < n; i++) {
+        if (on) g_boostOv[i] = pthread_override_qos_class_start_np(g_slowWorker[i], QOS_CLASS_USER_INITIATED, 0);
+        else if (g_boostOv[i]) { pthread_override_qos_class_end_np(g_boostOv[i]); g_boostOv[i] = NULL; }
+    }
+    g_boosted = on;
+}
+static double MSFPSFor(double secs, double *cpu) {
+    long long f0 = g_frames; double t0 = CACurrentMediaTime(), c0 = MSCPUSeconds(); usleep((useconds_t)(secs * 1e6));
+    double dt = CACurrentMediaTime() - t0; if (cpu) *cpu = (MSCPUSeconds() - c0) / dt * 100; return (g_frames - f0) / dt;
+}
+static BOOL MSIsHot(void) { return NSProcessInfo.processInfo.thermalState >= NSProcessInfoThermalStateSerious; }
+static void MSStartPerfLab(void) {
+    static dispatch_once_t once; dispatch_once(&once, ^{
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{     /* at utility it starved behind the game for minutes */
+        id hb = MSConfig()[@"HotBoost"]; int mode = [hb isEqual:@"test"] ? 1 : [hb boolValue] ? 2 : 0;   /* 0 off (default: tested, no gain), 1 test, 2 always */
+        BOOL prof = [MSConfig()[@"FrameProfiler"] boolValue];          /* opt-in: its sampling causes short hitches */
+        double lastProf = 0, lastTest = 0, verdictAt = 0; int profiles = 0, verdict = 0;     /* verdict: 1 boost helps, -1 doesn't */
+        for (;;) @autoreleasepool {
+            BOOL bg0 = g_inBackground; double cpu = 0, fps = MSFPSFor(10, &cpu), now = CACurrentMediaTime();
+            if (g_frames < 1500 || bg0 || g_inBackground) continue;
+            BOOL hot = MSIsHot(), slow = fps > 3 && fps < 24 && cpu > 150;             /* open world, not menus or loading */
+            if (prof && (slow || (hot && cpu > 250)) && profiles < 3 && now - lastProf > 120) { MSProfileFrame(fps); lastProf = now; profiles++; continue; }
+            if (!mode || !g_slowWorkerN) continue;
+            if (mode == 2 || verdict == 1) {
+                if (hot != g_boosted) { MSBoostSlowWorkers(hot); MSLogf(@"hot boost: %d efficiency-core workers %@ (thermal %s, %.0f FPS)", (int)g_slowWorkerN, hot ? @"raised to user-initiated" : @"back on utility", MSThermal(), fps); }
+                if (verdict == 1 && now - verdictAt > 600) verdict = 0;                     /* re-test every 10 min */
+                if (mode == 2 || verdict) continue;
+            }
+            if (verdict == -1 && now - verdictAt < 600) continue;
+            if (!hot || !slow || now - lastTest < 120) continue;
+            double f[4], c[4];
+            for (int i = 0; i < 4; i++) { MSBoostSlowWorkers(i & 1); MSFPSFor(1, NULL); f[i] = MSFPSFor(14, &c[i]); }
+            MSBoostSlowWorkers(NO); lastTest = verdictAt = CACurrentMediaTime();
+            double off = (f[0] + f[2]) / 2, on = (f[1] + f[3]) / 2; verdict = on >= off + 2 ? 1 : -1;
+            MSLogf(@"hot boost test: workers on utility %.1f / %.1f FPS (CPU %.0f / %.0f%%), raised %.1f / %.1f FPS (CPU %.0f / %.0f%%) -> %@",
+                   f[0], f[2], c[0], c[2], f[1], f[3], c[1], c[3], verdict == 1 ? @"raising them while the phone is hot" : @"keeping them on utility");
+        }
+    }); });
+}
+
 /* MetalFX: the game asks MTLFXTemporalScalerDescriptor whether this GPU can do MetalFX and falls back to FSR when it
    says no (seen: the game saved "ResolutionScaling MetalFX -> FSR2" ~60 s after starting). Every answer is logged; the
    support check is answered YES on an Apple GPU (A14 and later all do MetalFX). MetalFXForce = NO keeps the real answer. */
@@ -2648,8 +2984,24 @@ static BOOL ms_fxSupports(id self, SEL c, id dev) {
 }
 static float ms_fxMin(id self, SEL c, id dev) { float v = ((float (*)(id, SEL, id))g_fxMin)(self, c, dev); static int n; if (n++ < 3) MSLogf(@"MetalFX: min input scale %.2f", v); return v; }
 static float ms_fxMax(id self, SEL c, id dev) { float v = ((float (*)(id, SEL, id))g_fxMax)(self, c, dev); static int n; if (n++ < 3) MSLogf(@"MetalFX: max input scale %.2f", v); return v; }
+/* per-frame render width the game hands MetalFX (dynamic resolution changes it every frame): min/avg/max per 30 s */
+static IMP g_fxSetW; static _Atomic long g_fxWN, g_fxWSum, g_fxWMin = 1 << 30, g_fxWMax, g_fxOutW;
+static void ms_fxSetW(id self, SEL c, NSUInteger w) {
+    g_fxWN++; g_fxWSum += (long)w; if ((long)w < g_fxWMin) g_fxWMin = (long)w; if ((long)w > g_fxWMax) g_fxWMax = (long)w;
+    ((void (*)(id, SEL, NSUInteger))g_fxSetW)(self, c, w);
+}
+static NSString *MSRenderWidthReport(void) {
+    long n = g_fxWN, sum = g_fxWSum, lo = g_fxWMin, hi = g_fxWMax, out = g_fxOutW; g_fxWN = 0; g_fxWSum = 0; g_fxWMin = 1 << 30; g_fxWMax = 0;
+    if (!n || !out) return nil;
+    return [NSString stringWithFormat:@"render size: %ld-%ld px wide, avg %ld (%.0f-%.0f %%, avg %.0f %% of %ld)", lo, hi, sum / n, 100.0 * lo / out, 100.0 * hi / out, 100.0 * sum / n / out, out];
+}
 static id ms_fxNew(id self, SEL c, id dev) {
     id r = ((id (*)(id, SEL, id))g_fxNew)(self, c, dev);
+    if (r) {
+        g_fxOutW = (long)[[self valueForKey:@"outputWidth"] unsignedLongValue];
+        Method m = class_getInstanceMethod(object_getClass(r), @selector(setInputContentWidth:));
+        if (m && method_getImplementation(m) != (IMP)ms_fxSetW) { IMP o = method_setImplementation(m, (IMP)ms_fxSetW); if (!g_fxSetW) g_fxSetW = o; }
+    }
     static int n; if (n++ < 6) MSLogf(@"MetalFX: temporal scaler %@ (input %lux%lu -> output %lux%lu)", r ? @"created" : @"FAILED",
         [[self valueForKey:@"inputWidth"] unsignedLongValue], [[self valueForKey:@"inputHeight"] unsignedLongValue],
         [[self valueForKey:@"outputWidth"] unsignedLongValue], [[self valueForKey:@"outputHeight"] unsignedLongValue]);
@@ -2689,7 +3041,148 @@ static double MSFootprintMB(void) {
  * (4 GB until one has). Once the game draws frames itself the panel shrinks to a strip and then goes away. */
 _Atomic long long g_frames;
 static IMP g_origNextDrawable;
-static id ms_nextDrawable(id self, SEL _cmd) { MSPaceWait(); g_frames++; return ((id (*)(id, SEL))g_origNextDrawable)(self, _cmd); }
+static _Atomic long long g_drawDone;                 /* drawables the game's render thread got (frames it started presenting) */
+static _Atomic double g_drawAt, g_drawIv = 1 / 30.0;  /* when the last one came, average time between them */
+/* Low latency, part 1: with 3 drawables the render thread could queue up to 2 finished frames in front of the display
+   when the GPU is the limit - every queued frame is one more frame of input lag. 2 keeps one on screen + one being
+   drawn. Costs frame rate though: with 2 drawables a frame that misses a refresh waits for the next one, so the game
+   snaps to 30 (or 20) FPS and can't reach 60 - tester: "FPS stays at 30, performance got worse". So it is OFF unless
+   the start screen's "Low-latency input" switch (CyPortLowLatency) or LowLatency = YES turns it on; Drawables = 3
+   only undoes this part. */
+static BOOL MSLowLatencyOn(void) {
+    id v = MSConfig()[@"LowLatency"];
+    return [v respondsToSelector:@selector(boolValue)] ? [v boolValue] : MSPref(@"CyPortLowLatency", 0) != 0;
+}
+static void MSLowLatencyLayer(CAMetalLayer *l) {
+    static __weak CAMetalLayer *done; if (l == done) return; done = l;
+    /* v2: low latency keeps 3 drawables (2 halved the frame rate: 120 -> 60, 60 -> 30) and limits the frames queued for
+       the GPU instead (MSLowLatencyWait). Drawables = 2 in macshim.plist still forces the old way. */
+    int want = (int)MSCfgD(@"Drawables", 0); if (want != 2 && want != 3) return;
+    NSUInteger was = l.maximumDrawableCount; if (was != (NSUInteger)want) l.maximumDrawableCount = want;
+    MSLogf(@"low latency: game layer %.0fx%.0f, at most %d drawables (was %lu)", l.drawableSize.width, l.drawableSize.height, want, (unsigned long)was);
+}
+static _Atomic double g_gameMinDur = -1;             /* last cap the game presented with (0 = none), -1 = not drawing yet */
+/* Smooth frame pacing. When the game can't keep up with its cap (VSync 120/Off at 60-85 FPS, 60 when hot) frames take
+ * 2 refreshes, then 3, then 2: 17/25/17 ms - the FPS counter looks fine but it doesn't feel smooth. This holds the game
+ * to the highest even step it really keeps up with (120, 60, 40, 30 - whole refreshes on a 120 Hz screen, never above
+ * the game's own cap): down after 2 s with > 10% late frames, and now and then (20 s, doubling to 160 s after a failed
+ * try) it tries the next step up for 3 s. Start screen switch "Smooth frame pacing" (CyPortSmoothPacing, default on);
+ * SmoothPacing = YES/NO in macshim.plist overrides; FrameRate in macshim.plist (fixed pacing) turns it off. */
+static BOOL MSSmoothOn(void) {
+    id v = MSConfig()[@"SmoothPacing"];
+    return [v respondsToSelector:@selector(boolValue)] ? [v boolValue] : MSPref(@"CyPortSmoothPacing", 1) != 0;
+}
+static void MSSmoothFrame(double tOut) {                 /* render thread, after every nextDrawable */
+    static int on = -1; if (on < 0) on = MSSmoothOn(); if (!on || g_paceMode > 0 || g_inBackground) return;
+    static double last, winStart, probeAt, backoff = 20; static int n, late, step, top, probing, probeFrom, probeWins, badWins;
+    int maxHz = (int)lround(g_fps); if (maxHz < 60) maxHz = 60;
+    double gd = g_gameMinDur; int cap = gd > 0 ? (int)lround(1 / gd) : maxHz; if (cap > maxHz) cap = maxHz;
+    static const int steps[] = { 120, 60, 40, 30 };
+    int newTop = 0; for (int i = 0; i < 4; i++) if (steps[i] <= cap && maxHz % steps[i] == 0) { newTop = steps[i]; break; }
+    if (newTop != top) {                                  /* game cap changed (or first frame) */
+        top = newTop; probing = 0; badWins = 0;
+        if (!step || step > top) step = top; else if (step < top) probeAt = tOut + 3;
+        if (top) MSLogf(@"smooth pacing: game cap %d FPS, steps up to %d", cap, top);
+    }
+    if (top <= 30) { if (g_paceT > 0) MSPaceSet(0, @"smooth pacing: nothing to smooth"); last = 0; return; }
+    if (last > 0) {
+        double dt = tOut - last;
+        if (dt > 0.25) { n = late = 0; winStart = tOut; }   /* loading / hitch: not a pacing question */
+        else { n++; if (dt > 1.3 / step) late++; }
+    }
+    last = tOut; if (!winStart) winStart = tOut;
+    int was = step; NSString *why = nil;
+    if (tOut - winStart >= 1 && n >= 10) {
+        double frac = (double)late / n;
+        if (probing) {
+            if (frac > 0.08) { step = probeFrom; probing = 0; backoff = fmin(backoff * 2, 160); probeAt = tOut + backoff;
+                               why = [NSString stringWithFormat:@"smooth: %d FPS not kept (%.0f%% late), next try in %.0f s", was, 100 * frac, backoff]; }
+            else if (++probeWins >= 3) { probing = 0; backoff = 20; probeAt = tOut + 20;
+                               MSLogf(@"smooth pacing: %d FPS holds", step); }
+        } else if (frac > 0.10) {
+            if (++badWins >= 2) {
+                int lower = 0; for (int i = 0; i < 4; i++) if (steps[i] < step && maxHz % steps[i] == 0) { lower = steps[i]; break; }
+                if (lower) { step = lower; probeAt = tOut + backoff; why = [NSString stringWithFormat:@"smooth: %.0f%% of frames late at %d FPS", 100 * frac, was]; }
+                badWins = 0;
+            }
+        } else badWins = 0;
+        if (!probing && step < top && probeAt > 0 && tOut >= probeAt) {
+            int higher = top; for (int i = 3; i >= 0; i--) if (steps[i] > step && steps[i] <= top && maxHz % steps[i] == 0) { higher = steps[i]; break; }
+            probing = 1; probeFrom = step; probeWins = 0; step = higher; why = [NSString stringWithFormat:@"smooth: trying %d FPS", higher];
+        }
+        n = late = 0; winStart = tOut;
+    }
+    if (step != was || (step >= cap) != (g_paceT <= 0)) MSPaceSet(step >= cap ? 0 : step, why ?: @"smooth pacing");
+}
+static id ms_nextDrawable(id self, SEL _cmd) {
+    if (self == g_mirrorLayer) return ((id (*)(id, SEL))g_origNextDrawable)(self, _cmd);
+    MSPaceWait(); g_frames++;
+    MSLowLatencyLayer(self);
+    if (g_mirrorOn && [(CAMetalLayer *)self framebufferOnly]) [(CAMetalLayer *)self setFramebufferOnly:NO];  /* the mirror copies from it */
+    id d = ((id (*)(id, SEL))g_origNextDrawable)(self, _cmd);
+    double t = CACurrentMediaTime(), last = g_drawAt;
+    if (last > 0 && t - last < 0.25) g_drawIv = g_drawIv * 0.9 + (t - last) * 0.1;
+    g_drawAt = t; g_drawDone++;
+    MSSmoothFrame(t);
+    return d;
+}
+/* Low latency, part 2. The game reads input at the start of its frame (nextEventMatchingMask: and the GameController
+ * callbacks that run inside it), simulates, and its render thread draws that frame afterwards. When the render thread
+ * (or the GPU behind it) is the slower one, the game thread runs ahead and then waits for it - but it has already read
+ * the sticks/buttons/touches, so they are a frame or more old by the time the frame is drawn: the "laggy, imprecise"
+ * controls. Here the game thread does that waiting BEFORE it reads input: until the render thread has taken a drawable
+ * since the last read (= it is ready for the next frame). The frame rate stays the same (the wait only moves), input is
+ * a frame fresher. Only while the game reads input once per drawn frame (measured for 3 s at the start and every 60 s;
+ * loading screens and menus that stop drawing are left alone). Bounded to ~one frame. Off by default (MSLowLatencyOn). */
+static long long g_llFrames, g_llWaited, g_llTimeouts; static double g_llWaitSum, g_llWaitMax;
+/* Low latency, part 3: frames the render thread handed to the GPU (presenting command buffers) and how many of those
+   the GPU finished. With 3 drawables the GPU could have 2-3 frames queued, each one a frame of input lag; the game
+   thread now starts a frame (= reads input) only when at most one is left in flight. No refresh is skipped, so the
+   frame rate doesn't snap to half like with 2 drawables. */
+static _Atomic long long g_llSubmitted, g_llGpuDone;
+static void MSLowLatencyTrack(id<MTLCommandBuffer> cb) {   /* render thread, presenting command buffer, before commit */
+    static int on = -1; if (on < 0) on = MSLowLatencyOn(); if (!on || !cb) return;
+    g_llSubmitted++;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> b) { g_llGpuDone++; }];
+}
+static long long g_llGpuWaited; static double g_llGpuWaitSum;
+static void MSLowLatencyGpuWait(void) {
+    if (g_llSubmitted == 0 || CACurrentMediaTime() - g_drawAt > 0.25) return;
+    if (g_llSubmitted - g_llGpuDone <= 1) return;
+    double t0 = CACurrentMediaTime(), now = t0;
+    while (g_llSubmitted - g_llGpuDone > 1 && (now = CACurrentMediaTime()) - t0 < 0.05) usleep(200);
+    g_llGpuWaited++; g_llGpuWaitSum += now - t0;
+}
+static void MSLowLatencyWait(void) {                  /* main thread, start of every game frame */
+    static int on = -1; if (on < 0) on = MSLowLatencyOn(); if (!on) return;
+    MSLowLatencyGpuWait();
+    /* part 2 (game thread in lockstep with the render thread) also costs frame rate when both threads are busy:
+       only with LowLatencyLockstep = YES */
+    static int ls = -1; if (ls < 0) ls = MSCfgD(@"LowLatencyLockstep", 0) != 0; if (!ls) return;
+    static long long seen, calPolls, calDraws0; static double calEnd, nextCal; static int okState = -1;
+    double now = CACurrentMediaTime(), at = g_drawAt; long long dd = g_drawDone;
+    if (at <= 0 || now - at > 0.25) { seen = dd; calEnd = 0; return; }            /* not drawing right now */
+    g_llFrames++;
+    if (calEnd == 0 && now >= nextCal) { calEnd = now + 3; calPolls = 0; calDraws0 = dd; }
+    if (calEnd > 0) {                                                             /* measuring: no waiting */
+        calPolls++; seen = dd;
+        if (now >= calEnd) {
+            long long draws = dd - calDraws0; double r = draws > 0 ? (double)calPolls / draws : 0;
+            int ok = draws >= 20 && r > 0.8 && r < 1.25; calEnd = 0; nextCal = now + 60;
+            if (ok != okState) MSLogf(@"low latency: the game reads input %.2fx per drawn frame -> %@", r,
+                                      ok ? @"input is read once the render thread is ready" : @"waiting off for now");
+            okState = ok;
+        }
+        return;
+    }
+    if (okState == 1 && dd <= seen) {
+        double lim = fmin(g_drawIv * 1.1, 0.045), t0 = now;
+        while (g_drawDone <= seen && (now = CACurrentMediaTime()) - t0 < lim) usleep(150);
+        double w = now - t0; g_llWaited++; g_llWaitSum += w; if (w > g_llWaitMax) g_llWaitMax = w;
+        if (g_drawDone <= seen) g_llTimeouts++;
+    }
+    seen = g_drawDone;
+}
 static UIWindow *g_statusWin; static CGFloat g_stPad; static CALayer *g_stRoot, *g_stBg, *g_stTrack, *g_stFill; static CATextLayer *g_stTitle, *g_stHead, *g_stLog;
 static CATextLayer *MSTextLayer(CGFloat size, BOOL mono, UIColor *color) {
     CATextLayer *t = [CATextLayer layer]; t.contentsScale = UIScreen.mainScreen.scale; t.foregroundColor = color.CGColor;
@@ -2722,11 +3215,18 @@ static id ms_physicalInputProfile(GCController *self, SEL _cmd) {
 }
 /* The game only knows Xbox / DualShock 4 / DualSense controllers (it picks button glyphs and layouts by
  * productCategory). The snapshot controller's own category is unknown to it and corrupted memory on the next screen,
- * so it reports itself as an Xbox controller. */
+ * so it reports itself as an Xbox controller. Real third-party pads (EasySMX, 8BitDo, MFi: "HID", "MFi", "Generic")
+ * are just as unknown - tester's EasySMX M10 often did nothing in the start menu - so they are Xbox pads too.
+ * RealPadCategory = NO leaves them alone. */
 static IMP g_origCategory, g_origVendor;
 static NSString *ms_productCategory(GCController *self, SEL _cmd) {
     if (self == g_vpad) return GCProductCategoryXboxOne;
-    return ((NSString *(*)(id, SEL))g_origCategory)(self, _cmd);
+    NSString *c = ((NSString *(*)(id, SEL))g_origCategory)(self, _cmd);
+    static int spoof = -1; if (spoof < 0) spoof = MSCfgD(@"RealPadCategory", 1) != 0;
+    if (!spoof || self.isSnapshot || !self.extendedGamepad || [c isEqualToString:GCProductCategoryXboxOne] ||
+        [c isEqualToString:GCProductCategoryDualShock4] || [c isEqualToString:GCProductCategoryDualSense]) return c;
+    static NSString *said; if (![said isEqualToString:c]) { said = c; MSLogf(@"controller: '%@' (%@) is shown to the game as an Xbox controller", self.vendorName, c); }
+    return GCProductCategoryXboxOne;
 }
 static NSString *ms_vendorName(GCController *self, SEL _cmd) {
     if (self == g_vpad) return @"Xbox Wireless Controller";
@@ -2742,6 +3242,7 @@ static id ms_extendedGamepad(GCController *self, SEL _cmd) {
  * the game. The handlers it installs on the virtual pad are kept here, and every change the touch controls make runs
  * them (unless GameController already did within 30 ms). */
 static NSMapTable *g_padHandlers, *g_padFired;           /* element -> game's handler, element -> last time it ran */
+static BOOL g_realHandlerSeen;                            /* the game has hooked up a real controller (set a handler on it) */
 static BOOL MSIsPadObject(id o) {
     if (!g_pad || !o) return NO;
     if (o == g_pad) return YES;
@@ -2754,10 +3255,34 @@ static BOOL MSIsPadObject(id o) {
     }
     return NO;
 }
+/* how long a real controller's input took to reach the game: from GameController's timestamp of the event to the
+   moment the game's callback runs (main thread, start of a frame). Logged every 30 s with the low-latency numbers. */
+static __weak GCExtendedGamepad *g_realGP;
+static long long g_ptN; static double g_ptSum, g_ptMax;
+static void MSPadTiming(void) {
+    GCExtendedGamepad *g = g_realGP; if (!g) return;
+    double ts = g.lastEventTimestamp;                 /* seconds since 1970 on iOS 27, not CACurrentMediaTime's clock */
+    double d = (ts > 1e8 ? NSDate.date.timeIntervalSince1970 : CACurrentMediaTime()) - ts;
+    static int said; if (!said++) MSLogf(@"controller: first input reached the game %.1f ms after the controller sent it (%@ thread)", d * 1000, NSThread.isMainThread ? @"main" : @"other");
+    if (d < 0 || d > 2) return;
+    g_ptN++; g_ptSum += d; if (d > g_ptMax) g_ptMax = d;
+}
+static void MSInputReport(void) {                     /* main thread */
+    static double rep; double now = CACurrentMediaTime();
+    if (now - rep < 30) return;
+    if (rep > 0 && g_llFrames) MSLogf(@"low latency: %lld frames, waited before reading input in %.0f%% (avg %.1f ms, max %.1f ms, %lld hit the limit), frame %.1f ms",
+                                      g_llFrames, 100.0 * g_llWaited / g_llFrames, g_llWaited ? 1000 * g_llWaitSum / g_llWaited : 0, 1000 * g_llWaitMax, g_llTimeouts, 1000 * g_drawIv);
+    if (rep > 0 && g_llFrames) MSLogf(@"low latency: waited for the GPU in %lld frames (avg %.1f ms)", g_llGpuWaited, g_llGpuWaited ? 1000 * g_llGpuWaitSum / g_llGpuWaited : 0);
+    g_llGpuWaited = 0; g_llGpuWaitSum = 0;
+    if (rep > 0 && g_ptN) MSLogf(@"controller: %lld inputs, reached the game avg %.1f ms (max %.1f ms) after the controller sent them",
+                                 g_ptN, 1000 * g_ptSum / g_ptN, 1000 * g_ptMax);
+    rep = now; g_llFrames = g_llWaited = g_llTimeouts = 0; g_llWaitSum = g_llWaitMax = 0; g_ptN = 0; g_ptSum = g_ptMax = 0;
+}
 static IMP g_origSetVCH[4]; static Class g_vchClass[4], g_vchHooked[4];
 static void ms_setValueChangedHandler(id self, SEL _cmd, id handler) {
     IMP orig = NULL;
     for (int i = 0; i < 4; i++) if (g_vchHooked[i] && [self isKindOfClass:g_vchHooked[i]]) { orig = g_origSetVCH[i]; break; }
+    if (handler && !MSIsPadObject(self)) g_realHandlerSeen = YES;
     static int n; if (n++ < 40) MSLogf(@"game set a gamepad handler on %@%@", NSStringFromClass([self class]), MSIsPadObject(self) ? @" (on-screen controller)" : @"");
     id h = handler;
     if (handler && MSIsPadObject(self)) {
@@ -2772,6 +3297,14 @@ static void ms_setValueChangedHandler(id self, SEL _cmd, id handler) {
             h = ^(GCControllerAxisInput *a, float v) { @synchronized (g_padHandlers) { [g_padFired setObject:@(CACurrentMediaTime()) forKey:weakSelf]; } ((void (^)(id, float))real)(a, v); };
         else
             h = ^(id g, GCControllerElement *el) { @synchronized (g_padHandlers) { [g_padFired setObject:@(CACurrentMediaTime()) forKey:weakSelf]; } ((void (^)(id, id))real)(g, el); };
+    } else if (handler && MSCfgD(@"PadTiming", 0) != 0) {        /* a real controller: measure, change nothing (PadTiming = YES) */
+        id real = [handler copy];
+        if ([self isKindOfClass:GCControllerButtonInput.class])
+            h = ^(GCControllerButtonInput *b, float v, BOOL p) { MSPadTiming(); ((void (^)(id, float, BOOL))real)(b, v, p); };
+        else if ([self isKindOfClass:GCControllerDirectionPad.class])
+            h = ^(GCControllerDirectionPad *d, float x, float y) { MSPadTiming(); ((void (^)(id, float, float))real)(d, x, y); };
+        else if ([self isKindOfClass:GCControllerAxisInput.class])
+            h = ^(GCControllerAxisInput *a, float v) { MSPadTiming(); ((void (^)(id, float))real)(a, v); };
     }
     if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, h);
 }
@@ -3050,7 +3583,7 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
 }
 - (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self touchesEnded:ts withEvent:e]; }
 - (void)msTick:(CADisplayLink *)l {
-    BOOL want = g_frames > 60 && !MSRealControllerConnected() && !g_gcmCount;
+    BOOL want = g_frames > 60 && !(g_vpad ? g_realPad : MSRealControllerConnected()) && !g_gcmCount;
     if (want != _shown) { _shown = want; self.hidden = !want; if (want) MSLogf(@"touch controls shown"); }
     if (!want) return;
     [self msLayout];
@@ -3158,6 +3691,7 @@ static void MSTouchPadCreate(UIWindowScene *sc) {                 /* main thread
        over from the virtual one: the game sees the virtual pad disconnect, and connect again when the real one leaves */
     if (g_vpad) {
         g_realPad = MSRealControllerConnected();
+        static long long gen;                         /* bumps on every connect/disconnect: a pending "gone" check sees newer news */
         void (^update)(void) = ^{
             BOOL real = MSRealControllerConnected(); if (real == g_realPad) return;
             g_realPad = real;
@@ -3170,13 +3704,36 @@ static void MSTouchPadCreate(UIWindowScene *sc) {                 /* main thread
             [NSNotificationCenter.defaultCenter addObserverForName:n object:nil queue:nil usingBlock:^(NSNotification *x) {
                 if (x.object == g_vpad) return;
                 GCController *c = x.object; MSLogf(@"controller %@: %@ (%@)", [x.name containsString:@"Disconnect"] ? @"disconnected" : @"connected", c.vendorName, c.productCategory);
-                MSMainAsync(update);
+                BOOL gone = [x.name containsString:@"Disconnect"]; long long my = ++gen;
+                if (!gone && c.extendedGamepad) g_realGP = c.extendedGamepad;
+                /* connect: withdraw the on-screen pad right now, inside this notification - this observer was added before
+                   the game's, so the game sees "virtual pad gone" before "real pad here" and makes the real one active
+                   (before, the virtual pad's disconnect came a frame later and sometimes left the game with no pad).
+                   disconnect: Bluetooth pads drop out for a second now and then (tester log: gone/back within 1-2 s), so
+                   the on-screen pad only comes back if the real one stays away for 2.5 s. */
+                if (!gone) { if (NSThread.isMainThread) update(); MSMainAsync(update); return; }   /* 2nd: in case the list didn't have it yet */
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                    if (my == gen) MSMainAsync(update);
+                });
             }];
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             while (g_frames < 60) usleep(200000);
             sleep(2);
             MSMainAsync(^{
-                if (g_realPad) { MSLogf(@"touch pad: real controller present, virtual one stays out"); return; }
+                /* A pad that was already connected when the game started is never picked up: the game only hooks up
+                   controllers it gets a connect notification for (tester: stuck at "press space to continue" until
+                   the pad was unplugged and plugged in again). Same cure as for the virtual pad: tell it now. */
+                if (g_realPad) {
+                    MSLogf(@"touch pad: real controller present, virtual one stays out");
+                    if (g_realHandlerSeen) return;
+                    NSArray *all = ((NSArray *(*)(id, SEL))g_origControllers)(GCController.class, @selector(controllers));
+                    for (GCController *c in all) if (!c.isSnapshot && c.extendedGamepad) {
+                        g_realGP = c.extendedGamepad;
+                        [NSNotificationCenter.defaultCenter postNotificationName:GCControllerDidConnectNotification object:c];
+                        MSLogf(@"controller: told the game about %@, connected before it started", c.vendorName);
+                    }
+                    return;
+                }
                 [NSNotificationCenter.defaultCenter postNotificationName:GCControllerDidConnectNotification object:g_vpad];
                 MSLogf(@"touch pad: virtual controller connected");
             });
@@ -3191,7 +3748,38 @@ static IMP g_oCBPresent, g_oDrPresent, g_oCBPresentMin, g_oDrPresentMin, g_oCBCo
    say how much of that second the GPU was working (logged as "gpu: busy N%"). GPUSampler = NO turns it off. */
 static _Atomic BOOL g_gpuSampling; static os_unfair_lock g_gpuLock = OS_UNFAIR_LOCK_INIT;
 static double g_gpuIv[4096][2]; static int g_gpuN;
+static char g_mirrorKey; static BOOL g_gpuSamplerOn;
+static _Atomic int g_mirrorBusy;
+/* render thread, right after the game committed a command buffer that presents: copy its picture to the phone's layer.
+   A command buffer on the same queue runs after the game's, so the copy sees the finished frame. Skipped while two
+   copies are still on the GPU (never holds the game up). */
+static void MSMirrorFrame(id<MTLCommandBuffer> cb, id<CAMetalDrawable> d) {
+    CAMetalLayer *ml = g_mirrorLayer; id<MTLTexture> src = d.texture;
+    if (!ml || !src || src.framebufferOnly || src.sampleCount != 1 || g_mirrorBusy >= 2) return;
+    @try {
+        CGSize sz = CGSizeMake(src.width, src.height);
+        if (!CGSizeEqualToSize(ml.drawableSize, sz) || ml.pixelFormat != src.pixelFormat) {
+            [CATransaction begin]; [CATransaction setDisableActions:YES];
+            ml.pixelFormat = src.pixelFormat; ml.drawableSize = sz;
+            [CATransaction commit];
+            MSLogf(@"TV out: mirroring %lux%lu (pixel format %lu) to the phone", (unsigned long)src.width, (unsigned long)src.height, (unsigned long)src.pixelFormat);
+        }
+        id<CAMetalDrawable> md = ((id (*)(id, SEL))g_origNextDrawable)(ml, @selector(nextDrawable));
+        if (!md || md.texture.width != src.width || md.texture.height != src.height) return;
+        id<MTLCommandBuffer> c2 = [cb.commandQueue commandBuffer]; if (!c2) return;
+        id<MTLBlitCommandEncoder> b = [c2 blitCommandEncoder]; [b copyFromTexture:src toTexture:md.texture]; [b endEncoding];
+        ((void (*)(id, SEL, id))g_oCBPresent)(c2, @selector(presentDrawable:), md);
+        g_mirrorBusy++; [c2 addCompletedHandler:^(id<MTLCommandBuffer> x) { g_mirrorBusy--; }];
+        [c2 commit];
+    } @catch (NSException *e) {
+        static int n; if (n++ < 3) MSLogf(@"TV out: mirror failed: %@ - phone stays black", e.reason);
+        g_mirrorOn = NO;
+    }
+}
 static void ms_cbCommit(id self, SEL c) {
+    id md = nil;
+    if (g_mirrorOn && g_oCBPresent && (md = objc_getAssociatedObject(self, &g_mirrorKey)))
+        objc_setAssociatedObject(self, &g_mirrorKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (g_gpuSampling) {
         [(id<MTLCommandBuffer>)self addCompletedHandler:^(id<MTLCommandBuffer> b) {
             CFTimeInterval a = b.GPUStartTime, e = b.GPUEndTime; if (e <= a || a <= 0) return;
@@ -3199,10 +3787,11 @@ static void ms_cbCommit(id self, SEL c) {
         }];
     }
     ((void (*)(id, SEL))g_oCBCommit)(self, c);
+    if (md) MSMirrorFrame(self, md);
 }
 static int MSCmpIv(const void *x, const void *y) { double a = ((const double *)x)[0], b = ((const double *)y)[0]; return a < b ? -1 : a > b; }
 static NSString *MSGPUSample(void) {                    /* progress thread: blocks ~1.2 s */
-    if (!g_oCBCommit) return nil;
+    if (!g_oCBCommit || !g_gpuSamplerOn) return nil;
     os_unfair_lock_lock(&g_gpuLock); g_gpuN = 0; os_unfair_lock_unlock(&g_gpuLock);
     long long f0 = g_frames; double t0 = CACurrentMediaTime(); g_gpuSampling = YES; usleep(1000000); g_gpuSampling = NO;
     double t1 = CACurrentMediaTime(); long long frames = g_frames - f0; usleep(200000);     /* late completions */
@@ -3215,21 +3804,114 @@ static NSString *MSGPUSample(void) {                    /* progress thread: bloc
     return [NSString stringWithFormat:@"gpu: busy %.0f%% of the last second (%.1f ms per frame, %lld frames, %d command buffers)",
             100 * busy / (t1 - t0), 1000 * busy / frames, frames, n];
 }
+/* 120 Hz. iOS runs the screen at 60 Hz for a Metal layer unless something in the app asks for more with a display
+ * link's preferredFrameRateRange (the Info.plist key alone only allows it). The Mac game never asks, so menus stopped
+ * at exactly 60 with VSync 120 / Off, and VSync 40 gave 30. The game's present calls say what it wants
+ * (afterMinimumDuration = its VSync cap, plain present = uncapped); unless that fits 60 Hz a display link on its own
+ * thread asks for 120 Hz, otherwise it is paused (no extra refreshes at 30/60). HighRefresh = NO turns it off. */
+@interface MSRefreshTicker : NSObject @end
+@implementation MSRefreshTicker
+- (void)tick:(CADisplayLink *)l { }
+- (void)check:(NSTimer *)t {
+    CADisplayLink *l = t.userInfo; double d = g_paceT > 0 ? g_paceT : g_gameMinDur;
+    /* 60 Hz only fits caps that divide 60 (60, 30, 20): VSync 40 (25 ms) fell back to 33 ms = 30 FPS. Anything else -
+       40, 120, uncapped, a custom Max FPS - gets 120 Hz, where 25 ms is exactly 3 refreshes. */
+    int fps = d > 0 ? (int)lround(1 / d) : 0;
+    BOOL fits60 = fps > 0 && fps <= 60 && fabs(60.0 / fps - lround(60.0 / fps)) < 0.05;
+    BOOL want = d >= 0 && !fits60 && !g_inBackground;
+    if (l.paused == !want) return;
+    l.paused = !want;
+    MSLogf(@"screen: %@ (game cap %@)", want ? @"asking for 120 Hz" : @"back to the normal refresh rate", fps ? [NSString stringWithFormat:@"%d FPS", fps] : @"none");
+}
+@end
+static void MSStartRefreshTicker(void) {
+    if ([MSConfig()[@"HighRefresh"] isEqual:@NO] || UIScreen.mainScreen.maximumFramesPerSecond <= 60) return;
+    NSThread *th = [[NSThread alloc] initWithBlock:^{
+        MSRefreshTicker *k = [MSRefreshTicker new];
+        CADisplayLink *l = [CADisplayLink displayLinkWithTarget:k selector:@selector(tick:)];
+        NSInteger mx = UIScreen.mainScreen.maximumFramesPerSecond;
+        l.preferredFrameRateRange = CAFrameRateRangeMake(80, mx, mx); l.paused = YES;
+        [l addToRunLoop:NSRunLoop.currentRunLoop forMode:NSRunLoopCommonModes];
+        [NSRunLoop.currentRunLoop addTimer:[NSTimer timerWithTimeInterval:0.5 target:k selector:@selector(check:) userInfo:l repeats:YES] forMode:NSRunLoopCommonModes];
+        [NSRunLoop.currentRunLoop run];
+    }];
+    th.name = @"CyPort.refresh"; th.qualityOfService = NSQualityOfServiceUtility; [th start];
+}
+/* The game's cap is an exact multiple of the refresh (40 FPS = 25.0 ms = 3 refreshes at 120 Hz); with the usual
+   timing jitter some frames just missed it and waited a 4th refresh: VSync 40 showed 37-39 FPS. 2 ms less still lands
+   on the same refresh (one refresh is >= 8.3 ms) without missing it. */
+static CFTimeInterval MSCapMargin(CFTimeInterval t) {
+    static int on = -1; if (on < 0) on = MSCfgD(@"CapMargin", 1) != 0;
+    return on && t > 0.004 ? t - 0.002 : t;
+}
+/* Metal's presentDrawable:afterMinimumDuration: calls the drawable's presentAfterMinimumDuration: itself, so both hooks
+   ran for one frame (margin taken twice, log said "cap 43"). The command buffer path marks its drawables. */
+static char g_capKey;
+/* what the screen really did: for 2 s every 30 s each presented frame reports when it reached the screen; logged as
+   "shown: N frames, every 8 ms x a, 17 ms x b, ..." (counts per number of 120 Hz refreshes between frames) */
+static _Atomic BOOL g_shownSampling; static os_unfair_lock g_shownLock = OS_UNFAIR_LOCK_INIT;
+static double g_shownLast; static int g_shownHist[7];
+static void MSShownWatch(id<MTLDrawable> d) {
+    static double next; double now = CACurrentMediaTime();
+    if (!g_shownSampling) {
+        if (now < next || MSCfgD(@"ShownSampler", 1) == 0) return;
+        next = now + 30; g_shownSampling = YES; g_shownLast = 0; memset(g_shownHist, 0, sizeof g_shownHist);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 5), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                os_unfair_lock_lock(&g_shownLock); int h[7]; memcpy(h, g_shownHist, sizeof h); os_unfair_lock_unlock(&g_shownLock);
+                int n = 0; for (int i = 0; i < 7; i++) n += h[i];
+                if (n) MSLogf(@"shown: %d frames, every 8 ms x%d, 17 ms x%d, 25 ms x%d, 33 ms x%d, 42 ms x%d, longer x%d (game cap %.1f ms)",
+                              n, h[1], h[2], h[3], h[4], h[5], h[6] + h[0], 1000 * (double)g_gameMinDur);
+            });
+            g_shownSampling = NO;
+        });
+    }
+    if (![(id)d respondsToSelector:@selector(addPresentedHandler:)]) return;
+    [d addPresentedHandler:^(id<MTLDrawable> dr) {
+        double t = dr.presentedTime; if (t <= 0) return;
+        os_unfair_lock_lock(&g_shownLock);
+        if (g_shownLast > 0) { long k = lround((t - g_shownLast) * 120); if (k < 0) k = 0; if (k > 6) k = 6; g_shownHist[k]++; }
+        g_shownLast = t;
+        os_unfair_lock_unlock(&g_shownLock);
+    }];
+}
 static void ms_cbPresentMin(id self, SEL c, id d, CFTimeInterval t) {   /* the game's VSync setting uses this one */
-    double T = g_paceT; static int said; if (!said++) MSLogf(@"frame pacing: game presents with presentDrawable:afterMinimumDuration: %.4f", t);
+    g_gameMinDur = t; t = MSCapMargin(t); MSLowLatencyTrack(self);
+    if (d) objc_setAssociatedObject(d, &g_capKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    MSShownWatch(d);
+    if (g_mirrorOn) objc_setAssociatedObject(self, &g_mirrorKey, d, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    double T = g_paceT; static int said; if (!said++) MSLogf(@"frame pacing: game presents with presentDrawable:afterMinimumDuration: %.4f", (double)g_gameMinDur);
     ((void (*)(id, SEL, id, CFTimeInterval))g_oCBPresentMin)(self, c, d, T > 0 ? MAX(t, T - 0.002) : t);
 }
 static void ms_drPresentMin(id self, SEL c, CFTimeInterval t) {
+    if (objc_getAssociatedObject(self, &g_capKey)) { ((void (*)(id, SEL, CFTimeInterval))g_oDrPresentMin)(self, c, t); return; }
+    g_gameMinDur = t; t = MSCapMargin(t); MSShownWatch(self);
     double T = g_paceT; ((void (*)(id, SEL, CFTimeInterval))g_oDrPresentMin)(self, c, T > 0 ? MAX(t, T - 0.002) : t);
 }
+/* Uncapped (VSync Off): a plain present is treated by iOS as ordinary 60 Hz content - menus sat at exactly 60 while
+   VSync 120 (an 8.3 ms cap) ran at 120. So "no cap" is passed on as "every refresh of the fastest screen rate", which
+   is all the screen can show anyway. Uncapped = NO keeps the plain present. */
+static CFTimeInterval MSUncappedDur(void) {
+    static double dur = -1;
+    if (dur < 0) { NSInteger mx = UIScreen.mainScreen.maximumFramesPerSecond; dur = MSCfgD(@"Uncapped", 1) != 0 && mx > 60 && ![MSConfig()[@"HighRefresh"] isEqual:@NO] ? 1.0 / mx : 0; }
+    return dur;
+}
 static void ms_cbPresent(id self, SEL c, id d) {                /* -[MTLCommandBuffer presentDrawable:] */
+    g_gameMinDur = 0; MSLowLatencyTrack(self);
+    if (d) objc_setAssociatedObject(d, &g_capKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    MSShownWatch(d);
+    if (g_mirrorOn) objc_setAssociatedObject(self, &g_mirrorKey, d, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     double T = g_paceT; static int said; if (!said++) MSLogf(@"frame pacing: game presents with presentDrawable:");
-    if (T > 0) ((void (*)(id, SEL, id, CFTimeInterval))(g_oCBPresentMin ?: class_getMethodImplementation(object_getClass(self), @selector(presentDrawable:afterMinimumDuration:))))(self, @selector(presentDrawable:afterMinimumDuration:), d, T - 0.002);
+    double U = MSUncappedDur();
+    if (T > 0 || U > 0) ((void (*)(id, SEL, id, CFTimeInterval))(g_oCBPresentMin ?: class_getMethodImplementation(object_getClass(self), @selector(presentDrawable:afterMinimumDuration:))))(self, @selector(presentDrawable:afterMinimumDuration:), d, T > 0 ? T - 0.002 : MSCapMargin(U));
     else ((void (*)(id, SEL, id))g_oCBPresent)(self, c, d);
 }
 static void ms_drPresent(id self, SEL c) {                      /* -[CAMetalDrawable present] */
+    if (objc_getAssociatedObject(self, &g_capKey)) { ((void (*)(id, SEL))g_oDrPresent)(self, c); return; }
+    g_gameMinDur = 0; MSShownWatch(self);
     double T = g_paceT; static int said; if (!said++) MSLogf(@"frame pacing: game presents with [drawable present]");
-    if (T > 0) ((void (*)(id, SEL, CFTimeInterval))(g_oDrPresentMin ?: class_getMethodImplementation(object_getClass(self), @selector(presentAfterMinimumDuration:))))(self, @selector(presentAfterMinimumDuration:), T - 0.002);
+    double U = MSUncappedDur();
+    if (T > 0 || U > 0) ((void (*)(id, SEL, CFTimeInterval))(g_oDrPresentMin ?: class_getMethodImplementation(object_getClass(self), @selector(presentAfterMinimumDuration:))))(self, @selector(presentAfterMinimumDuration:), T > 0 ? T - 0.002 : MSCapMargin(U));
     else ((void (*)(id, SEL))g_oDrPresent)(self, c);
 }
 static void MSInstallPacing(void) {
@@ -3239,12 +3921,14 @@ static void MSInstallPacing(void) {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice(); id<MTLCommandBuffer> cb = [[dev newCommandQueue] commandBuffer];
     Method p = cb ? class_getInstanceMethod(object_getClass(cb), @selector(presentDrawable:)) : NULL;
     Method cm = cb ? class_getInstanceMethod(object_getClass(cb), @selector(commit)) : NULL;
-    if (cm && !g_oCBCommit && ![MSConfig()[@"GPUSampler"] isEqual:@NO]) g_oCBCommit = method_setImplementation(cm, (IMP)ms_cbCommit);
+    g_gpuSamplerOn = ![MSConfig()[@"GPUSampler"] isEqual:@NO];
+    if (cm && !g_oCBCommit && (g_gpuSamplerOn || MSCfgD(@"TVMirror", 1) != 0)) g_oCBCommit = method_setImplementation(cm, (IMP)ms_cbCommit);
     Method pm = cb ? class_getInstanceMethod(object_getClass(cb), @selector(presentDrawable:afterMinimumDuration:)) : NULL;
     if (p && pm && !g_oCBPresent) { g_oCBPresent = method_setImplementation(p, (IMP)ms_cbPresent); g_oCBPresentMin = method_setImplementation(pm, (IMP)ms_cbPresentMin); }
     Class D = NSClassFromString(@"CAMetalDrawable"); Method dp = D ? class_getInstanceMethod(D, @selector(present)) : NULL;
     Method dpm = D ? class_getInstanceMethod(D, @selector(presentAfterMinimumDuration:)) : NULL;
     if (dp && dpm && !g_oDrPresent) { g_oDrPresent = method_setImplementation(dp, (IMP)ms_drPresent); g_oDrPresentMin = method_setImplementation(dpm, (IMP)ms_drPresentMin); }
+    MSStartRefreshTicker();
     MSLogf(@"frame pacing hooks: nextDrawable %d, command buffer %@ %d, drawable %d", g_origNextDrawable != NULL, NSStringFromClass(object_getClass(cb)), g_oCBPresent != NULL, g_oDrPresent != NULL);
 }
 static void MSStatusCreate(void) {                    /* main thread, before the game's main() */
@@ -3345,6 +4029,7 @@ static NSString *MSPoolUsage(void) {
 static void MSStartReadProgress(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
+    MSStartPerfLab();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         double t0 = CACurrentMediaTime(), lastCPU = MSCPUSeconds(), lastT = t0, mbps = 0, cpuPct = 0;
         long long b5 = 0, frLast = 0; int quiet = 0; BOOL saved = NO, done = NO; double framesSince = 0, frT = t0, fps = 0;
@@ -3364,6 +4049,8 @@ static void MSStartReadProgress(void) {
                 static int diag = -1; if (diag < 0) diag = [MSConfig()[@"Diagnostics"] boolValue];
                 if (tick % 60 == 29 && fr > 300) { NSString *g = MSGPUSample(); if (g) MSLogf(@"%@", g); }
                 if (tick % 60 == 59 && fr > 60) MSLogf(@"threads (CPU over the last 30 s): %@", MSThreadCPUReport());
+                if (tick % 60 == 59 && fr > 60) { NSString *rs = MSRenderWidthReport(); if (rs) MSLogf(@"%@", rs); }
+                if (tick % 60 == 59 && fr > 60) { NSString *sp = MSSpinReport(30); if (sp) MSLogf(@"%@", sp); }
                 if (g_gcmCount) { static long long lm, lh; static long long lc; MSLogf(@"mouse: %lld motion events, %lld clicks, %lld pointer positions in the last 5 s (%s)", g_gcmMoves - lm, g_gcmClicks - lc, g_gcmHovers - lh, g_pointerLocked ? "gameplay" : "menu"); lm = g_gcmMoves; lh = g_gcmHovers; lc = g_gcmClicks; }
                 if (tick % 120 == 99 && fr > 1500) { NSString *ws = MSSampleWorkers(); if (ws) MSLogf(@"worker samples: %@", ws); }
                 if (diag && tick % 20 == 19) MSLogf(@"pools:%@", MSPoolUsage());

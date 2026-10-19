@@ -53,6 +53,32 @@ private struct LauncherView: View {
     @ObservedObject var model: LauncherModel
     /// swipe-to-look speed, read by the shim when the game starts (MSLookSensitivity)
     @AppStorage("CyPortLookSensitivity") private var lookSensitivity = 1.5
+    /// read by the shim when the game starts (MSLowLatencyOn): 2 drawables + input read once the render thread is ready
+    @AppStorage("CyPortLowLatency") private var lowLatency = false
+    /// read by the shim (MSSmoothOn): hold the game to an even 120/60/40/30 it can keep up with
+    @AppStorage("CyPortSmoothPacing") private var smoothPacing = true
+
+    /// a 300 pt wide boxed row like the Resolution button; the switch keeps its own size so it is never pushed off the edge
+    private func switchRow(_ title: String, icon: String, isOn: Binding<Bool>, note: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Label(title, systemImage: icon)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .lineLimit(1).minimumScaleFactor(0.8)
+                Spacer(minLength: 8)
+                Toggle(title, isOn: isOn).labelsHidden().tint(cyberYellow).fixedSize()
+            }
+            .padding(.horizontal, 14).padding(.vertical, 8)
+            .frame(width: 300)
+            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.15)))
+            Text(note)
+                .font(.caption).foregroundStyle(.white.opacity(0.45))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(width: 300, alignment: .leading)
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -121,6 +147,11 @@ private struct LauncherView: View {
                         .frame(width: 300)
                     }
 
+                    switchRow("Smooth frame pacing", icon: "waveform.path", isOn: $smoothPacing,
+                              note: smoothPacing ? "Even frame times: holds 120, 60, 40 or 30 FPS, whatever the phone keeps up with." : "Off: the game's own frame cap only.")
+                    switchRow("Low-latency input", icon: "bolt.horizontal", isOn: $lowLatency,
+                              note: lowLatency ? "Snappier controls. Costs a few FPS when the GPU is the limit." : "Off: best frame rate.")
+
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Label("Look sensitivity", systemImage: "hand.draw")
@@ -187,8 +218,9 @@ private struct LauncherView: View {
                     .disabled(model.starting || model.syncing)
                     .padding(.top, 4)
                 }
-                .padding(.vertical, 16)
+                .padding(.vertical, 16).padding(.horizontal, 2)
                 }
+                .frame(width: 304)           // never narrower than the 300 pt rows (+ their outline)
             }
             .padding(.horizontal, 24)
         }

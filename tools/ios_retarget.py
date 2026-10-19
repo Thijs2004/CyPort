@@ -45,7 +45,9 @@ REROUTE = {"__NSGetExecutablePath", "_sysctlbyname", "_mmap", "_munmap", "_madvi
            # keyboard input in -> made timeshare at the same priority (RealtimeThreads switch)
            "_pthread_setschedparam", "_pthread_attr_setschedpolicy",
            # spinlock waits: back-to-back yields become short sleeps (less heat/throttling; YieldBackoff switch)
-           "_sched_yield"}
+           "_sched_yield",
+           # job waits: workers / game thread spin briefly before sleeping (wake-ups are slow on a hot iPhone; JobSpin switch)
+           "_dispatch_semaphore_wait", "_os_sync_wait_on_address"}
 DYLIB_CMDS = (LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_LOAD_UPWARD)
 PLATFORM_MACOS, PLATFORM_IOS = 1, 2
 

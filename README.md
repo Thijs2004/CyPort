@@ -116,6 +116,12 @@ while loading. If it is killed with no crash log, the memory limit is still the 
   including the frame rate (VSync / Maximum FPS), are set in the game's own **Settings** menu and are kept between launches.
 - **Performance overlay** – Off / FPS / Detailed (FPS, frame time, CPU, RAM; *Detailed* also turns on Apple's Metal HUD).
   The system Metal HUD (Settings → Developer → Graphics HUD) is independent of this.
+- **Smooth frame pacing** (on by default) – when the phone can't keep up with the game's frame cap, frames alternate between
+  17 and 25 ms and the game feels choppy even at a good FPS. CyPort then holds the highest *even* rate it really keeps up with –
+  120, 60, 40 or 30 FPS, never above the game's own setting – and now and then tries the next step up. The FPS overlay shows
+  `actual/target`.
+- **Low-latency input** (off by default) – the game reads your input only when at most one frame is still on the GPU, so controls
+  react about a frame sooner. Costs a few FPS when the GPU is the limit.
 - **Look sensitivity** – how fast swiping turns the camera (0.25× – 4×).
 - **Cloud saves** – pick the store you play on (**GOG**, **Steam** or **Epic**) and sign in. Every time CyPort opens it brings the
   phone and that store's cloud in step, per save slot: the side that changed since the last sync wins (both changed: the newer one).
@@ -129,7 +135,10 @@ while loading. If it is killed with no crash log, the memory limit is still the 
 - **On-screen gamepad** (Xbox layout): left stick (fixed, or touch anywhere on the left half), **swipe on the right half to look**,
   A / B / X / Y, LB / LT / RB / RT, L3 / R3, d-pad, View / Menu, plus Esc / Space / Enter keys. 🎮 hides/shows the pad.
 - **Menus:** tap = mouse click, drag = scroll, hold then drag = mouse drag (sliders), two-finger tap = right click.
-- **Controllers:** connect an Xbox / DualSense / DualShock 4 / MFi controller – the on-screen pad steps aside.
+- **Controllers:** connect an Xbox / DualSense / DualShock 4 / MFi controller – the on-screen pad steps aside. Other pads
+  (EasySMX, 8BitDo, generic "HID" / MFi) are shown to the game as an Xbox controller, since it only knows those three kinds.
+  A controller that is already connected when the game starts works right away, and a Bluetooth pad that drops out for a
+  second doesn't bring the on-screen pad back.
 - **Keyboard / mouse / trackpad** (iPad, or iPhone with a USB-C/Bluetooth keyboard): work as on a Mac.
 - Game Mode turns on automatically (lower controller latency, priority CPU/GPU).
 - Going to the Home Screen freezes the game (no sound, no CPU use); opening the app again continues, if iOS kept it in memory.
@@ -137,8 +146,9 @@ while loading. If it is killed with no crash log, the memory limit is still the 
 ### Performance tips
 - **Resolution 1434 × 660** on the start screen. Every step up costs GPU time, and GPU heat adds to the CPU's: at 1912 × 880 an
   iPhone 16 Pro Max throttles within about 1.5 minutes of driving.
-- **Maximum FPS 30** in the game's graphics settings. A steady 30 looks smoother than a frame rate that jumps between 25 and 50,
-  and the phone stays cool much longer. 40 works indoors and while the phone is cool.
+- **Frame rate:** the game's *VSync* setting is its frame cap: 30 / 40 / 60 / 120 / Off. On a 120 Hz iPhone CyPort switches the
+  screen to 120 Hz whenever the cap needs it (40, 120, Off – iOS would otherwise stay at 60 Hz and 40 would show as 30). Higher
+  caps make the phone hot faster: **40** is a good choice for the open world, 60–120 for menus and short sessions.
 - Leave **frame generation off** – it adds GPU work and input delay.
 - A clip-on phone cooler helps more than any setting: heat, not raw speed, is what limits the phone.
 
@@ -158,6 +168,10 @@ while loading. If it is killed with no crash log, the memory limit is still the 
 | `StreamingTweaks` = NO | the engine's own open-world streaming limits (12 ms / 300 nodes per frame) instead of CyPort's `user.ini` |
 | `StreamingMsPerFrame` (default 6), `StreamingNodesPerFrame` (default 200) | CyPort's streaming limits |
 | `FrameRate` = 30 / 40 / 60 | CyPort holds this frame rate itself (with even frame pacing) instead of the game's setting |
+| `SmoothPacing` = YES / NO, `LowLatency` = YES / NO | override the start screen's switches |
+| `HighRefresh` = NO / `Uncapped` = NO / `CapMargin` = NO | no 120 Hz request / plain present when uncapped / exact game cap (no 2 ms margin) |
+| `RealPadCategory` = NO | show third-party controllers to the game as what they are (not as Xbox) |
+| `Drawables` = 2, `LowLatencyLockstep` = YES, `PadTiming` = YES | older low-latency methods (cost FPS) / controller delay measurement |
 | `FramePacing` = NO | no frame pacing hooks at all |
 | `Diagnostics` = YES | memory pool / GPU memory statistics in the log every 10 s |
 | `WorkerSampler` = YES | worker-thread profile in the log every ~60 s (pauses the workers briefly – causes a hitch) |
