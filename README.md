@@ -50,8 +50,10 @@ M-series iPads have more RAM and better cooling and should run it as well or bet
 ### To build it
 - A **Mac** with **Xcode 16 or newer** (Xcode 27 tested) and Python 3.
 - **Cyberpunk 2077 for Mac from GOG, version 2.3.1**, downloaded on that Mac (the `Cyberpunk 2077` folder with `Cyberpunk2077.app`, `archive`, `engine`, `r6`).
-  - Steam / Epic / Mac App Store copies: **untested**. The game data is probably the same for the same version, but CyPort's patches
-    target the GOG 2.3.1 executable, the Steam/Epic builds use their own account systems, and the App Store binary is encrypted.
+  - **Steam version 2.5.0** (Mac): launches and plays (tested on an iPhone Duo, game data copied over USB). The mouse gate
+    address is picked per build, and the build check now fails if the game needs an AppKit symbol the shim doesn't provide.
+  - Epic / Mac App Store copies: **untested**. The game data is probably the same for the same version, but CyPort's patches
+    target the GOG 2.3.1 and Steam 2.5.0 executables, the Epic build uses its own account system, and the App Store binary is encrypted.
     A newer game version will need updated patches.
 - An **Apple account to sign it with**:
   - **Paid Apple Developer account** ($99/year) – recommended: gives both *Increased Memory Limit* and *Extended Virtual Address Space*.
