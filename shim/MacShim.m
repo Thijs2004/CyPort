@@ -880,6 +880,29 @@ static void MSTVObserve(void) {
 - (void)windowDidLoad {} - (void)close { [_window close]; }
 @end
 
+/* ---------------------------------------------------------------- AppKit text-window classes (Steam 2.5.0)
+   The Steam build subclasses NSButton/NSScroller (CustomButton, CustomScroller) for a Mac-only scrolling text window,
+   so dyld needs these classes and constants to load the game. Not shown on iOS; unknown messages log and return 0 (MSBase). */
+@interface NSControl : NSView @end
+@implementation NSControl @end
+@interface NSButton : NSControl @end
+@implementation NSButton @end
+@interface NSScroller : NSControl @end
+@implementation NSScroller @end
+@interface NSScrollView : NSView @end
+@implementation NSScrollView @end
+@interface NSTextView : NSView @end
+@implementation NSTextView @end
+@interface NSColor : MSBase @end
+@implementation NSColor @end
+@interface NSFont : MSBase @end
+@implementation NSFont @end
+@interface NSBezierPath : MSBase @end
+@implementation NSBezierPath @end
+NSAttributedStringKey const NSFontAttributeName = @"NSFont";            /* same values as UIKit's/AppKit's */
+NSAttributedStringKey const NSForegroundColorAttributeName = @"NSColor";
+void NSRectFill(CGRect r) { (void)r; }
+
 /* ---------------------------------------------------------------- NSApplication + UIKit app delegate */
 static NSApplication *g_app;
 static BOOL g_uikitUp;                          /* UIApplicationMain is already running (MSBootUIKit) */
