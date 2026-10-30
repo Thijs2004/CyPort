@@ -417,18 +417,29 @@ void MacShimSetPointerLocked(int locked) {
 
 static CGPoint MSToCocoa(CGPoint p, UIView *v) { double k = MSAKScale(); return CGPointMake(p.x * k, (v.bounds.size.height - p.y) * k); }
 
-/* The game's mouse gate: GameView's mouseDown:/mouseMoved:/scrollWheel: drop every event unless a byte in the engine's
- * global input state (0x10853fac0 + 0x39, getter 0x102e2c184) is set. On a Mac it is set once a real mouse is in use;
- * nothing on the phone sets it, so touches never moved the cursor. The shim sets it whenever a touch acts as the mouse. */
-#define MS_MOUSE_GATE 0x10853faf9ULL
+/* The game's mouse gate: GameView's mouseDown:/mouseMoved:/scrollWheel: drop every event unless the engine's
+ * "mouse in use" byte is set (and a settings byte next to it). On a Mac it is set once a real mouse is in use;
+ * nothing on the phone sets it, so touches never moved the cursor. The shim sets it whenever a touch acts as the mouse.
+ * Addresses are per game build: GOG 2.3.1 = byte 0x10853faf9 (getter 0x102e2c184); Steam 2.5.0 = byte 0x109cd3459
+ * (getter 0x103091cf0: ldrb [0x109cd3458] & ldrb [0x109cd3459]; 0x458 comes from the saved settings, 0x459 has its own
+ * setter at 0x103091d68). The 2.5.0 getter's code is checked first, so an unknown build never gets a stray write. */
 static intptr_t MSExeSlide(void) {
     static intptr_t s = -1;
     if (s == -1) for (uint32_t k = 0; k < _dyld_image_count(); k++) if (_dyld_get_image_header(k)->filetype == MH_EXECUTE) { s = _dyld_get_image_vmaddr_slide(k); break; }
     return s;
 }
-static int MSMouseGate(void) { return *(volatile uint8_t *)(MS_MOUSE_GATE + MSExeSlide()); }
+static volatile uint8_t *MSMouseGateByte(void) {
+    static uintptr_t a = 1;
+    if (a == 1) {
+        static const uint32_t steam250[] = { 0xd0036208, 0x39516108, 0xd0036209, 0x39516529, 0x0a090108, 0x12000100, 0xd65f03c0 };
+        a = !memcmp((const void *)(0x103091cf0ULL + MSExeSlide()), steam250, sizeof steam250) ? 0x109cd3459ULL : 0x10853faf9ULL;
+        MSLogf(@"mouse gate byte %#lx (%s)", (unsigned long)a, a == 0x109cd3459ULL ? "Steam 2.5.0" : "GOG 2.3.1 default");
+    }
+    return (volatile uint8_t *)(a + MSExeSlide());
+}
+static int MSMouseGate(void) { return *MSMouseGateByte(); }
 static void MSOpenMouseGate(void) {
-    volatile uint8_t *g = (volatile uint8_t *)(MS_MOUSE_GATE + MSExeSlide());
+    volatile uint8_t *g = MSMouseGateByte();
     if (!*g) { *g = 1; static int n; if (n++ < 5) MSLogf(@"mouse gate opened (touch = mouse)"); }
 }
 static _Atomic long long g_gcmMoves, g_gcmHovers; static _Atomic double g_gcmLastMoveAt;

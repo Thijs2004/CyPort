@@ -76,6 +76,11 @@ for f in "$GAME_APP"/Contents/Frameworks/*.dylib; do
   python3 "$HERE/tools/ios_retarget.py" "$f" "$APP/Frameworks/$(basename "$f")" >/dev/null
 done
 sed "s/__BUNDLE_ID__/$BUNDLE_ID/" "$HERE/app/Info.plist" > "$APP/Info.plist"
+# report the version of the Mac copy it was built from (the store screen matches downloads against it)
+for k in CFBundleShortVersionString CFBundleVersion; do
+  v="$(plutil -extract "$k" raw "$GAME_APP/Contents/Info.plist" 2>/dev/null || true)"
+  [ -n "$v" ] && plutil -replace "$k" -string "$v" "$APP/Info.plist"
+done
 # first-run graphics settings (everything at its lowest); the shim copies it when the game has no UserSettings.json yet
 [ -f "$HERE/app/DefaultUserSettings.json" ] && cp "$HERE/app/DefaultUserSettings.json" "$APP/DefaultUserSettings.json"
 # app icon (legacy CFBundleIconFiles PNGs, see Info.plist)
