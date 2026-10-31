@@ -95,6 +95,7 @@ private struct LauncherView: View {
                         .italic()
                         .foregroundStyle(cyberYellow)
                         .shadow(color: cyberRed.opacity(0.6), radius: 0, x: 3, y: 2)
+                        .lineLimit(1).minimumScaleFactor(0.6)   // narrow screens (iPhone Duo folded): smaller, never wrapped
                     Text("RUNS YOUR OWN COPY OF THE GAME")
                         .font(.system(size: 13, weight: .heavy, design: .monospaced))
                         .tracking(3)

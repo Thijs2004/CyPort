@@ -20,12 +20,14 @@ No emulation, no streaming: the Apple Silicon Mac build runs directly on iOS / i
 | Bluetooth / MFi controllers (Xbox, DualSense, DualShock 4) | ✅ works, on-screen pad hides automatically |
 | Resolution picker up to native (2868 × 1320 on iPhone 16 Pro Max) | ✅ works |
 | AirPlay screen mirroring / USB-C → HDMI to a TV (game on the TV, phone as controller) | ✅ new |
+| iPhone Duo: both screens at their real size (no zoomed 16:9 window), fold / unfold while playing, upright when unfolded | ✅ new |
 | Performance | ⚠️ ~30 FPS in the open world at 1434 × 660 with low settings + MetalFX on an iPhone 16 Pro Max (more indoors); v1.2 keeps the phone cooler for longer, but it still throttles in long sessions – see [Performance tips](#performance-tips) |
 | Cloud saves (GOG, Steam, Epic) – carry on where you left off on your PC/Mac and back | 🧪 new: GOG download tested, sending and Steam/Epic untested |
 | Download the game data in the app (Steam, GOG, Epic account) | 🧪 new: untested with signed-in accounts |
 | Online features (GOG Galaxy achievements, crash upload) | ❌ offline only (stubbed) |
 
-Tested on: **iPhone 16 Pro Max (A18 Pro, 8 GB), iOS 27.0.1**, built with Xcode 27.
+Tested on: **iPhone 16 Pro Max (A18 Pro, 8 GB), iOS 27.0.1**, built with Xcode 27; **iPhone Duo (12 GB), iOS 27.1**, built with Xcode 27.1.
+The build stamps the game with the iOS SDK of the Xcode it's built with: an iPhone Duo only shows apps built with the iOS 27 SDK at its real screen sizes.
 
 ---
 
@@ -137,6 +139,13 @@ while loading. If it is killed with no crash log, the memory limit is still the 
 ### Controls
 - **On-screen gamepad** (Xbox layout): left stick (fixed, or touch anywhere on the left half), **swipe on the right half to look**,
   A / B / X / Y, LB / LT / RB / RT, L3 / R3, d-pad, View / Menu, plus Esc / Space / Enter keys. 🎮 hides/shows the pad.
+  Two thumb clusters sit low on each side (stick with LT · LB · L3 above it; X/Y/B/A with R3 · RB · RT above it), the
+  d-pad and keys along the top; they stay clear of the minimap, quick items, prompts, the camera and the home bar, and
+  are smaller on small screens. Layout: `shim/PadLayout.c`, checked by `tools/test_pad_layout.sh`.
+- **iPhone Duo:** the game fills whichever screen you play on. Folding or unfolding mid-game keeps the game's resolution
+  and scales the picture to the new screen (thin black bars where the shapes differ). Unfolded and held upright, the
+  picture goes to the top and the controller to the space below it. The resolution list on the start screen follows the
+  screen CyPort was opened on.
 - **Menus:** tap = mouse click, drag = scroll, hold then drag = mouse drag (sliders), two-finger tap = right click.
 - **Controllers:** connect an Xbox / DualSense / DualShock 4 / MFi controller – the on-screen pad steps aside. Other pads
   (EasySMX, 8BitDo, generic "HID" / MFi) are shown to the game as an Xbox controller, since it only knows those three kinds.
@@ -179,6 +188,7 @@ while loading. If it is killed with no crash log, the memory limit is still the 
 | `Diagnostics` = YES | memory pool / GPU memory statistics in the log every 10 s |
 | `WorkerSampler` = YES | worker-thread profile in the log every ~60 s (pauses the workers briefly – causes a hitch) |
 | `GPUSampler` = NO, `ConsoleLog` = YES | no GPU busy-time lines / also send the log to the system console |
+| `MemSizeGB` (number) | the RAM size the game is told (it sizes its memory budgets from it). Default on iPhones with more than 8 GB: 8, so the game stays further from iOS's limit; `0` = the real size |
 | `ResMode` (0–7), `AutoPlay`, `AutoKeys` | testing aids |
 
 Logs: *Files → On My iPhone → CyPort → `macshim.log`* (and `game_output.log`, the engine's own output).

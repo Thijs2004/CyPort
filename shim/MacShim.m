@@ -22,6 +22,7 @@
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <sys/sysctl.h>
+#include <sys/utsname.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
@@ -34,6 +35,7 @@
 #include <sys/resource.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include "PadLayout.h"
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
@@ -92,24 +94,70 @@ static void MSMainAsync(dispatch_block_t b) { CFRunLoopPerformBlock(CFRunLoopGet
 /* ---------------------------------------------------------------- screen info (C side uses this) */
 static double g_sw = 1366, g_sh = 1024, g_ss = 2, g_fps = 120;
 static double g_tvAspect;                    /* > 0: a TV was connected at launch, the game gets its shape (TV out) */
-static UIScreen *MSExternalScreen(void) { for (UIScreen *s in UIScreen.screens) if (s != UIScreen.mainScreen) return s; return nil; }
+static BOOL g_sizeLocked;                    /* the game is running: the size it was told never changes (see MSTVRoute) */
+static UIWindowScene *MSAppScene(void);
+/* The screen the app is shown on. On an iPhone Duo UIScreen.mainScreen stays the outer (folded) screen; unfolded, the
+   app's scene is on the inner screen, which UIKit lists as a second screen. */
+static UIScreen *MSPhoneScreen(void) { UIScreen *s = MSAppScene().screen; return s ?: UIScreen.mainScreen; }
+static int MSOnDuoInner(void) { return MSPhoneScreen() != UIScreen.mainScreen; }   /* main thread */
+/* landscape, except a running game on an unfolded iPhone Duo: there the phone may be held upright too (picture at the
+   top, controller below it - shim/PadLayout.c). Otherwise iOS keeps the app sideways and shrinks it into the screen. */
+static UIInterfaceOrientationMask MSAllowedOrientations(void) {
+    return g_sizeLocked && MSOnDuoInner() ? UIInterfaceOrientationMaskAllButUpsideDown : UIInterfaceOrientationMaskLandscape;
+}
+/* main thread: tell UIKit when that changed (game started, folded / unfolded) */
+static void MSOrientationsChanged(void) {
+    static UIInterfaceOrientationMask last; UIInterfaceOrientationMask m = MSAllowedOrientations(); if (m == last) return; last = m;
+    MSLogf(@"orientations: %@", m == UIInterfaceOrientationMaskLandscape ? @"landscape" : @"landscape + upright (iPhone Duo inner screen)");
+    for (UIWindow *w in MSAppScene().windows) [w.rootViewController setNeedsUpdateOfSupportedInterfaceOrientations];
+}
+/* a TV / external display: a screen that is neither the app's screen nor the main screen (an unfolded Duo also lists
+   its outer screen) and not a phone panel */
+static UIScreen *MSExternalScreen(void) {
+    UIScreen *p = MSPhoneScreen();
+    for (UIScreen *s in UIScreen.screens)
+        if (s != p && s != UIScreen.mainScreen && s.traitCollection.userInterfaceIdiom != UIUserInterfaceIdiomPhone) return s;
+    return nil;
+}
+static void MSLogScreens(NSString *why) {        /* main thread; logs only when something changed */
+    static NSString *last; UIScreen *p = MSPhoneScreen();
+    NSMutableArray *a = [NSMutableArray array];
+    for (UIScreen *s in UIScreen.screens)
+        [a addObject:[NSString stringWithFormat:@"%.0fx%.0f@%.0fx idiom %ld%@%@", s.bounds.size.width, s.bounds.size.height, s.nativeScale,
+                      (long)s.traitCollection.userInterfaceIdiom, s == UIScreen.mainScreen ? @" main" : @"", s == p ? @" app" : @""]];
+    NSString *line = [NSString stringWithFormat:@"%@ | game %.0fx%.0f pt%@", [a componentsJoinedByString:@", "], g_sw, g_sh, g_sizeLocked ? @" (fixed)" : @""];
+    if ([line isEqualToString:last]) return; last = line;
+    MSLogf(@"screen (%@): %@", why, line);
+}
 static void MSRefreshScreen(void) {
     MSOnMain(^{
-        UIScreen *s = UIScreen.mainScreen; g_sw = s.bounds.size.width; g_sh = s.bounds.size.height; g_ss = s.nativeScale; g_fps = (double)s.maximumFramesPerSecond;
+        UIScreen *s = MSPhoneScreen(); g_ss = s.nativeScale; g_fps = (double)s.maximumFramesPerSecond;
+        if (!g_sizeLocked) {
+            double w = s.bounds.size.width, h = s.bounds.size.height;
+            g_sw = MAX(w, h); g_sh = MIN(w, h);          /* landscape only */
+        }
         /* decided once, so the size the game was told never changes under it: same height (= same pixel cost) as
            the phone, the TV's width:height. TVOut = NO / TVShape = NO in macshim.plist turn it off. */
         static dispatch_once_t o; dispatch_once(&o, ^{
             UIScreen *x = MSExternalScreen();
             if (x && x.bounds.size.height > 0 && MSCfgD(@"TVOut", 1) != 0 && MSCfgD(@"TVShape", 1) != 0) g_tvAspect = x.bounds.size.width / x.bounds.size.height;
         });
-        if (g_tvAspect > 0) g_sw = round(g_sh * g_tvAspect);
+        if (g_tvAspect > 0 && !g_sizeLocked) g_sw = round(g_sh * g_tvAspect);
+        MSLogScreens(@"refresh");
     });
 }
+/* the game starts: from now on it keeps this size; folding/unfolding scales the picture to fit (MSTVRoute) */
+static void MSLockScreenSize(void) { MSRefreshScreen(); g_sizeLocked = YES; MSOnMain(^{ MSLogScreens(@"game starts"); }); }
 /* the phone's own window scene; with a second screen UIKit adds a scene for it, which must never get the game's
    windows (iOS only sends touches to windows in the app's scene) */
+static UIWindowScene *g_appScene;               /* set by MSSceneDelegate when the app's scene connects */
 static UIWindowScene *MSAppScene(void) {
-    for (UIScene *x in UIApplication.sharedApplication.connectedScenes)
-        if ([x isKindOfClass:UIWindowScene.class] && (((UIWindowScene *)x).screen == UIScreen.mainScreen || [x.session.role isEqualToString:UIWindowSceneSessionRoleApplication])) return (UIWindowScene *)x;
+    if (g_appScene) return g_appScene;
+    NSSet *all = UIApplication.sharedApplication.connectedScenes;
+    for (UIScene *x in all)
+        if ([x isKindOfClass:UIWindowScene.class] && [x.session.role isEqualToString:UIWindowSceneSessionRoleApplication]) return (UIWindowScene *)x;
+    for (UIScene *x in all)
+        if ([x isKindOfClass:UIWindowScene.class] && ((UIWindowScene *)x).screen == UIScreen.mainScreen) return (UIWindowScene *)x;
     return nil;
 }
 void MacShimScreenInfo(double *w, double *h, double *s, double *f) {
@@ -177,9 +225,9 @@ static CGRect MSUIFromAK(CGRect r) { double k = MSAKScale(); return CGRectMake(r
 - (CGFloat)backingScaleFactor { double s; MacShimScreenInfo(0, 0, &s, 0); return [MSConfig()[@"Retina2x"] isEqual:@NO] ? s : 2; }
 - (NSInteger)maximumFramesPerSecond { double f; MacShimScreenInfo(0, 0, 0, &f); return (NSInteger)f; }
 - (CGFloat)maximumExtendedDynamicRangeColorComponentValue {
-    __block CGFloat v = 1; MSOnMain(^{ id n = [UIScreen.mainScreen valueForKey:@"currentEDRHeadroom"]; if ([n respondsToSelector:@selector(doubleValue)]) v = [n doubleValue]; }); return v < 1 ? 1 : v; }
+    __block CGFloat v = 1; MSOnMain(^{ id n = [MSPhoneScreen() valueForKey:@"currentEDRHeadroom"]; if ([n respondsToSelector:@selector(doubleValue)]) v = [n doubleValue]; }); return v < 1 ? 1 : v; }
 - (CGFloat)maximumPotentialExtendedDynamicRangeColorComponentValue {
-    __block CGFloat v = 1; MSOnMain(^{ id n = [UIScreen.mainScreen valueForKey:@"potentialEDRHeadroom"]; if ([n respondsToSelector:@selector(doubleValue)]) v = [n doubleValue]; }); return v < 1 ? 1 : v; }
+    __block CGFloat v = 1; MSOnMain(^{ id n = [MSPhoneScreen() valueForKey:@"potentialEDRHeadroom"]; if ([n respondsToSelector:@selector(doubleValue)]) v = [n doubleValue]; }); return v < 1 ? 1 : v; }
 - (NSString *)localizedName { return @"iPad Display"; }
 - (NSDictionary *)deviceDescription {
     CGRect f = [self frame]; CGFloat s = [self backingScaleFactor];
@@ -392,7 +440,9 @@ static _Atomic int g_gcmCount;                   /* GameController mice connecte
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 - (BOOL)prefersPointerLocked { return g_pointerLocked || g_gcmCount > 0; }   /* a locked pointer is what makes iOS send raw mouse motion */
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return MSAllowedOrientations(); }
+- (void)viewDidLayoutSubviews { [super viewDidLayoutSubviews]; if (g_gameWin) MSMainAsync(^{ MSTVRoute(); }); }
+- (void)viewSafeAreaInsetsDidChange { [super viewSafeAreaInsetsDidChange]; if (g_gameWin) MSMainAsync(^{ MSTVRoute(); }); }
 @end
 void MacShimLogC(const char *what, const char *detail) { MSLogf(@"%s: %s", what, detail); }   /* for MacShimC.c */
 void MacShimSetPointerLocked(int locked) {
@@ -634,7 +684,7 @@ static void MSLeftPress(int by, BOOL down) {
 - (CALayer *)layer { return _layer ?: _host.layer; }
 - (void)setLayer:(CALayer *)l {
     _layer = l; if (!l) return;
-    MSOnMain(^{ l.contentsScale = UIScreen.mainScreen.nativeScale; l.frame = self.host.bounds; [self.host.layer addSublayer:l]; });
+    MSOnMain(^{ l.contentsScale = MSPhoneScreen().nativeScale; l.frame = self.host.bounds; [self.host.layer addSublayer:l]; });
     /* start screen "Performance overlay: Detailed" also turns on Apple's Metal HUD for the game's layer */
     if ([l isKindOfClass:CAMetalLayer.class] && MSPref(@"MacShimOverlay", 1) == 2 && [l respondsToSelector:NSSelectorFromString(@"setDeveloperHUDProperties:")])
         [l setValue:@{ @"mode": @"default" } forKey:@"developerHUDProperties"];
@@ -681,7 +731,7 @@ static void MSLeftPress(int by, BOOL down) {
         /* in the app's window scene: iOS only delivers touches to windows that belong to a scene (one made with
            initWithFrame: is drawn but never gets a touch - touch-as-mouse never reached the game) */
         UIWindowScene *sc = MSAppScene();
-        self->_uiWindow = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+        self->_uiWindow = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:MSPhoneScreen().bounds];
         MSLogf(@"game window created %@", sc ? @"in the app's scene" : @"WITHOUT a scene (no touches)");
         self->_uiWindow.rootViewController = [MSRootVC new]; self->_uiWindow.backgroundColor = UIColor.blackColor;
     });
@@ -769,6 +819,8 @@ static void MSLeftPress(int by, BOOL down) {
  * view keeps its bounds (the size AppKit was told), only a transform scales it, so the engine never sees a resize.
  * TVOut = NO in macshim.plist turns this off. */
 static UIWindow *g_tvWin; static UIView *g_tvPad;
+static CGFloat g_stickR = 60;                    /* on-screen stick radius (PadLayout: smaller on small screens) */
+static double g_stBottomGap = 4;                 /* the FPS overlay's distance from the bottom edge (above a home bar) */
 /* Mirror: every frame the game presents is also copied (one GPU blit, same command queue, right after the game's
    command buffer) into a Metal layer on the phone, so the picture is on both screens. Touches map onto the picture. */
 static BOOL MSMirrorFit(UIView *v, CGRect *r) {
@@ -786,7 +838,7 @@ static BOOL MSMirrorFit(UIView *v, CGRect *r) {
     self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     if (MSCfgD(@"TVMirror", 1) != 0) {
         CAMetalLayer *m = [CAMetalLayer layer]; m.device = MTLCreateSystemDefaultDevice(); m.framebufferOnly = NO; m.opaque = YES;
-        m.contentsGravity = kCAGravityResizeAspect; m.maximumDrawableCount = 3; m.contentsScale = UIScreen.mainScreen.scale; m.frame = self.bounds;
+        m.contentsGravity = kCAGravityResizeAspect; m.maximumDrawableCount = 3; m.contentsScale = MSPhoneScreen().scale; m.frame = self.bounds;
         [self.layer insertSublayer:m atIndex:0]; g_mirrorLayer = m;
     }
     UILabel *l = [UILabel new]; l.numberOfLines = 2; l.textAlignment = NSTextAlignmentCenter; self.note = l;
@@ -806,13 +858,25 @@ static BOOL MSMirrorFit(UIView *v, CGRect *r) {
 - (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e     { [g_hostView msTouches:t phase:2 event:e]; }
 - (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [g_hostView msTouches:t phase:2 event:e]; }
 @end
+/* where the picture goes in a view (shim/PadLayout.c): scaled to fit, centred; upright on an unfolded iPhone Duo at the top,
+   below the camera / status pill, with the controller below it */
+static CGRect MSPictureRect(UIView *into, double w, double h) {
+    UIEdgeInsets in = into.safeAreaInsets; CGSize c = into.bounds.size; UIScreen *sc = into.window.screen;
+    MSPadScreen ps = { c.width, c.height, in.top, in.left, in.bottom, in.right, w, h, sc && sc == MSPhoneScreen() && sc != UIScreen.mainScreen };
+    MSRect r = MSPadPicture(ps); return CGRectMake(r.x, r.y, r.w, r.h);
+}
+static BOOL MSHostFitted(UIView *host, UIView *into) {
+    double w, h; MacShimScreenInfo(&w, &h, 0, 0); CGRect r = MSPictureRect(into, w, h);
+    return host.superview == into && host.autoresizingMask == UIViewAutoresizingNone && fabs(host.center.x - CGRectGetMidX(r)) < 0.5 &&
+           fabs(host.center.y - CGRectGetMidY(r)) < 0.5 && fabs(host.transform.a - r.size.width / w) < 0.001;
+}
 static void MSFitHost(UIView *host, UIView *into) {
     double w, h; MacShimScreenInfo(&w, &h, 0, 0);
     if (host.superview != into) [into insertSubview:host atIndex:0];
     host.autoresizingMask = UIViewAutoresizingNone; host.transform = CGAffineTransformIdentity;
     host.bounds = CGRectMake(0, 0, w, h);
-    CGSize c = into.bounds.size; CGFloat k = MIN(c.width / w, c.height / h); if (!(k > 0)) k = 1;
-    host.center = CGPointMake(c.width / 2, c.height / 2); host.transform = CGAffineTransformMakeScale(k, k);
+    CGRect r = MSPictureRect(into, w, h); CGFloat k = r.size.width / w; if (!(k > 0)) k = 1;
+    host.center = CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)); host.transform = CGAffineTransformMakeScale(k, k);
 }
 static void MSTVRoute(void) {                                     /* main thread */
     NSWindow *gw = g_gameWin; MSHostView *host = gw.contentView.host; UIView *phone = gw.uiWindow.rootViewController.view;
@@ -854,7 +918,16 @@ static void MSTVRoute(void) {                                     /* main thread
         MSFitHost(host, phone);
         g_tvWin.hidden = YES; g_tvWin = nil;
         MSLogf(@"TV out: external display gone, game back on the phone");
+    } else if (g_sizeLocked && !MSHostFitted(host, phone)) {
+        /* the phone's screen changed under the running game (iPhone Duo folded/unfolded, turned upright): same picture,
+           scaled to fit */
+        MSFitHost(host, phone);
+        MSLogf(@"screen: game picture %.0fx%.0f pt fitted to the phone's %.0fx%.0f pt at %.0f,%.0f (scale %.3f)", g_sw, g_sh,
+               phone.bounds.size.width, phone.bounds.size.height, host.frame.origin.x, host.frame.origin.y, host.transform.a);
     }
+    g_stBottomGap = phone.safeAreaInsets.bottom > 0 ? 16 : 4;
+    MSOrientationsChanged();
+    MSLogScreens(@"route");
 }
 static void MSTVObserve(void) {
     static BOOL done; if (done) return; done = YES;
@@ -1069,11 +1142,12 @@ static BOOL MSCalledFromGameMain(void *ret);
 }
 - (void)applicationDidBecomeActive:(UIApplication *)app { MSLogf(@"app became active"); MSRefreshScreen(); if (NSApp) [(NSApplication *)NSApp msBecomeActive:YES]; }
 - (void)applicationWillResignActive:(UIApplication *)app { [(NSApplication *)NSApp msBecomeActive:NO]; }
+- (BOOL)msWaitForScene { return NO; }
 - (void)applicationWillTerminate:(UIApplication *)app {
     id d = [(NSApplication *)NSApp delegate];
     if ([d respondsToSelector:@selector(applicationWillTerminate:)]) ((void (*)(id, SEL, id))objc_msgSend)(d, @selector(applicationWillTerminate:), nil);
 }
-- (UIInterfaceOrientationMask)application:(UIApplication *)a supportedInterfaceOrientationsForWindow:(UIWindow *)w { return UIInterfaceOrientationMaskLandscape; }
+- (UIInterfaceOrientationMask)application:(UIApplication *)a supportedInterfaceOrientationsForWindow:(UIWindow *)w { return MSAllowedOrientations(); }
 @end
 
 /* ---------------------------------------------------------------- keyboard -> NSEvent */
@@ -1417,8 +1491,10 @@ static NSString *MSGB(uint64_t b) { return [NSString stringWithFormat:@"%.1f GB"
 @end
 @interface MSSetupDelegate : UIResponder <UIApplicationDelegate> @property(nonatomic, strong) UIWindow *window; @end
 @implementation MSSetupDelegate
+- (BOOL)msWaitForScene { return YES; }
 - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)o {
-    self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds]; self.window.rootViewController = [MSSetupVC new]; [self.window makeKeyAndVisible]; return YES;
+    if (!MSAppScene()) return YES;                    /* MSSceneDelegate calls this again once the scene is there */
+    self.window = [[UIWindow alloc] initWithWindowScene:MSAppScene()]; self.window.rootViewController = [MSSetupVC new]; [self.window makeKeyAndVisible]; return YES;
 }
 @end
 static void MSRunSetup(void) {                  /* replaces the game's startup; the user reopens the app afterwards */
@@ -1839,13 +1915,13 @@ static void MSSyncStartScreenFrom(NSDictionary *v) {
 @implementation MSRestartVC
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return MSAllowedOrientations(); }
 @end
 static UIWindow *g_restartWin;
 static void MSShowRestartPopup(NSArray *changed) {
     if (g_restartWin) return;                                    /* already showing */
     UIWindowScene *sc = MSAppScene();
-    g_restartWin = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    g_restartWin = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:MSPhoneScreen().bounds];
     g_restartWin.windowLevel = UIWindowLevelAlert + 20; g_restartWin.backgroundColor = UIColor.clearColor;
     g_restartWin.rootViewController = [MSRestartVC new]; g_restartWin.rootViewController.view.backgroundColor = UIColor.clearColor;
     g_restartWin.hidden = NO;
@@ -1918,11 +1994,13 @@ static void MSWatchGameSettings(void) {
 }
 @interface MSBootDelegate : MSUIDelegate @end
 @implementation MSBootDelegate
+- (BOOL)msWaitForScene { return YES; }
 - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opts {
+    if (!MSAppScene()) { MSLogf(@"UIKit launched before the game (boot); start screen waits for the app's scene"); return YES; }
     MSLogf(@"UIKit launched before the game (boot)");
     [NSNotificationCenter.defaultCenter addObserverForName:UIScreenDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification *x) {
         [NSNotificationCenter.defaultCenter postNotificationName:NSApplicationDidChangeScreenParametersNotification object:NSApp]; }];
-    self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    self.window = [[UIWindow alloc] initWithWindowScene:MSAppScene()];
     MSLauncherVC *lv = nil;
     __block void (^playAction)(void) = nil;            /* set below, once `go` exists */
     /* the SwiftUI start screen (Launcher.swift); the UIKit one stays as a fallback */
@@ -1950,6 +2028,7 @@ static void MSWatchGameSettings(void) {
        every dispatch to the main queue would be stuck for the whole game. */
     void (^start)(void) = ^{
         MSLogf(@"launch finished; starting the game's main()");
+        MSLockScreenSize();
         /* iOS gives the main thread a 1 MB stack, macOS 8 MB, and the game runs its whole loop on the main thread.
            Run it on a big stack of its own (still the main thread) with a no-access guard below. */
         double mb = MSCfgD(@"MainStackMB", 64); int r;
@@ -1979,6 +2058,35 @@ static void MSWatchGameSettings(void) {
     return YES;
 }
 @end
+/* Scene life cycle (UIApplicationSceneManifest in Info.plist). iOS 27 only starts an app built with the iOS 27 SDK if it
+ * uses scenes, and only that SDK gets an iPhone Duo's real screen sizes instead of a zoomed 16:9 window. The app
+ * delegates build their UI once the app's scene has connected (so the start screen knows which screen it is on), and
+ * the scene's active / resign callbacks go on to the app delegate, which UIKit no longer calls itself. */
+@interface MSSceneDelegate : UIResponder <UIWindowSceneDelegate> @property(nonatomic, strong) UIWindow *window; @end
+@implementation MSSceneDelegate
+static BOOL MSIsAppScene(UIScene *s) { return [s isKindOfClass:UIWindowScene.class] && [s.session.role isEqualToString:UIWindowSceneSessionRoleApplication]; }
+- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)o {
+    if (!MSIsAppScene(scene)) return;                 /* a TV's scene: MSTVRoute puts a window on it */
+    UIWindowScene *ws = (UIWindowScene *)scene; g_appScene = ws;
+    UIApplication *app = UIApplication.sharedApplication; id d = app.delegate;
+    MSLogf(@"app scene connected (%.0fx%.0f pt)", ws.coordinateSpace.bounds.size.width, ws.coordinateSpace.bounds.size.height);
+    MSRefreshScreen();
+    UIWindow *w = [d respondsToSelector:@selector(window)] ? [d window] : nil;
+    if (!w && [d respondsToSelector:@selector(msWaitForScene)] && [d msWaitForScene])
+        [d application:app didFinishLaunchingWithOptions:@{}];      /* builds the UI now, in this scene */
+    w = [d respondsToSelector:@selector(window)] ? [d window] : nil;
+    if (w) { if (w.windowScene != ws) w.windowScene = ws; self.window = w; [w makeKeyAndVisible]; }
+}
+- (void)sceneDidDisconnect:(UIScene *)s { if (s == g_appScene) g_appScene = nil; }
+- (void)sceneDidBecomeActive:(UIScene *)s {
+    id d = UIApplication.sharedApplication.delegate;
+    if (MSIsAppScene(s) && [d respondsToSelector:@selector(applicationDidBecomeActive:)]) [d applicationDidBecomeActive:UIApplication.sharedApplication];
+}
+- (void)sceneWillResignActive:(UIScene *)s {
+    id d = UIApplication.sharedApplication.delegate;
+    if (MSIsAppScene(s) && [d respondsToSelector:@selector(applicationWillResignActive:)]) [d applicationWillResignActive:UIApplication.sharedApplication];
+}
+@end
 static void MSBootUIKit(void) {
     g_uikitUp = YES; MSLogf(@"game main() reached sharedApplication; booting UIKit first");
     if (!MSDataRoot()) MSRunSetup();            /* no game folder: folder picker instead of the game (never returns) */
@@ -2001,13 +2109,26 @@ int ms_NSGetExecutablePath(char *buf, uint32_t *size) {
     return 0;
 }
 
+/* MemSizeGB: the RAM size the engine is told (hw.memsize, NSProcessInfo.physicalMemory); it sizes its memory budgets
+   from it. Default on iPhones with more than 8 GB: 8, as on an 8 GB iPhone. Told 12 GB (iPhone Duo) the game grew to
+   ~7.8 GB in the open world and iOS ended it when memory got tight, e.g. right after unfolding the Duo; told 8 it stays
+   at ~6.1 GB. MemSizeGB = 0 in macshim.plist: the real size. */
+static double g_realMemGB;
+static double MSMemSizeGB(void) {
+    static double gb = -1; if (gb >= 0) return gb;
+    if (g_realMemGB <= 0) g_realMemGB = NSProcessInfo.processInfo.physicalMemory / 1073741824.0;   /* before the swizzle */
+    id v = MSConfig()[@"MemSizeGB"];
+    if (v) gb = MAX([v doubleValue], 0);
+    else { struct utsname u; gb = (g_realMemGB > 9 && uname(&u) == 0 && !strncmp(u.machine, "iPhone", 6)) ? 8 : 0; }
+    return gb;
+}
 int ms_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) __asm("_sysctlbyname");
 int ms_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     NSDictionary *c = MSConfig(); const char *fake = NULL;
     if (!strcmp(name, "machdep.cpu.brand_string")) fake = [(c[@"CPUBrand"] ?: @"Apple M4") UTF8String];
     else if (!strcmp(name, "hw.model"))            fake = [(c[@"Model"] ?: @"Mac16,1") UTF8String];
     else if (!strcmp(name, "kern.osproductversion")) fake = [(c[@"OSVersion"] ?: @"15.5") UTF8String];
-    double memGB = [c[@"MemSizeGB"] doubleValue];             /* MemSizeGB: what hw.memsize reports (engine memory budgets) */
+    double memGB = MSMemSizeGB();                              /* what hw.memsize reports (engine memory budgets) */
     if (memGB > 0 && !newp && oldp && oldlenp && *oldlenp >= sizeof(uint64_t) && !strcmp(name, "hw.memsize")) {
         uint64_t v = (uint64_t)(memGB * 1073741824.0); memcpy(oldp, &v, sizeof v); *oldlenp = sizeof v;
         static int said; if (!said++) MSLogf(@"sysctl hw.memsize -> %.0f GB (MemSizeGB)", memGB);
@@ -3229,7 +3350,7 @@ static void MSLowLatencyWait(void) {                  /* main thread, start of e
 }
 static UIWindow *g_statusWin; static CGFloat g_stPad; static CALayer *g_stRoot, *g_stBg, *g_stTrack, *g_stFill; static CATextLayer *g_stTitle, *g_stHead, *g_stLog;
 static CATextLayer *MSTextLayer(CGFloat size, BOOL mono, UIColor *color) {
-    CATextLayer *t = [CATextLayer layer]; t.contentsScale = UIScreen.mainScreen.scale; t.foregroundColor = color.CGColor;
+    CATextLayer *t = [CATextLayer layer]; t.contentsScale = MSPhoneScreen().scale; t.foregroundColor = color.CGColor;
     UIFont *f = mono ? [UIFont monospacedSystemFontOfSize:size weight:UIFontWeightRegular] : [UIFont systemFontOfSize:size weight:UIFontWeightSemibold];
     t.font = (__bridge CFTypeRef)f; t.fontSize = size; t.truncationMode = kCATruncationEnd; t.wrapped = NO; return t;
 }
@@ -3429,7 +3550,7 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
 
 @interface MSPadView : UIView @end
 @implementation MSPadView {
-    NSMutableArray<MSCtl *> *_ctls; BOOL _hiddenByUser, _shown; CADisplayLink *_link; CGSize _laidOut;
+    NSMutableArray<MSCtl *> *_ctls; BOOL _hiddenByUser, _shown; CADisplayLink *_link;
     UITouch *_moveTouch, *_lookTouch; CGPoint _moveOrigin, _lookLast; CGVector _lookAccum; double _lookT, _lookMoved; float _lookX, _lookY;
     CAShapeLayer *_stickBase, *_stickKnob; float _lookSpeed;
     CGPoint _lHome, _rHome; UITouch *_rTouch; CAShapeLayer *_rBase, *_rKnob; int _wasd;
@@ -3458,7 +3579,7 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
     MSCtl *t = [MSCtl new]; t.kind = MSCtlToggle; t.label = @"🎮"; [_ctls addObject:t];
     for (MSCtl *c in _ctls) {
         c.shape = [CAShapeLayer layer]; c.shape.lineWidth = 1.5; [self.layer addSublayer:c.shape];
-        c.text = [CATextLayer layer]; c.text.contentsScale = UIScreen.mainScreen.scale; c.text.alignmentMode = kCAAlignmentCenter;
+        c.text = [CATextLayer layer]; c.text.contentsScale = MSPhoneScreen().scale; c.text.alignmentMode = kCAAlignmentCenter;
         c.text.foregroundColor = [UIColor colorWithWhite:1 alpha:0.85].CGColor; c.text.font = (__bridge CFTypeRef)[UIFont systemFontOfSize:14 weight:UIFontWeightBold];
         [self.layer addSublayer:c.text];
     }
@@ -3475,18 +3596,31 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
     return self;
 }
 - (void)msLayout {
-    CGSize S = self.bounds.size; if (CGSizeEqualToSize(S, _laidOut)) return; _laidOut = S;
-    UIEdgeInsets in = self.safeAreaInsets; CGFloat L = MAX(in.left, 16), R = S.width - MAX(in.right, 16), H = S.height - MAX(in.bottom, 8), T = MAX(in.top, 8);
-    NSDictionary *pos = @{
-        @"A": @[ @(R - 85), @(H - 40), @27 ],  @"B": @[ @(R - 35), @(H - 90), @27 ],  @"X": @[ @(R - 135), @(H - 90), @27 ], @"Y": @[ @(R - 85), @(H - 140), @27 ],
-        @"RT": @[ @(R - 40), @(T + 40), @30 ], @"RB": @[ @(R - 115), @(T + 34), @24 ],
-        @"LT": @[ @(L + 40), @(T + 40), @30 ], @"LB": @[ @(L + 115), @(T + 34), @24 ],
-        @"L3": @[ @(L + 24), @(H - 24), @20 ], @"R3": @[ @(R - 170), @(H - 22), @20 ],
-        @"▲": @[ @(L + 190), @(T + 22), @16 ], @"▼": @[ @(L + 190), @(T + 86), @16 ], @"◀": @[ @(L + 158), @(T + 54), @16 ], @"▶": @[ @(L + 222), @(T + 54), @16 ],
-        @"⧉": @[ @(S.width / 2 - 55), @(T + 20), @17 ], @"≡": @[ @(S.width / 2 + 55), @(T + 20), @17 ], @"🎮": @[ @(S.width / 2), @(T + 20), @17 ],
-        @"Esc": @[ @(S.width / 2 - 120), @(T + 20), @19 ], @"Space": @[ @(S.width / 2 + 120), @(T + 20), @21 ], @"Enter": @[ @(S.width / 2 + 175), @(T + 20), @21 ],
-    };
-    _lHome = CGPointMake(L + 115, H - 105); _rHome = CGPointMake(-1000, -1000);   /* no right stick: swipe on the right half to look */
+    /* shim/PadLayout.c places everything (screen shape, safe area, the game's picture and HUD, iPhone Duo status pill);
+       laid out again whenever one of those changes */
+    CGSize S = self.bounds.size; UIEdgeInsets in = self.safeAreaInsets; double gw, gh; MacShimScreenInfo(&gw, &gh, 0, 0);
+    MSPadScreen sc = { S.width, S.height, in.top, in.left, in.bottom, in.right, gw, gh, MSOnDuoInner() };
+    /* the iPhone Duo's outer screen: iOS keeps an 84 pt strip free along the whole side with the camera, but the camera
+       only takes that side's corner (measured: top-left, or bottom-right held the other way round) - the controls may
+       use the rest of the strip */
+    static int duo = -1; if (duo < 0) { struct utsname u; duo = uname(&u) == 0 && !strcmp(u.machine, "iPhone19,4"); }
+    if (duo && !sc.duoInner && S.width > S.height) {
+        if (in.left > 0)  { sc.left = 0;  sc.cutX0 = 0; sc.cutY0 = 0; sc.cutX1 = 95; sc.cutY1 = 72; }
+        else if (in.right > 0) { sc.right = 0; sc.cutX0 = S.width - 95; sc.cutY0 = S.height - 72; sc.cutX1 = S.width; sc.cutY1 = S.height; }
+    }
+    static MSPadScreen last; if (!memcmp(&sc, &last, sizeof sc)) return; last = sc;
+    MSPadPos pp[MS_PAD_COUNT]; MSPadLayout(sc, pp);
+    static NSDictionary *ids; static dispatch_once_t o; dispatch_once(&o, ^{ ids = @{
+        @"A": @(MS_PAD_A), @"B": @(MS_PAD_B), @"X": @(MS_PAD_X), @"Y": @(MS_PAD_Y), @"LB": @(MS_PAD_LB), @"LT": @(MS_PAD_LT),
+        @"RB": @(MS_PAD_RB), @"RT": @(MS_PAD_RT), @"L3": @(MS_PAD_L3), @"R3": @(MS_PAD_R3),
+        @"▲": @(MS_PAD_UP), @"▼": @(MS_PAD_DOWN), @"◀": @(MS_PAD_LEFT), @"▶": @(MS_PAD_RIGHT),
+        @"⧉": @(MS_PAD_VIEW), @"≡": @(MS_PAD_MENU), @"🎮": @(MS_PAD_TOGGLE), @"Esc": @(MS_PAD_ESC), @"Space": @(MS_PAD_SPACE), @"Enter": @(MS_PAD_ENTER) }; });
+    NSMutableDictionary *pos = [NSMutableDictionary dictionary];
+    for (NSString *k in ids) { MSPadPos q = pp[[ids[k] intValue]]; pos[k] = @[ @(q.x), @(q.y), @(q.r) ]; }
+    MSLogf(@"touch controls laid out for %.0fx%.0f pt (safe area T%.0f L%.0f B%.0f R%.0f%@)", S.width, S.height, in.top, in.left, in.bottom, in.right,
+           sc.duoInner ? @", iPhone Duo inner screen" : @"");
+    g_stickR = pp[MS_PAD_STICK].r > 0 ? pp[MS_PAD_STICK].r : 60;
+    _lHome = CGPointMake(pp[MS_PAD_STICK].x, pp[MS_PAD_STICK].y); _rHome = CGPointMake(-1000, -1000);   /* no right stick: swipe on the right half to look */
     [CATransaction begin]; [CATransaction setDisableActions:YES];
     for (MSCtl *c in _ctls) {
         NSArray *p = pos[c.label]; c.center = CGPointMake([p[0] doubleValue], [p[1] doubleValue]); c.r = [p[2] doubleValue];
@@ -3494,13 +3628,13 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
         CGFloat fs = c.label.length > 2 ? 9 : c.r < 20 ? 11 : 14; c.text.fontSize = fs; c.text.frame = CGRectMake(c.center.x - c.r, c.center.y - fs * 0.62, 2 * c.r, fs * 1.3);
         c.text.string = c.label; [self msPaint:c];
     }
-    [self msDrawStick:_stickBase knob:_stickKnob at:_lHome offset:CGPointZero r:60];
+    [self msDrawStick:_stickBase knob:_stickKnob at:_lHome offset:CGPointZero r:g_stickR];
     _rBase.hidden = _rKnob.hidden = YES;
     [CATransaction commit];
 }
 - (void)msDrawStick:(CAShapeLayer *)b knob:(CAShapeLayer *)k at:(CGPoint)p offset:(CGPoint)o r:(CGFloat)r {
     b.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(p.x - r, p.y - r, 2 * r, 2 * r)].CGPath;
-    k.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(p.x + o.x - 24, p.y + o.y - 24, 48, 48)].CGPath;
+    CGFloat kr = r * 0.4; k.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(p.x + o.x - kr, p.y + o.y - kr, 2 * kr, 2 * kr)].CGPath;
     b.hidden = k.hidden = _hiddenByUser;
 }
 - (BOOL)msNear:(CGPoint)p to:(CGPoint)c r:(CGFloat)r { CGFloat dx = p.x - c.x, dy = p.y - c.y; return dx * dx + dy * dy <= r * r; }
@@ -3552,7 +3686,7 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
             _moveTouch = t; _moveOrigin = [self msNear:p to:_lHome r:85] ? _lHome : p;   /* on the stick: centred; elsewhere: it follows the thumb */
             _stickT0 = t.timestamp; _stickP0 = p; _stickMax = 0;
             [CATransaction begin]; [CATransaction setDisableActions:YES];
-            [self msDrawStick:_stickBase knob:_stickKnob at:_moveOrigin offset:CGPointZero r:60];
+            [self msDrawStick:_stickBase knob:_stickKnob at:_moveOrigin offset:CGPointZero r:g_stickR];
             [CATransaction commit];
             [self msLeftStick:p];
         } else if (!_lookTouch) { _lookTouch = t; _lookLast = p; _lookT = t.timestamp; _lookX = _lookY = 0; }
@@ -3590,11 +3724,11 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
     _wasd = want;
 }
 - (void)msLeftStick:(CGPoint)p {
-    CGFloat dx = p.x - _moveOrigin.x, dy = p.y - _moveOrigin.y, len = hypot(dx, dy), k = len > 60 ? 60 / len : 1;
-    MSPadSetStick(g_pad.leftThumbstick, dx * k / 60, -dy * k / 60);
-    if (!g_pad) { float x = dx * k / 60, y = -dy * k / 60; [self msWASD:(y > 0.4) | (x < -0.4) << 1 | (y < -0.4) << 2 | (x > 0.4) << 3]; }
+    CGFloat R = g_stickR, dx = p.x - _moveOrigin.x, dy = p.y - _moveOrigin.y, len = hypot(dx, dy), k = len > R ? R / len : 1;
+    MSPadSetStick(g_pad.leftThumbstick, dx * k / R, -dy * k / R);
+    if (!g_pad) { float x = dx * k / R, y = -dy * k / R; [self msWASD:(y > 0.4) | (x < -0.4) << 1 | (y < -0.4) << 2 | (x > 0.4) << 3]; }
     [CATransaction begin]; [CATransaction setDisableActions:YES];
-    [self msDrawStick:_stickBase knob:_stickKnob at:_moveOrigin offset:CGPointMake(dx * k, dy * k) r:60];
+    [self msDrawStick:_stickBase knob:_stickKnob at:_moveOrigin offset:CGPointMake(dx * k, dy * k) r:g_stickR];
     [CATransaction commit];
 }
 - (void)msRightStick:(CGPoint)p {
@@ -3614,7 +3748,7 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
         if (t == _moveTouch) {
             _moveTouch = nil; MSPadSetStick(g_pad.leftThumbstick, 0, 0); [self msWASD:0];
             [CATransaction begin]; [CATransaction setDisableActions:YES];
-            [self msDrawStick:_stickBase knob:_stickKnob at:_lHome offset:CGPointZero r:60];
+            [self msDrawStick:_stickBase knob:_stickKnob at:_lHome offset:CGPointZero r:g_stickR];
             [CATransaction commit];
         } else if (t == _rTouch) {
             _rTouch = nil; MSPadSetStick(g_pad.rightThumbstick, 0, 0);
@@ -3649,7 +3783,7 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return MSAllowedOrientations(); }
 @end
 static UIWindow *g_padWin;
 /* test aid: AutoKeys = "20:a,40:down,60:tap@650/360,70:scroll@500/250/-400,80:rsdown" runs after the first frames
@@ -3726,7 +3860,7 @@ static void MSTouchPadCreate(UIWindowScene *sc) {                 /* main thread
         Method cur = class_getClassMethod(GCController.class, @selector(current));
         if (cur) g_origCurrent = method_setImplementation(cur, (IMP)ms_current);
     }
-    g_padWin = sc ? [[MSPadWindow alloc] initWithWindowScene:sc] : [[MSPadWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    g_padWin = sc ? [[MSPadWindow alloc] initWithWindowScene:sc] : [[MSPadWindow alloc] initWithFrame:MSPhoneScreen().bounds];
     g_padWin.windowLevel = UIWindowLevelNormal + 1; g_padWin.backgroundColor = UIColor.clearColor;
     g_padWin.rootViewController = [MSPadVC new]; g_padWin.rootViewController.view.backgroundColor = UIColor.clearColor;
     MSPadView *pv = [[MSPadView alloc] initWithFrame:g_padWin.rootViewController.view.bounds];
@@ -3869,11 +4003,12 @@ static NSString *MSGPUSample(void) {                    /* progress thread: bloc
 }
 @end
 static void MSStartRefreshTicker(void) {
-    if ([MSConfig()[@"HighRefresh"] isEqual:@NO] || UIScreen.mainScreen.maximumFramesPerSecond <= 60) return;
+    double mxf; MacShimScreenInfo(0, 0, 0, &mxf);
+    if ([MSConfig()[@"HighRefresh"] isEqual:@NO] || mxf <= 60) return;
     NSThread *th = [[NSThread alloc] initWithBlock:^{
         MSRefreshTicker *k = [MSRefreshTicker new];
         CADisplayLink *l = [CADisplayLink displayLinkWithTarget:k selector:@selector(tick:)];
-        NSInteger mx = UIScreen.mainScreen.maximumFramesPerSecond;
+        NSInteger mx = (NSInteger)mxf;
         l.preferredFrameRateRange = CAFrameRateRangeMake(80, mx, mx); l.paused = YES;
         [l addToRunLoop:NSRunLoop.currentRunLoop forMode:NSRunLoopCommonModes];
         [NSRunLoop.currentRunLoop addTimer:[NSTimer timerWithTimeInterval:0.5 target:k selector:@selector(check:) userInfo:l repeats:YES] forMode:NSRunLoopCommonModes];
@@ -3937,7 +4072,7 @@ static void ms_drPresentMin(id self, SEL c, CFTimeInterval t) {
    is all the screen can show anyway. Uncapped = NO keeps the plain present. */
 static CFTimeInterval MSUncappedDur(void) {
     static double dur = -1;
-    if (dur < 0) { NSInteger mx = UIScreen.mainScreen.maximumFramesPerSecond; dur = MSCfgD(@"Uncapped", 1) != 0 && mx > 60 && ![MSConfig()[@"HighRefresh"] isEqual:@NO] ? 1.0 / mx : 0; }
+    if (dur < 0) { double f; MacShimScreenInfo(0, 0, 0, &f); NSInteger mx = (NSInteger)f; dur = MSCfgD(@"Uncapped", 1) != 0 && mx > 60 && ![MSConfig()[@"HighRefresh"] isEqual:@NO] ? 1.0 / mx : 0; }
     return dur;
 }
 static void ms_cbPresent(id self, SEL c, id d) {                /* -[MTLCommandBuffer presentDrawable:] */
@@ -3980,7 +4115,7 @@ static void MSStatusCreate(void) {                    /* main thread, before the
     if ([MSConfig()[@"ShowStatus"] isEqual:@NO]) return;
     UIWindowScene *sc = MSAppScene();
     if (!sc) for (UIWindow *w in UIApplication.sharedApplication.windows) if (w.windowScene) { sc = w.windowScene; break; }
-    g_statusWin = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    g_statusWin = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:MSPhoneScreen().bounds];
     g_statusWin.windowLevel = UIWindowLevelAlert + 5; g_statusWin.userInteractionEnabled = NO;
     g_statusWin.backgroundColor = UIColor.clearColor; g_statusWin.rootViewController = [UIViewController new];
     g_statusWin.rootViewController.view.backgroundColor = UIColor.clearColor;
@@ -4127,7 +4262,7 @@ static void MSStartReadProgress(void) {
                 CGFloat pw = ov == 2 ? 400 : 210;
                 [CATransaction begin]; [CATransaction setDisableActions:YES];
                 CGRect R = g_stRoot.bounds;
-                g_stBg.frame = CGRectMake(R.size.width / 2 - pw / 2, R.size.height - 24, pw, 20); g_stBg.cornerRadius = 10;
+                g_stBg.frame = CGRectMake(R.size.width / 2 - pw / 2, R.size.height - 20 - g_stBottomGap, pw, 20); g_stBg.cornerRadius = 10;
                 g_stBg.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45].CGColor;
                 g_stTitle.hidden = g_stLog.hidden = g_stTrack.hidden = YES;
                 g_stHead.frame = CGRectMake(10, 2, pw - 20, 16); g_stHead.alignmentMode = kCAAlignmentCenter; g_stHead.fontSize = 11; g_stHead.string = f;
@@ -4285,7 +4420,8 @@ static void MSOpenLog(void) {
     for (size_t i = 0; i < sizeof sigs / sizeof *sigs; i++) {
         struct sigaction sa = { 0 }; sa.sa_sigaction = MSSigInfo; sa.sa_flags = SA_SIGINFO | SA_ONSTACK; sigemptyset(&sa.sa_mask); sigaction(sigs[i], &sa, NULL);
     }
-    MSLogf(@"---- launch: %@ iOS %@ (%@), %.0f MB RAM", UIDevice.currentDevice.model, UIDevice.currentDevice.systemVersion, @"MacShim", NSProcessInfo.processInfo.physicalMemory / 1048576.0);
+    MSMemSizeGB();                                  /* reads the real RAM size (before NSProcessInfo is told MemSizeGB) */
+    MSLogf(@"---- launch: %@ iOS %@ (%@), %.0f MB RAM", UIDevice.currentDevice.model, UIDevice.currentDevice.systemVersion, @"MacShim", g_realMemGB * 1024);
 }
 
 
@@ -4771,9 +4907,9 @@ int ms_BinkStartAsyncThread(int thread, const void *param) {
     int r = real(thread, param); MSLogf(@"Bink async thread %d -> %d", thread, r); return r;
 }
 
-static unsigned long long ms_physMem(id self, SEL _cmd) { return (unsigned long long)([MSConfig()[@"MemSizeGB"] doubleValue] * 1073741824.0); }
+static unsigned long long ms_physMem(id self, SEL _cmd) { return (unsigned long long)(MSMemSizeGB() * 1073741824.0); }
 __attribute__((constructor)) static void MSInstallMemSize(void) {
-    if ([MSConfig()[@"MemSizeGB"] doubleValue] <= 0) return;
+    if (MSMemSizeGB() <= 0) return;
     method_setImplementation(class_getInstanceMethod(NSProcessInfo.class, @selector(physicalMemory)), (IMP)ms_physMem);
 }
 /* frame decoding: NoBinkDecode = YES skips it (frames stay as they are) - test for Bink writing past its buffers */

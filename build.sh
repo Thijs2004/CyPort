@@ -60,7 +60,7 @@ clang $LDFLAG -target arm64-apple-ios16.0 -isysroot "$SDK" -dynamiclib -fobjc-ar
   -framework Foundation -framework UIKit -framework GameController -framework QuartzCore \
   -framework Security -framework CoreGraphics -framework CoreFoundation -framework Metal -framework UniformTypeIdentifiers -framework WebKit -lz \
   -Wl,-reexport_framework,Foundation -Wl,-reexport_framework,CoreGraphics -Wl,-reexport_framework,Security -Wl,-reexport_framework,Metal \
-  "$HERE/shim/MacShim.m" "$HERE/shim/MacShimC.c" "$HERE/shim/StoreCodecs.c" "$HERE/shim/third_party/lzma/LzmaDec.c" $SWIFT_OBJ \
+  "$HERE/shim/MacShim.m" "$HERE/shim/MacShimC.c" "$HERE/shim/PadLayout.c" "$HERE/shim/StoreCodecs.c" "$HERE/shim/third_party/lzma/LzmaDec.c" $SWIFT_OBJ \
   -o "$APP/Frameworks/libMacShim.dylib"
 rm -f "$APP/Frameworks/Launcher.o"
 
@@ -69,13 +69,32 @@ else
   cp "$HERE/prebuilt/libMacShim.dylib" "$APP/Frameworks/libMacShim.dylib"
 fi
 rm -rf "$APP"/Frameworks/*.dSYM
-echo "==> 2/4 retarget game binary + libraries (macOS -> iOS load commands only)"
-python3 "$HERE/tools/ios_retarget.py" "$GAME_APP/Contents/MacOS/Cyberpunk2077" "$APP/Cyberpunk2077" >/dev/null
+# The iOS SDK version stamped into the game: iOS shows an app at a newer iPhone's real screen size only when the app says
+# it was built with an SDK that knows that iPhone. Stamped "18.0", an iPhone Duo runs CyPort in a zoomed 16:9 window
+# (an iPhone 8-sized screen). So stamp the SDK of the Xcode on this Mac (IOS_SDK_VERSION=x.y overrides; 18.0 without Xcode).
+SDK_VER="${IOS_SDK_VERSION:-}"; SDK_NAME=""; SDK_BUILD=""
+SDK_DIR="${SDK:-$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || true)}"
+if [ -z "$SDK_VER" ] && [ -n "$SDK_DIR" ] && [ -f "$SDK_DIR/SDKSettings.plist" ]; then
+  SDK_VER="$(plutil -extract Version raw "$SDK_DIR/SDKSettings.plist" 2>/dev/null || true)"
+  SDK_NAME="$(plutil -extract CanonicalName raw "$SDK_DIR/SDKSettings.plist" 2>/dev/null || true)"
+  SDK_BUILD="$(xcrun --sdk iphoneos --show-sdk-build-version 2>/dev/null || true)"
+fi
+case "$SDK_VER" in [0-9]*.[0-9]*) ;; [0-9]*) SDK_VER="$SDK_VER.0" ;; *) SDK_VER="18.0" ;; esac
+if [ "${SDK_VER%%.*}" -lt 18 ]; then SDK_VER="18.0"; fi
+echo "==> 2/4 retarget game binary + libraries (macOS -> iOS load commands only, iOS SDK $SDK_VER)"
+python3 "$HERE/tools/ios_retarget.py" --sdk "$SDK_VER" "$GAME_APP/Contents/MacOS/Cyberpunk2077" "$APP/Cyberpunk2077" >/dev/null
 chmod +x "$APP/Cyberpunk2077"
 for f in "$GAME_APP"/Contents/Frameworks/*.dylib; do
+  # the libraries keep SDK 18.0: stamped newer, dyld checks them more strictly and refuses libBink2MacArm64.dylib
+  # ("mis-aligned LINKEDIT string pool"); only the main executable's SDK decides the screen size
   python3 "$HERE/tools/ios_retarget.py" "$f" "$APP/Frameworks/$(basename "$f")" >/dev/null
 done
 sed "s/__BUNDLE_ID__/$BUNDLE_ID/" "$HERE/app/Info.plist" > "$APP/Info.plist"
+# the same SDK in the Info.plist keys Xcode writes (iOS reads both)
+plutil -replace DTPlatformName -string iphoneos "$APP/Info.plist"
+plutil -replace DTPlatformVersion -string "$SDK_VER" "$APP/Info.plist"
+plutil -replace DTSDKName -string "${SDK_NAME:-iphoneos$SDK_VER}" "$APP/Info.plist"
+[ -n "$SDK_BUILD" ] && { plutil -replace DTSDKBuild -string "$SDK_BUILD" "$APP/Info.plist"; plutil -replace DTPlatformBuild -string "$SDK_BUILD" "$APP/Info.plist"; }
 # report the version of the Mac copy it was built from (the store screen matches downloads against it)
 for k in CFBundleShortVersionString CFBundleVersion; do
   v="$(plutil -extract "$k" raw "$GAME_APP/Contents/Info.plist" 2>/dev/null || true)"

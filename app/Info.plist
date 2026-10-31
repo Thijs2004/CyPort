@@ -16,6 +16,19 @@
 	<key>UIRequiredDeviceCapabilities</key><array><string>arm64</string><string>metal</string></array>
 	<key>UIRequiresFullScreen</key><true/>
 	<key>UILaunchScreen</key><dict/>
+	<!-- scene life cycle: required by iOS 27 for apps built with the iOS 27 SDK (the SDK that gets an iPhone Duo's real
+	     screen sizes); shim/MacShim.m MSSceneDelegate. The external display role keeps TV out working. -->
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key><false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array><dict><key>UISceneConfigurationName</key><string>App</string><key>UISceneDelegateClassName</key><string>MSSceneDelegate</string></dict></array>
+			<key>UIWindowSceneSessionRoleExternalDisplayNonInteractive</key>
+			<array><dict><key>UISceneConfigurationName</key><string>TV</string><key>UISceneDelegateClassName</key><string>MSSceneDelegate</string></dict></array>
+		</dict>
+	</dict>
 	<!-- app icon: the game's own Mac icon artwork, full bleed (app/icons, copied by build.sh) -->
 	<key>CFBundleIcons</key>
 	<dict><key>CFBundlePrimaryIcon</key><dict>
@@ -26,8 +39,9 @@
 		<key>CFBundleIconFiles</key><array><string>AppIcon60x60</string><string>AppIcon76x76</string><string>AppIcon83.5x83.5</string></array>
 	</dict></dict>
 	<key>UIStatusBarHidden</key><true/>
+	<!-- upright only on an unfolded iPhone Duo while the game runs (MSAllowedOrientations in shim/MacShim.m) -->
 	<key>UISupportedInterfaceOrientations</key>
-	<array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+	<array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string><string>UIInterfaceOrientationPortrait</string></array>
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
 	<key>UIApplicationSupportsIndirectInputEvents</key><true/>
