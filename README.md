@@ -20,7 +20,7 @@ No emulation, no streaming: the Apple Silicon Mac build runs directly on iOS / i
 | Bluetooth / MFi controllers (Xbox, DualSense, DualShock 4) | ✅ works, on-screen pad hides automatically |
 | Resolution picker up to native (2868 × 1320 on iPhone 16 Pro Max) | ✅ works |
 | AirPlay screen mirroring / USB-C → HDMI to a TV (game on the TV, phone as controller) | ✅ new |
-| iPhone Duo: both screens at their real size (no zoomed 16:9 window), fold / unfold while playing, upright when unfolded | ✅ new |
+| iPhone Duo: both screens at their real size (no zoomed 16:9 window), fold / unfold while playing, upright or sideways | ✅ new |
 | Performance | ⚠️ ~30 FPS in the open world at 1434 × 660 with low settings + MetalFX on an iPhone 16 Pro Max (more indoors); v1.2 keeps the phone cooler for longer, but it still throttles in long sessions – see [Performance tips](#performance-tips) |
 | Cloud saves (GOG, Steam, Epic) – carry on where you left off on your PC/Mac and back | 🧪 new: GOG download tested, sending and Steam/Epic untested |
 | Download the game data in the app (Steam, GOG, Epic account) | 🧪 new: untested with signed-in accounts |
@@ -143,8 +143,9 @@ while loading. If it is killed with no crash log, the memory limit is still the 
   d-pad and keys along the top; they stay clear of the minimap, quick items, prompts, the camera and the home bar, and
   are smaller on small screens. Layout: `shim/PadLayout.c`, checked by `tools/test_pad_layout.sh`.
 - **iPhone Duo:** the game fills whichever screen you play on. Folding or unfolding mid-game keeps the game's resolution
-  and scales the picture to the new screen (thin black bars where the shapes differ). Unfolded and held upright, the
-  picture goes to the top and the controller to the space below it. The resolution list on the start screen follows the
+  and scales the picture to the new screen (thin black bars where the shapes differ). Held upright (folded or
+  unfolded), the picture goes to the top and the controller to the space below it; the start screen turns upright too
+  (options under the title, PLAY at the bottom). The resolution list on the start screen follows the
   screen CyPort was opened on.
 - **Menus:** tap = mouse click, drag = scroll, hold then drag = mouse drag (sliders), two-finger tap = right click.
 - **Controllers:** connect an Xbox / DualSense / DualShock 4 / MFi controller – the on-screen pad steps aside. Other pads

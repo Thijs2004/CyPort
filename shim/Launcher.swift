@@ -80,16 +80,8 @@ private struct LauncherView: View {
         }
     }
 
-    var body: some View {
-        ZStack {
-            LinearGradient(colors: [Color.black, Color(red: 0.08, green: 0.02, blue: 0.06)], startPoint: .topLeading, endPoint: .bottomTrailing)
-                .ignoresSafeArea()
-            // thin neon accents
-            VStack { Rectangle().fill(cyberYellow).frame(height: 3); Spacer(); Rectangle().fill(cyberRed.opacity(0.8)).frame(height: 2) }
-                .ignoresSafeArea()
-
-            HStack(alignment: .center, spacing: 40) {
-                VStack(alignment: .leading, spacing: 6) {
+    private var titleBlock: some View {
+        VStack(alignment: .leading, spacing: 6) {
                     Text("CYPORT")
                         .font(.system(size: 52, weight: .black, design: .default))
                         .italic()
@@ -100,15 +92,15 @@ private struct LauncherView: View {
                         .font(.system(size: 13, weight: .heavy, design: .monospaced))
                         .tracking(3)
                         .foregroundStyle(.white.opacity(0.85))
-                    Text("Other graphics settings are in the game's own Settings menu - they're kept between launches.")
+        }
+    }
+    private var noteText: some View {
+        Text("Other graphics settings are in the game's own Settings menu - they're kept between launches.")
                         .font(.footnote)
                         .foregroundStyle(.white.opacity(0.5))
                         .frame(maxWidth: 300, alignment: .leading)
-                        .padding(.top, 14)
-                }
-
-                ScrollView(.vertical, showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 14) {
+    }
+    @ViewBuilder private var optionRows: some View {
                     VStack(alignment: .leading, spacing: 8) {
                         Label("Resolution", systemImage: "rectangle.on.rectangle")
                             .font(.subheadline.weight(.semibold))
@@ -200,7 +192,9 @@ private struct LauncherView: View {
                         }
                     }
 
-                    Button {
+    }
+    private var playButton: some View {
+        Button {
                         guard !model.starting, !model.syncing else { return }
                         model.starting = true
                         GameCloud.startWatching()
@@ -217,13 +211,50 @@ private struct LauncherView: View {
                         .shadow(color: cyberYellow.opacity(0.35), radius: 12)
                     }
                     .disabled(model.starting || model.syncing)
-                    .padding(.top, 4)
+    }
+
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [Color.black, Color(red: 0.08, green: 0.02, blue: 0.06)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                .ignoresSafeArea()
+            // thin neon accents
+            VStack { Rectangle().fill(cyberYellow).frame(height: 3); Spacer(); Rectangle().fill(cyberRed.opacity(0.8)).frame(height: 2) }
+                .ignoresSafeArea()
+
+            GeometryReader { geo in
+                if geo.size.height > geo.size.width {
+                    // upright (iPhone Duo): title on top, the options under it, PLAY at the bottom under the thumbs
+                    VStack(alignment: .leading, spacing: 12) {
+                        titleBlock
+                        ScrollView(.vertical, showsIndicators: false) {
+                            VStack(alignment: .leading, spacing: 14) { optionRows }
+                                .padding(.vertical, 8).padding(.horizontal, 2)
+                        }
+                        noteText
+                        playButton
+                    }
+                    .frame(width: 304)
+                    .padding(.vertical, 20)
+                    .frame(width: geo.size.width, height: geo.size.height)
+                } else {
+                    HStack(alignment: .center, spacing: 40) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            titleBlock
+                            noteText.padding(.top, 14)
+                        }
+                        ScrollView(.vertical, showsIndicators: false) {
+                        VStack(alignment: .leading, spacing: 14) {
+                            optionRows
+                            playButton.padding(.top, 4)
+                        }
+                        .padding(.vertical, 16).padding(.horizontal, 2)
+                        }
+                        .frame(width: 304)           // never narrower than the 300 pt rows (+ their outline)
+                    }
+                    .padding(.horizontal, 24)
+                    .frame(width: geo.size.width, height: geo.size.height)
                 }
-                .padding(.vertical, 16).padding(.horizontal, 2)
-                }
-                .frame(width: 304)           // never narrower than the 300 pt rows (+ their outline)
             }
-            .padding(.horizontal, 24)
         }
         .preferredColorScheme(.dark)
         .onAppear { model.sync() }
@@ -238,8 +269,9 @@ private struct LauncherView: View {
 private final class LauncherHostingController: UIHostingController<LauncherView> {
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
-    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .landscape }
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { MacShimAllowUpright() != 0 ? .allButUpsideDown : .landscape }
 }
+@_silgen_name("MacShimAllowUpright") private func MacShimAllowUpright() -> Int32   // shim/MacShim.m: an iPhone Duo
 
 @objc(MSSwiftLauncher) public final class MSSwiftLauncher: NSObject {
     /// resolutions/notes indexed like the shim's display modes (smallest first); onPlay(resolutionIndex, overlay)

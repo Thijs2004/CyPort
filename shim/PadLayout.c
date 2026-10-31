@@ -49,6 +49,7 @@ MSRect MSPadPicture(MSPadScreen s) {
     if (s.h > s.w) {                                   /* portrait: at the top, below the camera / status strip */
         double top = s.top;
         if (s.duoInner) { double x0, y0, x1, y1; MSPadPill(s, &x0, &y0, &x1, &y1); top = maxd(top, y1); }   /* minimap clear of the pill */
+        if (s.cutX1 > s.cutX0 && s.cutY0 < s.h / 4) top = maxd(top, s.cutY1);                             /* ... and of a camera */
         r.y = mind(top, s.h - r.h);
     }
     else r.y = (s.h - r.h) / 2;
@@ -129,17 +130,22 @@ void MSPadLayout(MSPadScreen s, MSPadPos *p) {
     double L = maxd(s.left, 16), R = s.w - maxd(s.right, 16), T = maxd(s.top, 8), H = s.h - maxd(s.bottom, 8);
     MSRect pic = c.pic;
 
-    if (s.h > s.w && pic.y + pic.h < s.h - 260) {          /* portrait with room under the picture: a gamepad */
-        double top = pic.y + pic.h + 10, sy = top + 36, cy = H - 140;
-        place1(&c, MS_PAD_STICK, L + 130, cy, 60, 0, 0);
-        faces(&c, R - 120, cy, 1, -1, 0);
-        place1(&c, MS_PAD_LT, L + 40, sy, 30, 0, 1);   place1(&c, MS_PAD_LB, L + 112, sy - 4, 24, 0, 1);
-        place1(&c, MS_PAD_RT, R - 40, sy, 30, 0, 1);   place1(&c, MS_PAD_RB, R - 112, sy - 4, 24, 0, 1);
-        if (!keys(&c, L + 112 + 24 + 14, R - 112 - 24 - 14, sy - 4, 1, 0, 1)) keys(&c, L, R, sy + 56, 1, 0, 1);
-        double dx = s.w * 0.43, dy = H - 66;              /* d-pad below-right of the stick, as on an Xbox pad */
-        dpad(&c, dx, dy, 1, 0, -1);
-        place1(&c, MS_PAD_R3, s.w - dx, dy, 20, 0, -1);
-        place1(&c, MS_PAD_L3, L + 44, H - 32, 20, 1, 0);
+    double padTop = pic.y + pic.h + 10;
+    if (s.h > s.w && H - padTop >= 140) {                   /* portrait with room under the picture: a gamepad */
+        /* sized for the unfolded iPhone Duo (669 pt wide, 328 pt under the picture). Narrower / shorter spaces (the Duo
+           folded) get distances scaled across and down separately, buttons no smaller than 60% */
+        double kx = mind(1, s.w / 669), ky = mind(1, (H - padTop) / 328), kr = mind(kx, maxd(ky, 0.6));
+        double sy = padTop + 36 * ky, cy = H - 140 * ky;
+        place1(&c, MS_PAD_STICK, L + 130 * kx, cy, 60 * kr, 0, 0);
+        faces(&c, R - 120 * kx, cy, kr, -1, 0);
+        place1(&c, MS_PAD_LT, L + 40 * kx, sy, rk(30, kr), 0, 1);   place1(&c, MS_PAD_LB, L + 112 * kx, sy - 4 * ky, rk(24, kr), 0, 1);
+        place1(&c, MS_PAD_RT, R - 40 * kx, sy, rk(30, kr), 0, 1);   place1(&c, MS_PAD_RB, R - 112 * kx, sy - 4 * ky, rk(24, kr), 0, 1);
+        double kxk = (112 + 24 + 14) * kx;
+        if (!keys(&c, L + kxk, R - kxk, sy - 4 * ky, kr, 0, 1)) keys(&c, L, R, sy + 56 * ky, kr, 0, 1);
+        double dx = s.w * 0.43, dy = H - 66 * ky;          /* d-pad below-right of the stick, as on an Xbox pad */
+        dpad(&c, dx, dy, kr, 0, -1);
+        place1(&c, MS_PAD_R3, s.w - dx, dy, rk(20, kr), 0, -1);
+        place1(&c, MS_PAD_L3, L + 44 * kx, H - 32 * ky, rk(20, kr), 1, 0);
         return;
     }
 

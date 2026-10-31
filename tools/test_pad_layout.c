@@ -22,6 +22,9 @@ int main(int argc, char **argv) {
         /* the Duo's outer screen: the shim passes the camera as its corner (side insets 0), as measured */
         { "duo-outer-landscape-camR",     { 678, 466, 0, 0, 34, 0, 678, 466, 0, 583, 394, 678, 466 } },
         { "duo-outer-landscape-camL",     { 678, 466, 0, 0, 34, 0, 678, 466, 0, 0, 0, 95, 72 } },
+        /* folded upright: iOS reports R84 (camera side); the shim passes the camera + status pill corner instead */
+        { "duo-outer-portrait",           { 466, 678, 0, 0, 34, 0, 678, 466, 0, 385, 0, 466, 160 } },
+        { "duo-outer-portrait-inner-game",{ 466, 678, 0, 0, 34, 0, 951, 669, 0, 385, 0, 466, 160 } },
         { "duo-outer-insets-only",        { 678, 466, 0, 84, 34, 0, 678, 466, 0 } },
         { "duo-outer-game-from-inner",    { 678, 466, 0, 0, 34, 0, 951, 669, 0, 583, 394, 678, 466 } },
         { "duo-inner-game-from-outer",    { 951, 669, 0, 0, 34, 0, 678, 466, 1 } },

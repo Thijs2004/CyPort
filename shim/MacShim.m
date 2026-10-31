@@ -99,11 +99,29 @@ static UIWindowScene *MSAppScene(void);
 /* The screen the app is shown on. On an iPhone Duo UIScreen.mainScreen stays the outer (folded) screen; unfolded, the
    app's scene is on the inner screen, which UIKit lists as a second screen. */
 static UIScreen *MSPhoneScreen(void) { UIScreen *s = MSAppScene().screen; return s ?: UIScreen.mainScreen; }
-static int MSOnDuoInner(void) { return MSPhoneScreen() != UIScreen.mainScreen; }   /* main thread */
-/* landscape, except a running game on an unfolded iPhone Duo: there the phone may be held upright too (picture at the
-   top, controller below it - shim/PadLayout.c). Otherwise iOS keeps the app sideways and shrinks it into the screen. */
+static int MSIsDuo(void) { static int d = -1; if (d < 0) { struct utsname u; d = uname(&u) == 0 && !strcmp(u.machine, "iPhone19,4"); } return d; }
+/* landscape, except on an iPhone Duo: there the phone may be held upright too, folded or unfolded (start screen: title,
+   options, PLAY at the bottom - shim/Launcher.swift; game: picture at the top, controller below it - shim/PadLayout.c).
+   Otherwise iOS keeps the app sideways and shrinks it into the inner screen. */
 static UIInterfaceOrientationMask MSAllowedOrientations(void) {
-    return g_sizeLocked && MSOnDuoInner() ? UIInterfaceOrientationMaskAllButUpsideDown : UIInterfaceOrientationMaskLandscape;
+    return MSIsDuo() ? UIInterfaceOrientationMaskAllButUpsideDown : UIInterfaceOrientationMaskLandscape;
+}
+int MacShimAllowUpright(void) { return MSIsDuo(); }       /* for the SwiftUI start screen */
+/* a view on the phone's screen described for shim/PadLayout.c (main thread). The iPhone Duo's outer screen: iOS keeps an
+   84 pt strip free along the whole side with the camera, but the camera only takes that side's corner (measured:
+   sideways top-left or bottom-right; upright the top-right corner, with the status pill below it down to ~156 pt) - the
+   layout keeps just that corner clear, and upright the picture starts below it. */
+static MSPadScreen MSPadScreenFor(UIView *v, double gw, double gh) {
+    CGSize S = v.bounds.size; UIEdgeInsets in = v.safeAreaInsets; UIScreen *scr = v.window.screen;
+    int inner = scr && scr == MSPhoneScreen() && scr != UIScreen.mainScreen;
+    MSPadScreen sc = { S.width, S.height, in.top, in.left, in.bottom, in.right, gw, gh, inner };
+    if (MSIsDuo() && !inner) {
+        if (S.width > S.height) {
+            if (in.left > 0)  { sc.left = 0;  sc.cutX0 = 0; sc.cutY0 = 0; sc.cutX1 = 95; sc.cutY1 = 72; }
+            else if (in.right > 0) { sc.right = 0; sc.cutX0 = S.width - 95; sc.cutY0 = S.height - 72; sc.cutX1 = S.width; sc.cutY1 = S.height; }
+        } else { sc.right = 0; sc.left = 0; sc.cutX0 = S.width - 81; sc.cutY0 = 0; sc.cutX1 = S.width; sc.cutY1 = 160; }   /* camera + status pill */
+    }
+    return sc;
 }
 /* main thread: tell UIKit when that changed (game started, folded / unfolded) */
 static void MSOrientationsChanged(void) {
@@ -861,9 +879,7 @@ static BOOL MSMirrorFit(UIView *v, CGRect *r) {
 /* where the picture goes in a view (shim/PadLayout.c): scaled to fit, centred; upright on an unfolded iPhone Duo at the top,
    below the camera / status pill, with the controller below it */
 static CGRect MSPictureRect(UIView *into, double w, double h) {
-    UIEdgeInsets in = into.safeAreaInsets; CGSize c = into.bounds.size; UIScreen *sc = into.window.screen;
-    MSPadScreen ps = { c.width, c.height, in.top, in.left, in.bottom, in.right, w, h, sc && sc == MSPhoneScreen() && sc != UIScreen.mainScreen };
-    MSRect r = MSPadPicture(ps); return CGRectMake(r.x, r.y, r.w, r.h);
+    MSRect r = MSPadPicture(MSPadScreenFor(into, w, h)); return CGRectMake(r.x, r.y, r.w, r.h);
 }
 static BOOL MSHostFitted(UIView *host, UIView *into) {
     double w, h; MacShimScreenInfo(&w, &h, 0, 0); CGRect r = MSPictureRect(into, w, h);
@@ -3599,15 +3615,7 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
     /* shim/PadLayout.c places everything (screen shape, safe area, the game's picture and HUD, iPhone Duo status pill);
        laid out again whenever one of those changes */
     CGSize S = self.bounds.size; UIEdgeInsets in = self.safeAreaInsets; double gw, gh; MacShimScreenInfo(&gw, &gh, 0, 0);
-    MSPadScreen sc = { S.width, S.height, in.top, in.left, in.bottom, in.right, gw, gh, MSOnDuoInner() };
-    /* the iPhone Duo's outer screen: iOS keeps an 84 pt strip free along the whole side with the camera, but the camera
-       only takes that side's corner (measured: top-left, or bottom-right held the other way round) - the controls may
-       use the rest of the strip */
-    static int duo = -1; if (duo < 0) { struct utsname u; duo = uname(&u) == 0 && !strcmp(u.machine, "iPhone19,4"); }
-    if (duo && !sc.duoInner && S.width > S.height) {
-        if (in.left > 0)  { sc.left = 0;  sc.cutX0 = 0; sc.cutY0 = 0; sc.cutX1 = 95; sc.cutY1 = 72; }
-        else if (in.right > 0) { sc.right = 0; sc.cutX0 = S.width - 95; sc.cutY0 = S.height - 72; sc.cutX1 = S.width; sc.cutY1 = S.height; }
-    }
+    MSPadScreen sc = MSPadScreenFor(self, gw, gh);
     static MSPadScreen last; if (!memcmp(&sc, &last, sizeof sc)) return; last = sc;
     MSPadPos pp[MS_PAD_COUNT]; MSPadLayout(sc, pp);
     static NSDictionary *ids; static dispatch_once_t o; dispatch_once(&o, ^{ ids = @{
