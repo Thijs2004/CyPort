@@ -77,10 +77,17 @@ SDK_DIR="${SDK:-$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || true)}"
 if [ -z "$SDK_VER" ] && [ -n "$SDK_DIR" ] && [ -f "$SDK_DIR/SDKSettings.plist" ]; then
   SDK_VER="$(plutil -extract Version raw "$SDK_DIR/SDKSettings.plist" 2>/dev/null || true)"
   SDK_NAME="$(plutil -extract CanonicalName raw "$SDK_DIR/SDKSettings.plist" 2>/dev/null || true)"
-  SDK_BUILD="$(xcrun --sdk iphoneos --show-sdk-build-version 2>/dev/null || true)"
+  SDK_BUILD="$(xcrun --sdk "$SDK_DIR" --show-sdk-build-version 2>/dev/null || true)"
 fi
 case "$SDK_VER" in [0-9]*.[0-9]*) ;; [0-9]*) SDK_VER="$SDK_VER.0" ;; *) SDK_VER="18.0" ;; esac
 if [ "${SDK_VER%%.*}" -lt 18 ]; then SDK_VER="18.0"; fi
+# iOS 27 only launches an app stamped with the iOS 27+ SDK if it uses scenes (MSSceneDelegate, in the shim since the
+# iPhone Duo support). A shim without it (an older prebuilt) keeps the old stamp and no scene list, or the screen stays black.
+OLD_SHIM=0
+if ! grep -q MSSceneDelegate "$APP/Frameworks/libMacShim.dylib"; then
+  OLD_SHIM=1; SDK_VER="18.0"; SDK_NAME=""; SDK_BUILD=""
+  echo "    this MacShim predates scene support: stamping iOS SDK 18.0 (REBUILD_SHIM=1 for an iPhone Duo's real screen sizes)"
+fi
 echo "==> 2/4 retarget game binary + libraries (macOS -> iOS load commands only, iOS SDK $SDK_VER)"
 python3 "$HERE/tools/ios_retarget.py" --sdk "$SDK_VER" "$GAME_APP/Contents/MacOS/Cyberpunk2077" "$APP/Cyberpunk2077" >/dev/null
 chmod +x "$APP/Cyberpunk2077"
@@ -90,6 +97,7 @@ for f in "$GAME_APP"/Contents/Frameworks/*.dylib; do
   python3 "$HERE/tools/ios_retarget.py" "$f" "$APP/Frameworks/$(basename "$f")" >/dev/null
 done
 sed "s/__BUNDLE_ID__/$BUNDLE_ID/" "$HERE/app/Info.plist" > "$APP/Info.plist"
+if [ "$OLD_SHIM" = 1 ]; then plutil -remove UIApplicationSceneManifest "$APP/Info.plist"; fi
 # the same SDK in the Info.plist keys Xcode writes (iOS reads both)
 plutil -replace DTPlatformName -string iphoneos "$APP/Info.plist"
 plutil -replace DTPlatformVersion -string "$SDK_VER" "$APP/Info.plist"

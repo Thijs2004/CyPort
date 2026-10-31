@@ -123,12 +123,6 @@ static MSPadScreen MSPadScreenFor(UIView *v, double gw, double gh) {
     }
     return sc;
 }
-/* main thread: tell UIKit when that changed (game started, folded / unfolded) */
-static void MSOrientationsChanged(void) {
-    static UIInterfaceOrientationMask last; UIInterfaceOrientationMask m = MSAllowedOrientations(); if (m == last) return; last = m;
-    MSLogf(@"orientations: %@", m == UIInterfaceOrientationMaskLandscape ? @"landscape" : @"landscape + upright (iPhone Duo inner screen)");
-    for (UIWindow *w in MSAppScene().windows) [w.rootViewController setNeedsUpdateOfSupportedInterfaceOrientations];
-}
 /* a TV / external display: a screen that is neither the app's screen nor the main screen (an unfolded Duo also lists
    its outer screen) and not a phone panel */
 static UIScreen *MSExternalScreen(void) {
@@ -149,9 +143,9 @@ static void MSLogScreens(NSString *why) {        /* main thread; logs only when 
 }
 static void MSRefreshScreen(void) {
     MSOnMain(^{
-        UIScreen *s = MSPhoneScreen(); g_ss = s.nativeScale; g_fps = (double)s.maximumFramesPerSecond;
-        if (!g_sizeLocked) {
-            double w = s.bounds.size.width, h = s.bounds.size.height;
+        UIScreen *s = MSPhoneScreen(); g_fps = (double)s.maximumFramesPerSecond;
+        if (!g_sizeLocked) {                          /* the scale is part of the size the game was told: fixed too */
+            double w = s.bounds.size.width, h = s.bounds.size.height; g_ss = s.nativeScale;
             g_sw = MAX(w, h); g_sh = MIN(w, h);          /* landscape only */
         }
         /* decided once, so the size the game was told never changes under it: same height (= same pixel cost) as
@@ -942,7 +936,6 @@ static void MSTVRoute(void) {                                     /* main thread
                phone.bounds.size.width, phone.bounds.size.height, host.frame.origin.x, host.frame.origin.y, host.transform.a);
     }
     g_stBottomGap = phone.safeAreaInsets.bottom > 0 ? 16 : 4;
-    MSOrientationsChanged();
     MSLogScreens(@"route");
 }
 static void MSTVObserve(void) {
@@ -1504,6 +1497,7 @@ static NSString *MSGB(uint64_t b) { return [NSString stringWithFormat:@"%.1f GB"
     return nil;
 }
 - (BOOL)prefersStatusBarHidden { return YES; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }  /* laid out sideways (Info.plist also lists upright, for the Duo) */
 @end
 @interface MSSetupDelegate : UIResponder <UIApplicationDelegate> @property(nonatomic, strong) UIWindow *window; @end
 @implementation MSSetupDelegate
@@ -3616,7 +3610,11 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
        laid out again whenever one of those changes */
     CGSize S = self.bounds.size; UIEdgeInsets in = self.safeAreaInsets; double gw, gh; MacShimScreenInfo(&gw, &gh, 0, 0);
     MSPadScreen sc = MSPadScreenFor(self, gw, gh);
-    static MSPadScreen last; if (!memcmp(&sc, &last, sizeof sc)) return; last = sc;
+    static MSPadScreen last;                     /* field by field: memcmp would also compare the struct's padding */
+    if (sc.w == last.w && sc.h == last.h && sc.top == last.top && sc.left == last.left && sc.bottom == last.bottom && sc.right == last.right &&
+        sc.gameW == last.gameW && sc.gameH == last.gameH && sc.duoInner == last.duoInner &&
+        sc.cutX0 == last.cutX0 && sc.cutY0 == last.cutY0 && sc.cutX1 == last.cutX1 && sc.cutY1 == last.cutY1) return;
+    last = sc;
     MSPadPos pp[MS_PAD_COUNT]; MSPadLayout(sc, pp);
     static NSDictionary *ids; static dispatch_once_t o; dispatch_once(&o, ^{ ids = @{
         @"A": @(MS_PAD_A), @"B": @(MS_PAD_B), @"X": @(MS_PAD_X), @"Y": @(MS_PAD_Y), @"LB": @(MS_PAD_LB), @"LT": @(MS_PAD_LT),
