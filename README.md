@@ -19,7 +19,7 @@ No emulation, no streaming: the Apple Silicon Mac build runs directly on iOS / i
 | Gameplay (loading saves, driving, combat) | ✅ works |
 | On-screen controls (virtual gamepad + touch-as-mouse in menus) | ✅ works, now with a layout editor (✎) |
 | Import your own saves from a Mac or PC | ✅ new |
-| Free Apple ID (SideStore + GetMoreRam) | 🧪 v1.4 fixes the crash at launch without extended virtual addressing; reports welcome |
+| Free Apple ID (SideStore + GetMoreRam) | ✅ v1.4.1: no more crash at launch without extended virtual addressing (tested with a simulated free-account address space); reports welcome |
 | Bluetooth / MFi controllers (Xbox, DualSense, DualShock 4) | ✅ works, on-screen pad hides automatically |
 | Resolution picker up to native (2868 × 1320 on iPhone 16 Pro Max) | ✅ works |
 | AirPlay screen mirroring / USB-C → HDMI to a TV (game on the TV, phone as controller) | ✅ new |

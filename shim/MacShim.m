@@ -2346,7 +2346,14 @@ static void MSBootUIKit(void) {
 /* the game's own Mach-O: found by type, not as image 0 - on iOS 27 image 0 is not the game, so this said "no" to every
    game call (the engine's pool reservations never reached the compact layout below) */
 static const struct mach_header *MSMainExeHeader(void) { return MSGameHeader(); }
-static BOOL MSCallerIsMainExe(void *ret) { Dl_info i; return dladdr(ret, &i) && i.dli_fbase == (void *)MSMainExeHeader(); }
+static BOOL MSCallerIsMainExe(void *ret) {
+    Dl_info i; if (!dladdr(ret, &i)) return NO;
+    if (i.dli_fbase == (void *)MSMainExeHeader()) return YES;
+    /* several-versions app: the game's own initialisers (the three 8 GB pools) run while the starter is still in dlopen,
+       before g_gameHeader is set - recognise the game by its file name then */
+    if (!g_gameHeader && i.dli_fname) { const char *n = strrchr(i.dli_fname, '/'); return n && !strcmp(n + 1, "CyberpunkGame.dylib"); }
+    return NO;
+}
 
 int ms_NSGetExecutablePath(char *buf, uint32_t *size) __asm("__NSGetExecutablePath");
 int ms_NSGetExecutablePath(char *buf, uint32_t *size) {
