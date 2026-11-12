@@ -248,6 +248,6 @@ agent), which did most of the analysis, debugging and implementation in long int
 
 ## License
 The CyPort code is **MIT** licensed (see `LICENSE`). It does not include and does not grant any rights to *Cyberpunk 2077* or any
-CD PROJEKT RED content.
+CD PROJEKT RED content (see `NOTICE`).
 Included decoders for the store downloads: LZMA decoder from the 7-Zip LZMA SDK (public domain, `shim/third_party/lzma`) and the
 zstd decompressor (BSD, `shim/third_party/zstd/LICENSE`).
