@@ -38,6 +38,8 @@ final class StoreModel: ObservableObject {
     enum Phase { case choose, preparing(String), ready, downloading, done(String), failed(String) }
     enum Destination: Equatable { case phone, folder(URL) }
     let downloadRoot: URL, internalRoot: URL, bookmarkKey: String
+    /// Update Cyberpunk: the game folder in use; only the files that differ from what the app's game program needs are downloaded into it
+    let updateRoot: URL?
     @Published var phase: Phase = .choose
     @Published var store: StoreKind?
     @Published var refresh = 0                                 // bumps after sign-in/out
@@ -50,8 +52,9 @@ final class StoreModel: ObservableObject {
     @Published var freeBytes: Int64 = 0
     private var task: Task<Void, Never>?
 
-    init(downloadRoot: URL, internalRoot: URL, bookmarkKey: String) {
-        self.downloadRoot = downloadRoot; self.internalRoot = internalRoot; self.bookmarkKey = bookmarkKey
+    init(downloadRoot: URL, internalRoot: URL, bookmarkKey: String, updateRoot: URL? = nil) {
+        self.downloadRoot = downloadRoot; self.internalRoot = internalRoot; self.bookmarkKey = bookmarkKey; self.updateRoot = updateRoot
+        if updateRoot != nil { return }
         // a download into a folder that didn't finish: offer to continue there
         if let bm = UserDefaults.standard.data(forKey: "CyPortDownloadFolder") {
             var stale = false
@@ -59,6 +62,7 @@ final class StoreModel: ObservableObject {
         }
     }
     var gameFolder: URL {
+        if let u = updateRoot { return u }
         switch destination { case .phone: return downloadRoot; case .folder(let u): return u.appendingPathComponent("Cyberpunk 2077", isDirectory: true) }
     }
     var resuming: Bool { FileManager.default.fileExists(atPath: gameFolder.appendingPathComponent(".cyport-download.json").path) }
@@ -73,15 +77,28 @@ final class StoreModel: ObservableObject {
                 switch s {
                 case .steam: p = try await SteamStore.shared.plan(progress: say)
                 case .gog:
-                    if gogBuilds.isEmpty { gogBuilds = try await GOGStore.shared.builds(); gogBuild = GOGStore.preferred(gogBuilds) }
+                    if gogBuilds.isEmpty {
+                        gogBuilds = try await GOGStore.shared.builds()
+                        gogBuild = gogBuilds.first { $0.id == GameData.expected?.gogBuild } ?? GOGStore.preferred(gogBuilds)   // the very build of the app's game program
+                    }
                     guard let b = gogBuild else { throw StoreError("GOG lists no Mac version of the game.") }
                     p = try await GOGStore.shared.plan(build: b, progress: say)
                 case .epic: p = try await EpicStore.shared.plan(progress: say)
                 }
-                plan = p
+                var q = p
+                if updateRoot == nil, s != .gog { try GameData.checkVersion(p) }   // GOG: the build is picked (and named) on screen
+                if let root = updateRoot {
+                    q = try await GameData.updatePlan(p, root: root, progress: say)
+                    if q.files.isEmpty {
+                        GameData.markVerified(root, [])
+                        phase = .done("Your game data already is Cyberpunk \(GameData.appVersionName), the version this CyPort plays. Nothing to download.")
+                        return
+                    }
+                }
+                plan = q
                 updateSpace()
                 phase = .ready
-                storeLog("\(s.rawValue): ready, \(p.files.count) files, \(p.totalBytes / 1_000_000) MB, \(p.versionName) (\(p.version))")
+                storeLog("\(s.rawValue): ready, \(q.files.count) files, \(q.totalBytes / 1_000_000) MB, \(q.versionName) (\(q.version))\(updateRoot != nil ? " (update)" : "")")
             } catch is CancellationError { phase = .choose }
             catch { phase = .failed(error.localizedDescription); storeLog("\(s.rawValue): \(error.localizedDescription)") }
         }
@@ -122,6 +139,12 @@ final class StoreModel: ObservableObject {
     func cancel() { task?.cancel() }
     private func finish(_ dest: URL) throws {
         let fm = FileManager.default
+        if let root = updateRoot {
+            GameData.markVerified(root, plan?.files.map(\.path) ?? [])
+            phase = .done("Cyberpunk is updated to \(GameData.appVersionName). Close the app and open it again to play.")
+            storeLog("update installed (\(plan?.files.count ?? 0) files)")
+            return
+        }
         switch destination {
         case .phone:
             if fm.fileExists(atPath: internalRoot.path) { try fm.removeItem(at: internalRoot) }
@@ -145,6 +168,7 @@ struct StoreView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var login: StoreKind?
     @State private var pickFolder = false
+    @State private var deleteWindows = false
 
     var body: some View {
         ZStack {
@@ -152,11 +176,13 @@ struct StoreView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     HStack {
-                        Text("Get the game from your store").font(.title2.bold()).foregroundColor(.white)
+                        Text(model.updateRoot != nil ? "Update Cyberpunk" : "Get the game from your store").font(.title2.bold()).foregroundColor(.white)
                         Spacer()
                         if case .downloading = model.phase {} else { Button("Close") { model.cancel(); dismiss() }.foregroundColor(.yellow) }
                     }
-                    Text("Sign in to the store where you bought Cyberpunk 2077. CyPort downloads the Mac version's game data (about 90 GB with Phantom Liberty). Your app already contains the game program, built from your Mac copy (version \(Game.appVersion)).")
+                    Text(model.updateRoot != nil
+                         ? "This CyPort plays Cyberpunk \(GameData.appVersionName). Sign in to GOG or Steam (where you bought it): CyPort checks your game files and downloads only the ones that are missing or from another version. Steam or PC copies work too: the Mac version comes with your purchase."
+                         : "Sign in to the store where you bought Cyberpunk 2077. CyPort downloads the Mac version's game data (about 90 GB with Phantom Liberty). Your app already contains the game program (Cyberpunk \(GameData.appVersionName)).")
                         .font(.subheadline).foregroundColor(.gray)
                     content
                 }
@@ -191,6 +217,18 @@ struct StoreView: View {
     var storeList: some View {
         VStack(spacing: 12) {
             let _ = model.refresh
+            if model.updateRoot != nil, GameData.versions.count > 1 {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Game version").font(.subheadline.bold()).foregroundColor(.white)
+                    Picker("Game version", selection: Binding(get: { GameData.selected?.name ?? "" },
+                                                              set: { n in if let v = GameData.versions.first(where: { $0.name == n }) { GameData.select(v); model.refresh += 1 } })) {
+                        ForEach(GameData.versions) { v in Text("Cyberpunk \(v.name)\(v.name == GameData.running?.name ? " (playing now)" : "")").tag(v.name) }
+                    }.pickerStyle(.segmented)
+                    Text("This CyPort plays every version listed here. Pick the one you want: CyPort brings your game files to it (only the files that differ) and starts that version from then on.")
+                        .font(.caption).foregroundColor(.gray)
+                }
+                .padding(14).background(Color.white.opacity(0.07)).cornerRadius(12)
+            }
             ForEach(StoreKind.allCases) { s in
                 HStack {
                     VStack(alignment: .leading, spacing: 3) {
@@ -200,7 +238,7 @@ struct StoreView: View {
                     Spacer()
                     if s.signedIn {
                         Button("Sign out") { s.signOut(); model.refresh += 1 }.font(.caption).foregroundColor(.gray)
-                        Button("Download") { model.prepare(s) }.buttonStyle(.borderedProminent).tint(.yellow).foregroundColor(.black)
+                        Button(model.updateRoot != nil ? "Update" : "Download") { model.prepare(s) }.buttonStyle(.borderedProminent).tint(.yellow).foregroundColor(.black)
                     } else {
                         Button("Sign in") { login = s }.buttonStyle(.bordered).tint(.yellow)
                     }
@@ -214,16 +252,29 @@ struct StoreView: View {
         VStack(alignment: .leading, spacing: 14) {
             if let p = model.plan, let s = model.store {
                 Text("\(s.rawValue): Cyberpunk 2077 for Mac").font(.headline).foregroundColor(.white)
-                if s == .gog, model.gogBuilds.count > 1 {
+                if s == .gog, model.gogBuilds.count > 1, model.updateRoot == nil {
                     Picker("Version", selection: Binding(get: { model.gogBuild?.id ?? "" }, set: { id in
                         model.gogBuild = model.gogBuilds.first { $0.id == id }; model.prepare(.gog) })) {
                         ForEach(model.gogBuilds, id: \.id) { b in Text("\(b.version) (\(b.date))").tag(b.id) }
                     }.pickerStyle(.menu).tint(.yellow)
                 }
-                Text("Version: \(p.versionName) · \(p.files.count) files · \(gb(p.totalBytes))")
+                Text(model.updateRoot != nil ? "Update to \(GameData.appVersionName): \(p.files.count) file\(p.files.count == 1 ? "" : "s") to download · \(gb(p.totalBytes))"
+                                             : "Version: \(p.versionName) · \(p.files.count) files · \(gb(p.totalBytes))")
                     .foregroundColor(.white)
-                versionNote(s, p)
+                if model.updateRoot == nil { versionNote(s, p) }
+                if let root = model.updateRoot, GameData.isWindowsCopy(root) || FileManager.default.fileExists(atPath: root.appendingPathComponent("archive/pc").path) {
+                    Text("This folder also has the Windows version's files (archive/pc, bin). The Mac game doesn't use them.")
+                        .font(.caption).foregroundColor(.orange)
+                    Button("Delete the Windows files to make room", role: .destructive) { deleteWindows = true }.font(.caption.bold())
+                        .confirmationDialog("Delete archive/pc and bin from the game folder?", isPresented: $deleteWindows, titleVisibility: .visible) {
+                            Button("Delete", role: .destructive) {
+                                for d in ["archive/pc", "bin"] { try? FileManager.default.removeItem(at: root.appendingPathComponent(d)) }
+                                storeLog("update: Windows files deleted"); model.updateSpace()
+                            }
+                        }
+                }
                 Divider().background(Color.gray)
+                if model.updateRoot == nil {
                 Text("Save to").font(.subheadline.bold()).foregroundColor(.white)
                 HStack {
                     Button { model.usePhone() } label: { Label("This iPhone", systemImage: model.destination == .phone ? "largecircle.fill.circle" : "circle") }
@@ -232,6 +283,7 @@ struct StoreView: View {
                         else { Label("A folder (SSD)…", systemImage: "circle") }
                     }
                 }.tint(.yellow)
+                }
                 Text("\(model.resuming ? "Continues the earlier download · " : "")Needs \(gb(model.needBytes)) · \(gb(model.freeBytes)) free")
                     .font(.caption).foregroundColor(model.needBytes > model.freeBytes ? .orange : .gray)
                 Text("Keep the app open while it downloads (the screen stays on). If it stops, it continues from where it was.")
@@ -239,7 +291,7 @@ struct StoreView: View {
                 HStack {
                     Button("Back") { model.phase = .choose }
                     Spacer()
-                    Button(model.resuming ? "Continue download" : "Download") { model.start() }
+                    Button(model.resuming ? "Continue" : model.updateRoot != nil ? "Update" : "Download") { model.start() }
                         .buttonStyle(.borderedProminent).tint(.yellow).foregroundColor(.black)
                         .disabled(model.needBytes > model.freeBytes)
                 }

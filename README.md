@@ -14,18 +14,23 @@ No emulation, no streaming: the Apple Silicon Mac build runs directly on iOS / i
 
 | | |
 |---|---|
+| Cyberpunk **2.3.1 and 2.5** (GOG Mac; Steam Mac data works too) – one app, it picks the version that fits your game files | ✅ new |
 | Boots, main menu, user agreement, settings | ✅ works |
 | Gameplay (loading saves, driving, combat) | ✅ works |
-| On-screen controls (virtual gamepad + touch-as-mouse in menus) | ✅ works |
+| On-screen controls (virtual gamepad + touch-as-mouse in menus) | ✅ works, now with a layout editor (✎) |
+| Import your own saves from a Mac or PC | ✅ new |
+| Free Apple ID (SideStore + GetMoreRam) | 🧪 v1.4 fixes the crash at launch without extended virtual addressing; reports welcome |
 | Bluetooth / MFi controllers (Xbox, DualSense, DualShock 4) | ✅ works, on-screen pad hides automatically |
 | Resolution picker up to native (2868 × 1320 on iPhone 16 Pro Max) | ✅ works |
 | AirPlay screen mirroring / USB-C → HDMI to a TV (game on the TV, phone as controller) | ✅ new |
+| iPhone Duo: both screens at their real size (no zoomed 16:9 window), fold / unfold while playing, upright or sideways | ✅ new |
 | Performance | ⚠️ ~30 FPS in the open world at 1434 × 660 with low settings + MetalFX on an iPhone 16 Pro Max (more indoors); v1.2 keeps the phone cooler for longer, but it still throttles in long sessions – see [Performance tips](#performance-tips) |
 | Cloud saves (GOG, Steam, Epic) – carry on where you left off on your PC/Mac and back | 🧪 new: GOG download tested, sending and Steam/Epic untested |
 | Download the game data in the app (Steam, GOG, Epic account) | 🧪 new: untested with signed-in accounts |
 | Online features (GOG Galaxy achievements, crash upload) | ❌ offline only (stubbed) |
 
-Tested on: **iPhone 16 Pro Max (A18 Pro, 8 GB), iOS 27.0.1**, built with Xcode 27.
+Tested on: **iPhone 16 Pro Max (A18 Pro, 8 GB), iOS 27.0.1**, built with Xcode 27; **iPhone Duo (12 GB), iOS 27.1**, built with Xcode 27.1.
+The build stamps the game with the iOS SDK of the Xcode it's built with: an iPhone Duo only shows apps built with the iOS 27 SDK at its real screen sizes.
 
 ---
 
@@ -50,8 +55,10 @@ M-series iPads have more RAM and better cooling and should run it as well or bet
 ### To build it
 - A **Mac** with **Xcode 16 or newer** (Xcode 27 tested) and Python 3.
 - **Cyberpunk 2077 for Mac from GOG, version 2.3.1**, downloaded on that Mac (the `Cyberpunk 2077` folder with `Cyberpunk2077.app`, `archive`, `engine`, `r6`).
-  - Steam / Epic / Mac App Store copies: **untested**. The game data is probably the same for the same version, but CyPort's patches
-    target the GOG 2.3.1 executable, the Steam/Epic builds use their own account systems, and the App Store binary is encrypted.
+  - **Steam version 2.5.0** (Mac): launches and plays (tested on an iPhone Duo, game data copied over USB). The mouse gate
+    address is picked per build, and the build check now fails if the game needs an AppKit symbol the shim doesn't provide.
+  - Epic / Mac App Store copies: **untested**. The game data is probably the same for the same version, but CyPort's patches
+    target the GOG 2.3.1 and Steam 2.5.0 executables, the Epic build uses its own account system, and the App Store binary is encrypted.
     A newer game version will need updated patches.
 - An **Apple account to sign it with**:
   - **Paid Apple Developer account** ($99/year) – recommended: gives both *Increased Memory Limit* and *Extended Virtual Address Space*.
@@ -128,6 +135,9 @@ while loading. If it is killed with no crash log, the memory limit is still the 
   Saves you make on the phone go up while you play, so the game on your PC/Mac continues from them. A replaced phone save is moved
   to `saves-backup-<date>` first, and before the first upload to a store the whole cloud is copied to the phone. Optional – without
   signing in everything stays on the phone. With GOG, the game's own CD PROJEKT RED cloud sign-in is set up as well.
+- **Import saves…** (under Cloud saves) – pick save folders in Files: one slot (`ManualSave-3`) or the folder that holds them
+  (Mac: `~/Library/Application Support/CD Projekt Red/Cyberpunk 2077/saves`, PC: `Saved Games/CD Projekt Red/Cyberpunk 2077`).
+  A phone save with the same name is moved to `saves-backup-<date>` first.
 - When you change a setting in-game that needs a restart, CyPort offers to quit; just open it again.
 - First launch uses the lowest graphics settings. With smooth frame pacing on (the default) it also sets VSync and Maximum FPS
   to Off, so smooth pacing picks the frame rate; after that, whatever you set in the game is kept.
@@ -135,6 +145,17 @@ while loading. If it is killed with no crash log, the memory limit is still the 
 ### Controls
 - **On-screen gamepad** (Xbox layout): left stick (fixed, or touch anywhere on the left half), **swipe on the right half to look**,
   A / B / X / Y, LB / LT / RB / RT, L3 / R3, d-pad, View / Menu, plus Esc / Space / Enter keys. 🎮 hides/shows the pad.
+  On an iPhone Duo the layout adapts to each screen: two thumb clusters low on each side (stick with LT · LB · L3 above it;
+  X/Y/B/A with R3 · RB · RT above it), the d-pad and keys along the top, clear of the minimap, quick items, prompts, the
+  camera and the status pill (`shim/PadLayout.c`, checked by `tools/test_pad_layout.sh`).
+- **Layout editor:** tap **✎** (top centre) during play. Drag any button or the move stick; **− / +** resize the one you
+  picked, **↺** goes back to the default layout, **✓** saves. Saved per screen size, so a folded and an unfolded Duo each
+  keep their own.
+- **iPhone Duo:** the game fills whichever screen you play on. Folding or unfolding mid-game keeps the game's resolution
+  and scales the picture to the new screen (thin black bars where the shapes differ). Held upright (folded or
+  unfolded), the picture goes to the top and the controller to the space below it; the start screen turns upright too
+  (options under the title, PLAY at the bottom). The resolution list on the start screen follows the
+  screen CyPort was opened on.
 - **Menus:** tap = mouse click, drag = scroll, hold then drag = mouse drag (sliders), two-finger tap = right click.
 - **Controllers:** connect an Xbox / DualSense / DualShock 4 / MFi controller – the on-screen pad steps aside. Other pads
   (EasySMX, 8BitDo, generic "HID" / MFi) are shown to the game as an Xbox controller, since it only knows those three kinds.
@@ -177,6 +198,8 @@ while loading. If it is killed with no crash log, the memory limit is still the 
 | `Diagnostics` = YES | memory pool / GPU memory statistics in the log every 10 s |
 | `WorkerSampler` = YES | worker-thread profile in the log every ~60 s (pauses the workers briefly – causes a hitch) |
 | `GPUSampler` = NO, `ConsoleLog` = YES | no GPU busy-time lines / also send the log to the system console |
+| `MemSizeGB` (number) | the RAM size the game is told (it sizes its memory budgets from it). Default: iOS's per-app limit + 1 GB, at most 7 GB (`MemoryFitMaxGB`), so the game stays under the limit; `MemoryFit` = NO = the real size |
+| `CompactPools` = YES / NO | force / never use the small-address-space memory layout (used automatically without extended virtual addressing, e.g. a free Apple ID) |
 | `ResMode` (0–7), `AutoPlay`, `AutoKeys` | testing aids |
 
 Logs: *Files → On My iPhone → CyPort → `macshim.log`* (and `game_output.log`, the engine's own output).

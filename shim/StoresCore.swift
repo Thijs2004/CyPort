@@ -226,7 +226,9 @@ enum Keychain {
 
 /// One output file, built from parts of decoded chunks in order.
 struct DLPart { let chunk: Int; let offset: Int; let length: Int }
-struct DLFile { var path: String; let size: Int64; let parts: [DLPart] }
+/// a checksum of one stretch of a file, as the store lists it (GOG: md5 of each chunk; Steam: sha1 of each chunk)
+struct DLCheck { let offset: Int64; let size: Int; let hash: String; let sha1: Bool }
+struct DLFile { var path: String; let size: Int64; let parts: [DLPart]; var checks: [DLCheck] = [] }
 /// A store's download: the files and a way to get chunk n, decoded and verified.
 struct DLPlan {
     var files: [DLFile]
@@ -893,7 +895,8 @@ final class SteamStore: @unchecked Sendable {
                     }
                     parts.append(DLPart(chunk: k, offset: 0, length: c.size))
                 }
-                files.append(DLFile(path: f.path, size: f.size, parts: parts))
+                files.append(DLFile(path: f.path, size: f.size, parts: parts,
+                                    checks: f.chunks.map { DLCheck(offset: Int64($0.offset), size: $0.size, hash: $0.sha.hex, sha1: true) }))
             }
         }
         guard ownedAny else { throw StoreError("This Steam account doesn't own Cyberpunk 2077 (Steam refused the download key).") }
@@ -1074,14 +1077,15 @@ final class GOGStore: @unchecked Sendable {
             let dm = try Self.meta(try await Net.request(mu))
             for it in ((dm["depot"] as? [String: Any])?["items"] as? [[String: Any]] ?? []) where (it["type"] as? String) == "DepotFile" {
                 guard let path = it["path"] as? String else { continue }
-                var parts: [DLPart] = [], size: Int64 = 0
+                var parts: [DLPart] = [], size: Int64 = 0, checks: [DLCheck] = []
                 for c in it["chunks"] as? [[String: Any]] ?? [] {
                     guard let cm = c["compressedMd5"] as? String, let md = c["md5"] as? String,
                           let s = (c["size"] as? NSNumber)?.intValue, let cs = (c["compressedSize"] as? NSNumber)?.intValue else { continue }
+                    checks.append(DLCheck(offset: size, size: s, hash: md, sha1: false))
                     parts.append(DLPart(chunk: chunks.count, offset: 0, length: s)); size += Int64(s)
                     chunks.append(ChunkRef(product: pid, cmd5: cm, md5: md, size: s, csize: cs))
                 }
-                files.append(DLFile(path: path.replacingOccurrences(of: "\\", with: "/"), size: size, parts: parts))
+                files.append(DLFile(path: path.replacingOccurrences(of: "\\", with: "/"), size: size, parts: parts, checks: checks))
             }
         }
         let picked = try GameFiles.pick(files)
@@ -1364,5 +1368,182 @@ struct EpicManifest {
         if how & 1 != 0 { body = try Inflate.run(body, expected: window) }
         guard body.count == window, Hash.sha1(body) == sha1 else { throw StoreError("Epic chunk doesn't match its checksum") }
         return body
+    }
+}
+
+// MARK: - game data version (Update Cyberpunk)
+
+/// Which game data the app's game program needs: CyPortData.json in the app (tools/data_manifest.py at build time,
+/// from the GOG Mac build with the same executable): every data file's size and chunk checksums. The start screen
+/// checks the game folder against it; "Update Cyberpunk" downloads only the files that differ, from GOG (the very
+/// build) or Steam (when its Mac version is the same one).
+enum GameData {
+    struct Entry { let size: Int64; let chunks: [(size: Int, md5: String)]; let group: String }
+    struct Expected { let version: String; let gogBuild: String; let files: [String: Entry] }
+    /// several game versions in one app: Games/<version>/ (game.plist + CyPortData.json); the starter put the one it
+    /// loaded in CYPORT_GAME_DIR. A one-version app has CyPortData.json next to its executable.
+    struct Version: Identifiable { let name: String; let dir: URL; let number: Double; var id: String { name } }
+    static let versions: [Version] = {
+        let games = Bundle.main.bundleURL.appendingPathComponent("Games")
+        let dirs = (try? FileManager.default.contentsOfDirectory(at: games, includingPropertiesForKeys: nil)) ?? []
+        return dirs.compactMap { d -> Version? in
+            guard let pl = NSDictionary(contentsOf: d.appendingPathComponent("game.plist")) else { return nil }
+            return Version(name: pl["version"] as? String ?? d.lastPathComponent, dir: d, number: (pl["number"] as? NSNumber)?.doubleValue ?? 0)
+        }.sorted { $0.number > $1.number }
+    }()
+    static let runningDir: URL? = ProcessInfo.processInfo.environment["CYPORT_GAME_DIR"].map { URL(fileURLWithPath: $0, isDirectory: true) }
+    static var running: Version? { versions.first { $0.dir.standardizedFileURL.path == runningDir?.standardizedFileURL.path } }
+    private static func load(_ u: URL?) -> Expected? {
+        guard let u, let d = try? Data(contentsOf: u),
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any], let fs = o["files"] as? [String: [String: Any]] else { return nil }
+        var files: [String: Entry] = [:]
+        for (p, f) in fs {
+            let ch = (f["chunks"] as? [[Any]] ?? []).compactMap { c -> (Int, String)? in
+                guard c.count == 2, let s = (c[0] as? NSNumber)?.intValue, let m = c[1] as? String else { return nil }; return (s, m) }
+            files[p] = Entry(size: (f["size"] as? NSNumber)?.int64Value ?? 0, chunks: ch, group: f["group"] as? String ?? "base")
+        }
+        return Expected(version: o["version"] as? String ?? "?", gogBuild: "\(o["gogBuild"] ?? "")", files: files)
+    }
+    /// the version the data is checked against / updated to: the running one, until Update picks another
+    static private(set) var expected: Expected? = load(runningDir?.appendingPathComponent("CyPortData.json")
+                                                       ?? Bundle.main.url(forResource: "CyPortData", withExtension: "json"))
+    static private(set) var selected: Version? = running
+    /// back to the running version (the Update screen closed without switching)
+    static func reset() { selected = running; expected = load(runningDir?.appendingPathComponent("CyPortData.json") ?? Bundle.main.url(forResource: "CyPortData", withExtension: "json")) }
+    static func select(_ v: Version) {
+        selected = v; expected = load(v.dir.appendingPathComponent("CyPortData.json"))
+        UserDefaults.standard.set(v.name, forKey: "CyPortGameVersion")    // the starter loads it when no data decides
+    }
+    /// "2.31a_mac" / "2.3.1" -> 2.31, "2.5_macOS_v2" -> 2.5 (CDPR's 2.31 is 2.3.1: below 2.5)
+    static func number(_ v: String) -> Double { let d = Game.versionDigits(v); return d.isEmpty ? 0 : Double(d.prefix(1) + "." + d.dropFirst()) ?? 0 }
+    static var appVersionName: String { expected.map { String($0.version.split(separator: "_").first ?? "") } ?? Game.appVersion }
+
+    enum Status: Equatable { case unknown, ok, windows, missing, update(files: Int, bytes: Int64) }
+
+    private static func size(_ u: URL) -> Int64? { (try? FileManager.default.attributesOfItem(atPath: u.path)[.size] as? NSNumber)?.int64Value }
+    private static func mtime(_ u: URL) -> Int { Int(((try? FileManager.default.attributesOfItem(atPath: u.path)[.modificationDate]) as? Date)?.timeIntervalSince1970 ?? 0) }
+    private static func exists(_ root: URL, _ p: String) -> Bool { FileManager.default.fileExists(atPath: root.appendingPathComponent(p).path) }
+
+    /// the files this folder should have: the base game, the voice languages it has, Phantom Liberty if it's there
+    static func wanted(_ root: URL) -> [String: Entry] {
+        guard let e = expected else { return [:] }
+        let ep1 = e.files.keys.contains { $0.hasPrefix("archive/Mac/ep1/") } && exists(root, "archive/Mac/ep1")
+        return e.files.filter { p, f in
+            if f.group == "base" { return true }
+            if f.group == "ep1" { return ep1 }
+            return exists(root, p) && (!f.group.hasPrefix("ep1:") || ep1)          // a voice language that's installed
+        }
+    }
+    /// a Windows copy (Steam / GOG / Epic for PC): its data is a different build and lacks the Mac shaders
+    static func isWindowsCopy(_ root: URL) -> Bool { exists(root, "archive/pc") && !exists(root, "archive/Mac") }
+
+    // files checked once and found matching: path -> "size:mtime:version" (so the next check doesn't read them again)
+    private static func cacheURL(_ root: URL) -> URL { root.appendingPathComponent(".cyport-verified.json") }
+    static func loadCache(_ root: URL) -> [String: String] {
+        (try? JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL(root)))) as? [String: String] ?? [:]
+    }
+    static func saveCache(_ root: URL, _ c: [String: String]) {
+        if let d = try? JSONSerialization.data(withJSONObject: c) { try? d.write(to: cacheURL(root), options: .atomic) }
+    }
+    static func stamp(_ root: URL, _ p: String) -> String {
+        let u = root.appendingPathComponent(p); return "\(size(u) ?? -1):\(mtime(u)):\(expected?.version ?? "")"
+    }
+    /// after an update: the files just written are known to match
+    static func markVerified(_ root: URL, _ paths: [String]) {
+        var c = loadCache(root); for p in paths { c[p] = stamp(root, p) }; saveCache(root, c)
+    }
+
+    /// does a file's content match? Store checksums (GOG md5 / Steam sha1 per chunk) or the app's own list (GOG md5)
+    static func matches(_ root: URL, _ p: String, checks: [DLCheck]) -> Bool {
+        guard !checks.isEmpty, let h = try? FileHandle(forReadingFrom: root.appendingPathComponent(p)) else { return false }
+        defer { try? h.close() }
+        for c in checks.sorted(by: { $0.offset < $1.offset }) {
+            guard (try? h.seek(toOffset: UInt64(c.offset))) != nil, let d = try? h.read(upToCount: c.size), d.count == c.size,
+                  (c.sha1 ? Hash.sha1(d) : Hash.md5(d)).hex == c.hash.lowercased() else { return false }
+        }
+        return true
+    }
+    static func checks(_ f: Entry) -> [DLCheck] {
+        var off: Int64 = 0
+        return f.chunks.map { c in defer { off += Int64(c.size) }; return DLCheck(offset: off, size: c.size, hash: c.md5, sha1: false) }
+    }
+    /// the files whose content defines the game version: compiled scripts and the tweak database (same for every store)
+    static let versionFiles = ["r6/cache/final.redscripts", "r6/cache/tweakdb.bin"]
+
+    /// quick (start screen): sizes, plus the content of the small files a new version always changes. Files checked
+    /// against a store before (cache) count as matching even if that store packs them a little differently from GOG.
+    static func quick(_ root: URL?) -> Status {
+        guard let root, expected != nil else { return .unknown }
+        if isWindowsCopy(root) { return .windows }
+        guard exists(root, "archive") else { return .missing }
+        let w = wanted(root); var cache = loadCache(root)
+        var n = 0, bytes: Int64 = 0
+        for (p, f) in w where cache[p] != stamp(root, p) && size(root.appendingPathComponent(p)) != f.size { n += 1; bytes += f.size }
+        if n == 0 {
+            for p in versionFiles {
+                guard let f = w[p], cache[p] != stamp(root, p) else { continue }
+                if matches(root, p, checks: checks(f)) { cache[p] = stamp(root, p); saveCache(root, cache) }
+                else { return .update(files: w.count, bytes: w.values.reduce(0) { $0 + $1.size }) }   // same sizes, other version
+            }
+        }
+        return n == 0 ? .ok : .update(files: n, bytes: bytes)
+    }
+
+    /// full check before an update: every file the store offers that this folder wants, content included (files
+    /// checked before are skipped). Returns the paths that need downloading.
+    static func needed(_ root: URL, offered: [DLFile], progress: @escaping (String) -> Void) async -> Set<String> {
+        let w = wanted(root); var cache = loadCache(root)
+        let byPath = Dictionary(offered.map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
+        var need = Set<String>(), toHash: [(String, [DLCheck])] = []
+        for p in w.keys {
+            guard let f = byPath[p] else { continue }                       // not offered (a language this store left out)
+            let st = stamp(root, p)
+            if size(root.appendingPathComponent(p)) != f.size { need.insert(p) }
+            else if cache[p] != st { toHash.append((p, f.checks.isEmpty ? checks(w[p]!) : f.checks)) }
+        }
+        let total = toHash.reduce(Int64(0)) { $0 + (byPath[$1.0]?.size ?? 0) }
+        if total > 0 { progress("Checking the game files on your phone (\(total / 1_000_000_000) GB)…") }
+        let results = await withTaskGroup(of: (String, Bool).self) { g -> [(String, Bool)] in
+            var out: [(String, Bool)] = [], it = toHash.makeIterator(), running = 0
+            func add() -> Bool { guard let (p, c) = it.next() else { return false }; g.addTask { (p, matches(root, p, checks: c)) }; return true }
+            while running < 3, add() { running += 1 }
+            for await r in g { out.append(r); progress("Checking the game files on your phone (\(out.count) of \(toHash.count))…"); _ = add() }
+            return out
+        }
+        for (p, ok) in results { if ok { cache[p] = stamp(root, p) } else { need.insert(p); cache[p] = nil } }
+        saveCache(root, cache)
+        return need
+    }
+
+    /// does the store offer the game data of the app's version? Decided by the version files (Steam and Epic only
+    /// have their newest version; GOG keeps every one).
+    static func checkVersion(_ p: DLPlan) throws {
+        guard let e = expected else { return }
+        let offered = Dictionary(p.files.map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
+        var same = 0, known = 0
+        for v in versionFiles {
+            guard let want = e.files[v], let f = offered[v] else { continue }
+            known += 1
+            let ours = checks(want)
+            if f.size == want.size && (f.checks.isEmpty || f.checks.first?.sha1 == true || f.checks.map(\.hash) == ours.map(\.hash)) { same += 1 }
+        }
+        let base = e.files.filter { $0.value.group == "base" }, have = base.keys.filter { offered[$0] != nil }.count
+        storeLog("version check: \(p.versionName): version files \(same)/\(known) match, \(have) of \(base.count) base files offered")
+        if known == 0 || same < known || have < base.count * 9 / 10 {
+            let n = number(p.versionName)
+            let which = n > 0 ? "Cyberpunk \(String(format: "%g", n))" : "A different version (\(p.versionName))"
+            throw StoreError("\(which) is what this store has, but this CyPort plays \(e.version). The game program inside the app and the game data must be the same version: use the CyPort build for that version (each version is its own app, they can be installed side by side).")
+        }
+    }
+    /// a store's plan cut down to the files this folder needs. Throws when the store offers another game version.
+    static func updatePlan(_ p: DLPlan, root: URL, progress: @escaping (String) -> Void) async throws -> DLPlan {
+        guard expected != nil else { throw StoreError("This CyPort build doesn't know its game data (no CyPortData.json).") }
+        try checkVersion(p)
+        let offered = Dictionary(p.files.map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
+        let need = await needed(root, offered: p.files, progress: progress)
+        var q = p; q.files = p.files.filter { need.contains($0.path) }
+        let missing = need.filter { offered[$0] == nil }
+        if !missing.isEmpty { storeLog("update: \(missing.count) needed files not offered by this store (e.g. \(missing.first!))") }
+        return q
     }
 }

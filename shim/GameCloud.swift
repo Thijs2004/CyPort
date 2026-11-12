@@ -114,6 +114,38 @@ enum GameCloud {
         try fm.moveItem(at: src, to: dst)
     }
 
+    /// "Import saves…" on the start screen: folders picked in Files - a save slot ("ManualSave-3") or any folder that has
+    /// slots in it (the Mac's or PC's "Cyberpunk 2077" saves folder, or the "CD Projekt Red" folder above it). Same
+    /// format on Mac, PC and phone. A phone slot with the same name goes to saves-backup-<date> first. Imported slots
+    /// get the current time, so a cloud sync sees them as the newest and doesn't put the cloud's copy back over them.
+    /// Returns the number of slots imported.
+    static func importSaves(from picked: [URL]) throws -> Int {
+        let fm = FileManager.default
+        func slots(in dir: URL, depth: Int) -> [URL] {
+            if isSlot(dir.lastPathComponent) { return [dir] }
+            guard depth > 0, let kids = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isDirectoryKey]) else { return [] }
+            return kids.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+                .flatMap { slots(in: $0, depth: depth - 1) }
+        }
+        try fm.createDirectory(at: saves, withIntermediateDirectories: true)
+        var n = 0
+        for url in picked {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            let found = slots(in: url, depth: 3)
+            for src in found where fm.fileExists(atPath: src.appendingPathComponent("sav.dat").path) {
+                let slot = src.lastPathComponent, dst = saves.appendingPathComponent(slot)
+                try backUp(slot: slot)
+                try fm.copyItem(at: src, to: dst)
+                let now = Date()
+                for f in localFiles().filter({ $0.rel.hasPrefix(slot + "/") }) { try? fm.setAttributes([.modificationDate: now], ofItemAtPath: f.url.path) }
+                n += 1
+            }
+            log("import saves from \(url.lastPathComponent): \(found.count) slot folder(s) found, \(n) imported so far")
+        }
+        return n
+    }
+
     /// once: an earlier version put old phone saves back and then sent them over the cloud's. The cloud's own
     /// copies were saved in CyPort/cloud-backup-<date> right before; they go back on the phone and back to GOG.
     /// Returns the slots to send.
@@ -237,10 +269,20 @@ enum GameCloud {
         guard !UserDefaults.standard.bool(forKey: key) else { return }
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd-HHmmss"
         let dir = appSupport.appendingPathComponent("CyPort/cloud-backup-\(source.rawValue.lowercased())-\(f.string(from: Date()))", isDirectory: true)
-        for it in items {
-            let dst = dir.appendingPathComponent(it.rel)
-            try FileManager.default.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try await it.fetch().write(to: dst)
+        // 8 downloads at a time: one by one took ~40 s for a full GOG cloud (102 files) with PLAY waiting on it
+        try await withThrowingTaskGroup(of: Void.self) { g in
+            var it = items.makeIterator(), running = 0
+            func add() -> Bool {
+                guard let item = it.next() else { return false }
+                g.addTask {
+                    let dst = dir.appendingPathComponent(item.rel)
+                    try FileManager.default.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try await item.fetch().write(to: dst)
+                }
+                return true
+            }
+            while running < 8, add() { running += 1 }
+            while try await g.next() != nil { _ = add() }
         }
         UserDefaults.standard.set(true, forKey: key)
         log("\(source.rawValue) cloud backed up to \(dir.lastPathComponent) (\(items.count) file(s))")
@@ -375,17 +417,30 @@ enum GOGCloud {
     static let clientID = "53652320436400298"
 
     /// the game's client secret: the 64 hex characters stored right after its client id in the executable
+    private static var cachedSecret: String?
     static func clientSecret() throws -> String {
-        guard let exe = Bundle.main.executableURL, let d = try? Data(contentsOf: exe, options: .alwaysMapped) else {
-            throw StoreError("Couldn't read the game's executable.")
-        }
+        if let s = cachedSecret { return s }
+        // the game program: Games/<version>/CyberpunkGame.dylib in an app with several versions (the main executable
+        // is then only the starter), else the main executable itself
+        var exes: [URL] = []
+        if let d = GameData.runningDir { exes.append(d.appendingPathComponent("CyberpunkGame.dylib")) }
+        exes += GameData.versions.map { $0.dir.appendingPathComponent("CyberpunkGame.dylib") }
+        if let e = Bundle.main.executableURL { exes.append(e) }
         let id = Data((clientID + "\0").utf8)
-        var from = d.startIndex
-        while let r = d.range(of: id, in: from..<d.endIndex) {
-            let s = d[r.upperBound...].prefix(64)
-            if s.count == 64, s.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) { return String(decoding: s, as: UTF8.self) }
-            from = r.upperBound
+        var readAny = false
+        for exe in exes {
+            guard let d = try? Data(contentsOf: exe, options: .alwaysMapped) else { continue }
+            readAny = true
+            var from = d.startIndex
+            while let r = d.range(of: id, in: from..<d.endIndex) {
+                let s = d[r.upperBound...].prefix(64)
+                if s.count == 64, s.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) {
+                    let v = String(decoding: s, as: UTF8.self); cachedSecret = v; return v
+                }
+                from = r.upperBound
+            }
         }
+        if !readAny { throw StoreError("Couldn't read the game's executable.") }
         throw StoreError("Couldn't find the game's cloud settings in its executable.")
     }
 

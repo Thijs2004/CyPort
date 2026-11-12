@@ -12,6 +12,7 @@
  */
 #import <UIKit/UIKit.h>
 #import <GameController/GameController.h>
+#import <malloc/malloc.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Metal/Metal.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
@@ -22,6 +23,7 @@
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <sys/sysctl.h>
+#include <sys/utsname.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
@@ -34,6 +36,7 @@
 #include <sys/resource.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include "PadLayout.h"
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
@@ -57,7 +60,7 @@ static NSInteger MSPref(NSString *k, NSInteger def);
 static void MSStatusCreate(void);
 static void MSTouchPadCreate(UIWindowScene *sc);
 static void MSTVRoute(void); static void MSTVObserve(void);
-static void MSLowLatencyWait(void); static void MSInputReport(void);
+static void MSLowLatencyWait(void); static void MSInputReport(void); static void MSPollBegin(void); static void MSFxReport(void); static void MSHookControllerEffects(void);
 /* TV out: the phone shows the picture too (TVMirror = NO: phone stays black, saves a little power) */
 @class CAMetalLayer; static CAMetalLayer *g_mirrorLayer; static _Atomic BOOL g_mirrorOn;
 static BOOL MSMirrorFit(UIView *v, CGRect *r);
@@ -88,28 +91,153 @@ static _Atomic BOOL g_inBackground;
 static NSHashTable *g_audioEngines;
 extern void _dispatch_main_queue_callback_4CF(void *msg);
 static void MSMainAsync(dispatch_block_t b) { CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, b); CFRunLoopWakeUp(CFRunLoopGetMain()); }
+/* Game on its own thread (GameThread, default on; start screen "Smooth controls"). The Mac game runs its whole loop on
+ * the thread that calls main(), and only lets the run loop turn once per frame (nextEventMatchingMask). On the iOS main
+ * thread that meant touches, controller input and the on-screen controls were only handled once per game frame - the
+ * controls ran at the game's frame rate and froze in every hitch. Like MeloNX / nxnative, the game now runs on a thread
+ * of its own (its own run loop, 64 MB stack) and the main thread stays free for UIKit. Everything that calls into the
+ * game - controller handlers, NSEvents, notifications, activation - is queued on the game's run loop (MSGameAsync)
+ * and runs at its next poll, in order; the AppKit stand-ins hop to the main thread for UIKit work (MSOnMain). */
+static BOOL g_offMain;                         /* decided at PLAY, before the game starts */
+static pthread_t g_gameThread; static CFRunLoopRef g_gameRL;
+static BOOL MSOnGameThread(void) { return g_offMain ? (g_gameRL && pthread_equal(pthread_self(), g_gameThread)) : pthread_main_np() != 0; }
+static void MSGameAsync(dispatch_block_t b) {           /* runs on the game's thread at its next event poll */
+    CFRunLoopRef rl = g_offMain && g_gameRL ? g_gameRL : CFRunLoopGetMain();
+    CFRunLoopPerformBlock(rl, kCFRunLoopCommonModes, b); CFRunLoopWakeUp(rl);
+}
+/* Notifications the game observes (controller / mouse connect, screen changes, ...) arrive on the thread that posts
+   them - mostly the main thread. Observers the game registers from its own thread get them there instead: selector
+   observers through a proxy, block observers wrapped (queue nil or the main queue, which the game meant as its own). */
+@interface MSGameObs : NSObject { @public __weak id target; SEL sel; } @end
+@implementation MSGameObs
+- (void)fire:(NSNotification *)n {
+    id t = target; SEL s = sel; if (!t) return;
+    if (MSOnGameThread()) { ((void (*)(id, SEL, id))objc_msgSend)(t, s, n); return; }
+    __weak id wt = t; MSGameAsync(^{ id tt = wt; if (tt) ((void (*)(id, SEL, id))objc_msgSend)(tt, s, n); });
+}
+@end
+static NSMapTable *g_gameObs;                           /* game's observer (weak) -> its proxies */
+static IMP g_ncAdd, g_ncAddBlock, g_ncRemove, g_ncRemoveNamed;
+static void ms_ncAdd(id self, SEL _cmd, id obs, SEL sel, NSNotificationName name, id obj) {
+    if (g_offMain && obs && MSOnGameThread()) {
+        MSGameObs *p = [MSGameObs new]; p->target = obs; p->sel = sel;
+        @synchronized (g_gameObs) {
+            NSMutableArray *a = [g_gameObs objectForKey:obs]; if (!a) { a = [NSMutableArray array]; [g_gameObs setObject:a forKey:obs]; }
+            [a addObject:p];
+        }
+        obs = p; sel = @selector(fire:);
+    }
+    ((void (*)(id, SEL, id, SEL, id, id))g_ncAdd)(self, _cmd, obs, sel, name, obj);
+}
+static id ms_ncAddBlock(id self, SEL _cmd, NSNotificationName name, id obj, NSOperationQueue *q, void (^b)(NSNotification *)) {
+    if (g_offMain && b && (!q || q == NSOperationQueue.mainQueue) && MSOnGameThread()) {
+        void (^inner)(NSNotification *) = [b copy];
+        b = ^(NSNotification *n) { if (MSOnGameThread()) inner(n); else MSGameAsync(^{ inner(n); }); };
+        q = nil;
+    }
+    return ((id (*)(id, SEL, id, id, id, id))g_ncAddBlock)(self, _cmd, name, obj, q, b);
+}
+static NSArray *MSGameObsOf(id obs, BOOL drop) {
+    if (!obs || !g_gameObs) return nil;
+    @synchronized (g_gameObs) { NSArray *a = [[g_gameObs objectForKey:obs] copy]; if (drop) [g_gameObs removeObjectForKey:obs]; return a; }
+}
+static void ms_ncRemove(id self, SEL _cmd, id obs) {
+    for (id p in MSGameObsOf(obs, YES)) ((void (*)(id, SEL, id))g_ncRemove)(self, _cmd, p);
+    ((void (*)(id, SEL, id))g_ncRemove)(self, _cmd, obs);
+}
+static void ms_ncRemoveNamed(id self, SEL _cmd, id obs, NSNotificationName name, id obj) {
+    for (id p in MSGameObsOf(obs, NO)) ((void (*)(id, SEL, id, id, id))g_ncRemoveNamed)(self, _cmd, p, name, obj);
+    ((void (*)(id, SEL, id, id, id))g_ncRemoveNamed)(self, _cmd, obs, name, obj);
+}
+static void MSHookNotificationsForGame(void) {
+    static BOOL done; if (done) return; done = YES;
+    g_gameObs = [NSMapTable weakToStrongObjectsMapTable];
+    Class c = NSNotificationCenter.class;
+    g_ncAdd = method_setImplementation(class_getInstanceMethod(c, @selector(addObserver:selector:name:object:)), (IMP)ms_ncAdd);
+    g_ncAddBlock = method_setImplementation(class_getInstanceMethod(c, @selector(addObserverForName:object:queue:usingBlock:)), (IMP)ms_ncAddBlock);
+    g_ncRemove = method_setImplementation(class_getInstanceMethod(c, @selector(removeObserver:)), (IMP)ms_ncRemove);
+    g_ncRemoveNamed = method_setImplementation(class_getInstanceMethod(c, @selector(removeObserver:name:object:)), (IMP)ms_ncRemoveNamed);
+}
 
 /* ---------------------------------------------------------------- screen info (C side uses this) */
 static double g_sw = 1366, g_sh = 1024, g_ss = 2, g_fps = 120;
 static double g_tvAspect;                    /* > 0: a TV was connected at launch, the game gets its shape (TV out) */
-static UIScreen *MSExternalScreen(void) { for (UIScreen *s in UIScreen.screens) if (s != UIScreen.mainScreen) return s; return nil; }
+static BOOL g_sizeLocked;                    /* the game is running: the size it was told never changes (see MSTVRoute) */
+static UIWindowScene *MSAppScene(void);
+/* The screen the app is shown on. On an iPhone Duo UIScreen.mainScreen stays the outer (folded) screen; unfolded, the
+   app's scene is on the inner screen, which UIKit lists as a second screen. */
+static UIScreen *MSPhoneScreen(void) { UIScreen *s = MSAppScene().screen; return s ?: UIScreen.mainScreen; }
+static int MSIsDuo(void) { static int d = -1; if (d < 0) { struct utsname u; d = uname(&u) == 0 && !strcmp(u.machine, "iPhone19,4"); } return d; }
+/* landscape, except on an iPhone Duo: there the phone may be held upright too, folded or unfolded (start screen: title,
+   options, PLAY at the bottom - shim/Launcher.swift; game: picture at the top, controller below it - shim/PadLayout.c).
+   Otherwise iOS keeps the app sideways and shrinks it into the inner screen. */
+static UIInterfaceOrientationMask MSAllowedOrientations(void) {
+    return MSIsDuo() ? UIInterfaceOrientationMaskAllButUpsideDown : UIInterfaceOrientationMaskLandscape;
+}
+int MacShimAllowUpright(void) { return MSIsDuo(); }       /* for the SwiftUI start screen */
+/* a view on the phone's screen described for shim/PadLayout.c (main thread). The iPhone Duo's outer screen: iOS keeps an
+   84 pt strip free along the whole side with the camera, but the camera only takes that side's corner (measured:
+   sideways top-left or bottom-right; upright the top-right corner, with the status pill below it down to ~156 pt) - the
+   layout keeps just that corner clear, and upright the picture starts below it. */
+static MSPadScreen MSPadScreenFor(UIView *v, double gw, double gh) {
+    CGSize S = v.bounds.size; UIEdgeInsets in = v.safeAreaInsets; UIScreen *scr = v.window.screen;
+    int inner = scr && scr == MSPhoneScreen() && scr != UIScreen.mainScreen;
+    MSPadScreen sc = { S.width, S.height, in.top, in.left, in.bottom, in.right, gw, gh, inner };
+    if (MSIsDuo() && !inner) {
+        if (S.width > S.height) {
+            if (in.left > 0)  { sc.left = 0;  sc.cutX0 = 0; sc.cutY0 = 0; sc.cutX1 = 95; sc.cutY1 = 72; }
+            else if (in.right > 0) { sc.right = 0; sc.cutX0 = S.width - 95; sc.cutY0 = S.height - 72; sc.cutX1 = S.width; sc.cutY1 = S.height; }
+        } else { sc.right = 0; sc.left = 0; sc.cutX0 = S.width - 81; sc.cutY0 = 0; sc.cutX1 = S.width; sc.cutY1 = 160; }   /* camera + status pill */
+    }
+    return sc;
+}
+/* a TV / external display: a screen that is neither the app's screen nor the main screen (an unfolded Duo also lists
+   its outer screen) and not a phone panel */
+static UIScreen *MSExternalScreen(void) {
+    UIScreen *p = MSPhoneScreen();
+    for (UIScreen *s in UIScreen.screens)
+        if (s != p && s != UIScreen.mainScreen && s.traitCollection.userInterfaceIdiom != UIUserInterfaceIdiomPhone) return s;
+    return nil;
+}
+static void MSLogScreens(NSString *why) {        /* main thread; logs only when something changed */
+    static NSString *last; UIScreen *p = MSPhoneScreen();
+    NSMutableArray *a = [NSMutableArray array];
+    for (UIScreen *s in UIScreen.screens)
+        [a addObject:[NSString stringWithFormat:@"%.0fx%.0f@%.0fx idiom %ld%@%@", s.bounds.size.width, s.bounds.size.height, s.nativeScale,
+                      (long)s.traitCollection.userInterfaceIdiom, s == UIScreen.mainScreen ? @" main" : @"", s == p ? @" app" : @""]];
+    NSString *line = [NSString stringWithFormat:@"%@ | game %.0fx%.0f pt%@", [a componentsJoinedByString:@", "], g_sw, g_sh, g_sizeLocked ? @" (fixed)" : @""];
+    if ([line isEqualToString:last]) return; last = line;
+    MSLogf(@"screen (%@): %@", why, line);
+}
 static void MSRefreshScreen(void) {
     MSOnMain(^{
-        UIScreen *s = UIScreen.mainScreen; g_sw = s.bounds.size.width; g_sh = s.bounds.size.height; g_ss = s.nativeScale; g_fps = (double)s.maximumFramesPerSecond;
+        UIScreen *s = MSPhoneScreen(); g_fps = (double)s.maximumFramesPerSecond;
+        if (!g_sizeLocked) {                          /* the scale is part of the size the game was told: fixed too */
+            double w = s.bounds.size.width, h = s.bounds.size.height; g_ss = s.nativeScale;
+            g_sw = MAX(w, h); g_sh = MIN(w, h);          /* landscape only */
+        }
         /* decided once, so the size the game was told never changes under it: same height (= same pixel cost) as
            the phone, the TV's width:height. TVOut = NO / TVShape = NO in macshim.plist turn it off. */
         static dispatch_once_t o; dispatch_once(&o, ^{
             UIScreen *x = MSExternalScreen();
             if (x && x.bounds.size.height > 0 && MSCfgD(@"TVOut", 1) != 0 && MSCfgD(@"TVShape", 1) != 0) g_tvAspect = x.bounds.size.width / x.bounds.size.height;
         });
-        if (g_tvAspect > 0) g_sw = round(g_sh * g_tvAspect);
+        if (g_tvAspect > 0 && !g_sizeLocked) g_sw = round(g_sh * g_tvAspect);
+        MSLogScreens(@"refresh");
     });
 }
+/* the game starts: from now on it keeps this size; folding/unfolding scales the picture to fit (MSTVRoute) */
+static void MSLockScreenSize(void) { MSRefreshScreen(); g_sizeLocked = YES; MSOnMain(^{ MSLogScreens(@"game starts"); }); }
 /* the phone's own window scene; with a second screen UIKit adds a scene for it, which must never get the game's
    windows (iOS only sends touches to windows in the app's scene) */
+static UIWindowScene *g_appScene;               /* set by MSSceneDelegate when the app's scene connects */
 static UIWindowScene *MSAppScene(void) {
-    for (UIScene *x in UIApplication.sharedApplication.connectedScenes)
-        if ([x isKindOfClass:UIWindowScene.class] && (((UIWindowScene *)x).screen == UIScreen.mainScreen || [x.session.role isEqualToString:UIWindowSceneSessionRoleApplication])) return (UIWindowScene *)x;
+    if (g_appScene) return g_appScene;
+    NSSet *all = UIApplication.sharedApplication.connectedScenes;
+    for (UIScene *x in all)
+        if ([x isKindOfClass:UIWindowScene.class] && [x.session.role isEqualToString:UIWindowSceneSessionRoleApplication]) return (UIWindowScene *)x;
+    for (UIScene *x in all)
+        if ([x isKindOfClass:UIWindowScene.class] && ((UIWindowScene *)x).screen == UIScreen.mainScreen) return (UIWindowScene *)x;
     return nil;
 }
 void MacShimScreenInfo(double *w, double *h, double *s, double *f) {
@@ -177,9 +305,9 @@ static CGRect MSUIFromAK(CGRect r) { double k = MSAKScale(); return CGRectMake(r
 - (CGFloat)backingScaleFactor { double s; MacShimScreenInfo(0, 0, &s, 0); return [MSConfig()[@"Retina2x"] isEqual:@NO] ? s : 2; }
 - (NSInteger)maximumFramesPerSecond { double f; MacShimScreenInfo(0, 0, 0, &f); return (NSInteger)f; }
 - (CGFloat)maximumExtendedDynamicRangeColorComponentValue {
-    __block CGFloat v = 1; MSOnMain(^{ id n = [UIScreen.mainScreen valueForKey:@"currentEDRHeadroom"]; if ([n respondsToSelector:@selector(doubleValue)]) v = [n doubleValue]; }); return v < 1 ? 1 : v; }
+    __block CGFloat v = 1; MSOnMain(^{ id n = [MSPhoneScreen() valueForKey:@"currentEDRHeadroom"]; if ([n respondsToSelector:@selector(doubleValue)]) v = [n doubleValue]; }); return v < 1 ? 1 : v; }
 - (CGFloat)maximumPotentialExtendedDynamicRangeColorComponentValue {
-    __block CGFloat v = 1; MSOnMain(^{ id n = [UIScreen.mainScreen valueForKey:@"potentialEDRHeadroom"]; if ([n respondsToSelector:@selector(doubleValue)]) v = [n doubleValue]; }); return v < 1 ? 1 : v; }
+    __block CGFloat v = 1; MSOnMain(^{ id n = [MSPhoneScreen() valueForKey:@"potentialEDRHeadroom"]; if ([n respondsToSelector:@selector(doubleValue)]) v = [n doubleValue]; }); return v < 1 ? 1 : v; }
 - (NSString *)localizedName { return @"iPad Display"; }
 - (NSDictionary *)deviceDescription {
     CGRect f = [self frame]; CGFloat s = [self backingScaleFactor];
@@ -385,14 +513,17 @@ static _Atomic int g_galaxyFailures;
 - (void)msButton:(BOOL)down right:(BOOL)r at:(CGPoint)p;
 - (void)msTouches:(NSSet<UITouch *> *)ts phase:(int)ph event:(UIEvent *)ev;
 @end
-static _Atomic int g_gcmCount;                   /* GameController mice connected (see MSAttachMouse) */
+static _Atomic int g_gcmCount;                   /* GameController mice that are really in use (see MSAttachMouse) */
+static _Atomic int g_gcmAttached;                /* GameController mice attached at all (AssistiveTouch's virtual one too) */
 @interface MSRootVC : UIViewController @end
 @implementation MSRootVC
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
-- (BOOL)prefersPointerLocked { return g_pointerLocked || g_gcmCount > 0; }   /* a locked pointer is what makes iOS send raw mouse motion */
+- (BOOL)prefersPointerLocked { return g_pointerLocked || g_gcmAttached > 0; }   /* a locked pointer is what makes iOS send raw mouse motion */
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return MSAllowedOrientations(); }
+- (void)viewDidLayoutSubviews { [super viewDidLayoutSubviews]; if (g_gameWin) MSMainAsync(^{ MSTVRoute(); }); }
+- (void)viewSafeAreaInsetsDidChange { [super viewSafeAreaInsetsDidChange]; if (g_gameWin) MSMainAsync(^{ MSTVRoute(); }); }
 @end
 void MacShimLogC(const char *what, const char *detail) { MSLogf(@"%s: %s", what, detail); }   /* for MacShimC.c */
 void MacShimSetPointerLocked(int locked) {
@@ -420,14 +551,68 @@ static CGPoint MSToCocoa(CGPoint p, UIView *v) { double k = MSAKScale(); return 
 /* The game's mouse gate: GameView's mouseDown:/mouseMoved:/scrollWheel: drop every event unless a byte in the engine's
  * global input state (0x10853fac0 + 0x39, getter 0x102e2c184) is set. On a Mac it is set once a real mouse is in use;
  * nothing on the phone sets it, so touches never moved the cursor. The shim sets it whenever a touch acts as the mouse. */
-#define MS_MOUSE_GATE 0x10853faf9ULL
-static intptr_t MSExeSlide(void) {
-    static intptr_t s = -1;
-    if (s == -1) for (uint32_t k = 0; k < _dyld_image_count(); k++) if (_dyld_get_image_header(k)->filetype == MH_EXECUTE) { s = _dyld_get_image_vmaddr_slide(k); break; }
+/* The game's own Mach-O. A one-version app runs the game as its executable; the several-versions app (Games/<version>/
+   in the bundle) runs a small starter and loads the game as CyberpunkGame.dylib (MacShimMain sets g_gameHeader). */
+static const struct mach_header *g_gameHeader; static NSString *g_gameDir;
+static const struct mach_header *MSGameHeader(void) {
+    if (g_gameHeader) return g_gameHeader;
+    for (uint32_t k = 0; k < _dyld_image_count(); k++) { const struct mach_header *x = _dyld_get_image_header(k); if (x && x->filetype == MH_EXECUTE) return x; }
+    return NULL;
+}
+static intptr_t MSGameSlide(void) {
+    const struct mach_header *h = MSGameHeader();
+    for (uint32_t k = 0; k < _dyld_image_count(); k++) if (_dyld_get_image_header(k) == h) return _dyld_get_image_vmaddr_slide(k);
+    return 0;
+}
+static intptr_t MSExeSlide(void) {                 /* cached per game image (the starter's own image doesn't count) */
+    static const struct mach_header *for_; static intptr_t s;
+    const struct mach_header *h = MSGameHeader();
+    if (h != for_) { s = MSGameSlide(); for_ = h; }
     return s;
 }
-static int MSMouseGate(void) { return *(volatile uint8_t *)(MS_MOUSE_GATE + MSExeSlide()); }
+/* Addresses inside one exact game program (they move with every game version). build.sh stores the original
+ * executable's md5 in Info.plist (CyPortGameExe); an unknown game program gets 0 for each, and the code that needs one
+ * stays off (logged) instead of writing into the wrong place. */
+typedef struct { const char *exeMD5, *name; uint64_t mouseGate, playerInputs, freeEntry, medOwns; } MSGameAddrs;
+static const MSGameAddrs kMSGames[] = {
+    { "97345cfb45e7e5a03c5ca8d7adb1733f", "2.31a (GOG Mac)", 0x10853faf9, 0x10853fac0, 0x100012cac, 0x10000f434 },
+    /* 2.5: the input state is a function-local static now (getter 0x10190339c, built on first use; gate getter
+       0x101903ecc = ldrb [x0,#0x39] as before). Free hook not ported (Quarantine is an opt-in debug aid). */
+    { "02276ae5fd350073a0dd7babf0839145", "2.5 (GOG Mac)", 0x108601f91, 0x108601f58, 0, 0 },
+};
+static BOOL MSIsMultiGame(void) {                         /* Games/<version>/ in the bundle: the starter picks one */
+    static int m = -1;
+    if (m < 0) m = [NSFileManager.defaultManager fileExistsAtPath:[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Games"]];
+    return m;
+}
+static const MSGameAddrs *MSGame(void) {
+    static const MSGameAddrs *g; static BOOL done;
+    static const MSGameAddrs pending = { "", "not loaded yet" };
+    if (done) return g;
+    if (MSIsMultiGame() && !g_gameDir) return &pending;      /* the starter hasn't picked the game yet: nothing to touch */
+    done = YES;
+    NSString *md5 = g_gameDir ? [NSDictionary dictionaryWithContentsOfFile:[g_gameDir stringByAppendingPathComponent:@"game.plist"]][@"CyPortGameExe"] : nil;
+    if (!md5) md5 = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CyPortGameExe"];
+    for (size_t i = 0; i < sizeof kMSGames / sizeof *kMSGames; i++) if ([md5 isEqualToString:@(kMSGames[i].exeMD5)]) g = &kMSGames[i];
+    if (!g) {
+        /* Steam 2.5.0 (Mac): recognised by its mouse-gate getter at 0x103091cf0 (ldrb [0x109cd3458] & ldrb [0x109cd3459];
+           found by AltDoug, PR #9), since its md5 isn't known here. Player inputs not known -> the 8 s wait fallback. */
+        static const uint32_t steam250[] = { 0xd0036208, 0x39516108, 0xd0036209, 0x39516529, 0x0a090108, 0x12000100, 0xd65f03c0 };
+        static const MSGameAddrs steam = { "", "2.5.0 (Steam Mac)", 0x109cd3459, 0, 0, 0 };
+        const void *at = (const void *)(0x103091cf0ULL + MSGameSlide()); Dl_info di;
+        if (dladdr(at, &di) && di.dli_fbase == (void *)MSGameHeader() && !memcmp(at, steam250, sizeof steam250)) g = &steam;
+    }
+    if (!g && !md5) g = &kMSGames[0];                        /* built before the key existed: that was always 2.31a */
+    static const MSGameAddrs none = { "", "unknown" };
+    if (!g) g = &none;
+    MSLogf(@"game program: %s%@", g->name, g == &none ? [NSString stringWithFormat:@" (md5 %@) - mouse gate, controller-ready check and free hook are off", md5] : @"");
+    return g;
+}
+#define MS_MOUSE_GATE (MSGame()->mouseGate)
+static int MSMouseGate(void) { return MS_MOUSE_GATE ? *(volatile uint8_t *)(MS_MOUSE_GATE + MSExeSlide()) : 1; }
+static BOOL MSPadOnly(void);
 static void MSOpenMouseGate(void) {
+    if (MSPadOnly() || !MS_MOUSE_GATE) return;
     volatile uint8_t *g = (volatile uint8_t *)(MS_MOUSE_GATE + MSExeSlide());
     if (!*g) { *g = 1; static int n; if (n++ < 5) MSLogf(@"mouse gate opened (touch = mouse)"); }
 }
@@ -443,9 +628,23 @@ static __weak MSHostView *g_hostView;           /* the game's view, for the Auto
    goes out each frame and the rest follows, so no movement is lost. LookSmooth (0-0.9, default 0.35) = how much
    is held back per frame. */
 static CGPoint g_lookPending; static os_unfair_lock g_lookLock = OS_UNFAIR_LOCK_INIT;
-static int g_lookStick = -1;                          /* 1: swipe drives the right stick (default), 0: mouse look */
+static int g_lookStick = -1;                          /* 1: swipe drives the right stick, 0: mouse look */
 static double g_lookFingerAt;                         /* last time the look finger moved */
+/* Camera on the touch pad: 2 = floating right stick (default, like DK Bananza / Mario Kart World: centred where the
+   thumb lands, dragged along past its edge, the tilt is the camera speed - the same at any frame rate), 1 = swipe
+   (finger speed -> right stick), 0 = mouse look. Start screen "Camera" (CyPortLookMode), plist LookMode
+   stick / swipe / mouse overrides. */
+static int MSLookMode(void) {
+    static int m = -1; if (m >= 0) return m;
+    id v = MSConfig()[@"LookMode"];
+    if ([v isEqual:@"mouse"]) m = 0; else if ([v isEqual:@"swipe"]) m = 1; else if ([v isEqual:@"stick"]) m = 2;
+    else { NSNumber *n = [NSUserDefaults.standardUserDefaults objectForKey:@"CyPortLookMode"]; m = n && n.intValue >= 0 && n.intValue <= 2 ? n.intValue : 2; }
+    g_lookStick = m != 0;
+    MSLogf(@"touch pad: camera = %@", m == 2 ? @"floating right stick" : m == 1 ? @"swipe" : @"mouse look");
+    return m;
+}
 static void MSLookFlushStick(double dt);
+static void MSPadFlushCoalesced(void);
 static void MSGCMouseFlush(void);
 static double MSLookSensitivity(void);
 static void MSLookAdd(CGPoint d) { os_unfair_lock_lock(&g_lookLock); g_lookPending.x += d.x; g_lookPending.y += d.y; os_unfair_lock_unlock(&g_lookLock); }
@@ -486,6 +685,10 @@ static CGPoint MSTouchIn(UITouch *t, UIView *host) {
  * frame); drag = scroll wheel (the user agreement must be scrolled to the end); hold still 0.35 s, then drag = mouse
  * drag (sliders); two-finger tap = right click. ScrollSpeed (default 1.5) scales the scrolling. */
 static UITouch *g_fTouch; static CGPoint g_fStart, g_fLast; static int g_fMode, g_fFingers; static unsigned g_fGen; static BOOL g_fEntered;
+/* a touch whose end never reached us (its view was hidden or covered mid-touch): without this check the finger it
+   belonged to stayed "down" for good and every later touch was ignored - stick dead, menu taps dead */
+static BOOL MSTouchGone(UITouch *t) { return !t || t.phase == UITouchPhaseEnded || t.phase == UITouchPhaseCancelled; }
+static BOOL g_realPad;                /* defined with the controller code below */
 static double g_fBeganAt, g_gcmButtonAt;          /* AssistiveTouch: a mouse click also arrives as a tap - keep only the click */
 static void MSAfter(double s, dispatch_block_t b) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(s * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{ MSMainAsync(b); });
@@ -529,6 +732,7 @@ static void MSLeftPress(int by, BOOL down) {
 }
 - (void)msMouseTap:(UITouch *)t phase:(int)ph {
     if (ph == 0) {
+        if (g_atTouch && MSTouchGone(g_atTouch)) { g_atTouch = nil; if (!g_atIgnore) MSLeftPress(1, NO); }
         if (g_atTouch) return;
         g_atTouch = t; g_atIgnore = g_leftBy != 0;          /* the GC button got this click first */
         static int n; if (n++ < 6) MSLogf(@"mouse: tap (left click)%@", g_atIgnore ? @" - twin of a button press, ignored" : @"");
@@ -541,6 +745,19 @@ static void MSLeftPress(int by, BOOL down) {
 - (void)msFinger:(UITouch *)t phase:(int)ph event:(UIEvent *)ev {
     if (g_gcmCount) { [self msMouseTap:t phase:ph]; return; }
     CGPoint p = MSTouchIn(t, self);
+    if (ph == 0 && g_fTouch && MSTouchGone(g_fTouch)) {           /* its end got lost: let go of it first */
+        if (g_fMode == 2) [self msButton:NO right:NO at:g_fLast];
+        g_fTouch = nil; g_fGen++;
+    }
+    /* Playing with a controller, the screen is not an input: a palm or thumb resting on it used to reach the game as
+       the mouse (hold = left click = shooting, drag = scroll wheel = weapon switching) and flipped the game over to
+       keyboard + mouse - prompts changed and the pad seemed to stop working. Menus still take taps.
+       TouchWithController = YES brings the old behaviour back. */
+    static int touchPad = -1; if (touchPad < 0) touchPad = MSCfgD(@"TouchWithController", 0) != 0;
+    if (ph == 0 && g_realPad && g_pointerLocked && !touchPad) {
+        static int n; if (n++ < 3) MSLogf(@"touch: ignored in gameplay while a controller is connected");
+        return;
+    }
     if (ph == 0) {
         g_fBeganAt = CACurrentMediaTime();
         MSOpenMouseGate();
@@ -623,19 +840,23 @@ static void MSLeftPress(int by, BOOL down) {
 - (CALayer *)layer { return _layer ?: _host.layer; }
 - (void)setLayer:(CALayer *)l {
     _layer = l; if (!l) return;
-    MSOnMain(^{ l.contentsScale = UIScreen.mainScreen.nativeScale; l.frame = self.host.bounds; [self.host.layer addSublayer:l]; });
+    MSOnMain(^{ l.contentsScale = MSPhoneScreen().nativeScale; l.frame = self.host.bounds; [self.host.layer addSublayer:l]; });
     /* start screen "Performance overlay: Detailed" also turns on Apple's Metal HUD for the game's layer */
     if ([l isKindOfClass:CAMetalLayer.class] && MSPref(@"MacShimOverlay", 1) == 2 && [l respondsToSelector:NSSelectorFromString(@"setDeveloperHUDProperties:")])
         [l setValue:@{ @"mode": @"default" } forKey:@"developerHUDProperties"];
 }
 - (void)setHidden:(BOOL)h { _hidden = h; MSOnMain(^{ self.host.hidden = h; }); }
 - (void)msLayoutFromHost {
+    if (g_offMain && !NSThread.isMainThread) { MSOnMain(^{ [self msLayoutFromHost]; }); return; }   /* UIKit part on the main thread */
     CGRect b = _host.bounds, ab = MSAKFromUI(b); BOOL changed = !CGSizeEqualToSize(ab.size, _frame.size);
     if (_layer) { [CATransaction begin]; [CATransaction setDisableActions:YES]; _layer.frame = b; [CATransaction commit]; }
     if (changed) {
         _frame.size = ab.size;
-        if ([self respondsToSelector:@selector(viewDidChangeBackingProperties)]) ((void (*)(id, SEL))objc_msgSend)(self, @selector(viewDidChangeBackingProperties));
-        id w = self.window; if (w && [w valueForKey:@"contentView"] == self) ((void (*)(id, SEL))objc_msgSend)(w, NSSelectorFromString(@"msContentResized"));
+        dispatch_block_t tell = ^{                           /* the game's part on the game's thread */
+            if ([self respondsToSelector:@selector(viewDidChangeBackingProperties)]) ((void (*)(id, SEL))objc_msgSend)(self, @selector(viewDidChangeBackingProperties));
+            id w = self.window; if (w && [w valueForKey:@"contentView"] == self) ((void (*)(id, SEL))objc_msgSend)(w, NSSelectorFromString(@"msContentResized"));
+        };
+        if (MSOnGameThread()) tell(); else MSGameAsync(tell);
     }
 }
 - (void)addTrackingArea:(NSTrackingArea *)a { [_trackingAreas addObject:a]; }
@@ -649,6 +870,27 @@ static void MSLeftPress(int by, BOOL down) {
 - (BOOL)isHidden { return _hidden; }
 - (BOOL)canBecomeKeyView { return YES; } - (BOOL)mouseDownCanMoveWindow { return NO; } - (BOOL)isFlipped { return NO; }
 @end
+
+/* AppKit pieces the 2.5 game program links (2.31a didn't): text attributes, NSRectFill and a few controls the game
+   subclasses (NSButton, NSScroller) or creates for Mac-only windows. Plain stand-ins: unknown calls are logged and
+   return 0 (MSBase), views behave like NSView. */
+NSString *const NSFontAttributeName = @"NSFont";
+NSString *const NSForegroundColorAttributeName = @"NSColor";
+__attribute__((visibility("default"))) void NSRectFill(CGRect r) { (void)r; }
+@interface NSColor : MSBase @end
+@implementation NSColor @end
+@interface NSFont : MSBase @end
+@implementation NSFont @end
+@interface NSBezierPath : MSBase @end
+@implementation NSBezierPath @end
+@interface NSButton : NSView @end
+@implementation NSButton @end
+@interface NSScroller : NSView @end
+@implementation NSScroller @end
+@interface NSScrollView : NSView @end
+@implementation NSScrollView @end
+@interface NSTextView : NSView @end
+@implementation NSTextView @end
 
 /* ---------------------------------------------------------------- NSWindow / NSWindowController */
 @interface NSWindow : NSResponder
@@ -670,7 +912,7 @@ static void MSLeftPress(int by, BOOL down) {
         /* in the app's window scene: iOS only delivers touches to windows that belong to a scene (one made with
            initWithFrame: is drawn but never gets a touch - touch-as-mouse never reached the game) */
         UIWindowScene *sc = MSAppScene();
-        self->_uiWindow = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+        self->_uiWindow = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:MSPhoneScreen().bounds];
         MSLogf(@"game window created %@", sc ? @"in the app's scene" : @"WITHOUT a scene (no touches)");
         self->_uiWindow.rootViewController = [MSRootVC new]; self->_uiWindow.backgroundColor = UIColor.blackColor;
     });
@@ -736,7 +978,7 @@ static void MSLeftPress(int by, BOOL down) {
     if ([_delegate respondsToSelector:will]) ((void (*)(id, SEL, id))objc_msgSend)(_delegate, will, n);
     [NSNotificationCenter.defaultCenter postNotification:n];
     _styleMask = enter ? (_styleMask | MSStyleFullScreen) : (_styleMask & ~MSStyleFullScreen);
-    MSMainAsync(^{
+    MSGameAsync(^{
         if ([self->_delegate respondsToSelector:did]) ((void (*)(id, SEL, id))objc_msgSend)(self->_delegate, did, n);
     });
 }
@@ -758,6 +1000,8 @@ static void MSLeftPress(int by, BOOL down) {
  * view keeps its bounds (the size AppKit was told), only a transform scales it, so the engine never sees a resize.
  * TVOut = NO in macshim.plist turns this off. */
 static UIWindow *g_tvWin; static UIView *g_tvPad;
+static CGFloat g_stickR = 60;                    /* on-screen stick radius (PadLayout: smaller on small screens) */
+static double g_stBottomGap = 4;                 /* the FPS overlay's distance from the bottom edge (above a home bar) */
 /* Mirror: every frame the game presents is also copied (one GPU blit, same command queue, right after the game's
    command buffer) into a Metal layer on the phone, so the picture is on both screens. Touches map onto the picture. */
 static BOOL MSMirrorFit(UIView *v, CGRect *r) {
@@ -775,7 +1019,7 @@ static BOOL MSMirrorFit(UIView *v, CGRect *r) {
     self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     if (MSCfgD(@"TVMirror", 1) != 0) {
         CAMetalLayer *m = [CAMetalLayer layer]; m.device = MTLCreateSystemDefaultDevice(); m.framebufferOnly = NO; m.opaque = YES;
-        m.contentsGravity = kCAGravityResizeAspect; m.maximumDrawableCount = 3; m.contentsScale = UIScreen.mainScreen.scale; m.frame = self.bounds;
+        m.contentsGravity = kCAGravityResizeAspect; m.maximumDrawableCount = 3; m.contentsScale = MSPhoneScreen().scale; m.frame = self.bounds;
         [self.layer insertSublayer:m atIndex:0]; g_mirrorLayer = m;
     }
     UILabel *l = [UILabel new]; l.numberOfLines = 2; l.textAlignment = NSTextAlignmentCenter; self.note = l;
@@ -795,13 +1039,23 @@ static BOOL MSMirrorFit(UIView *v, CGRect *r) {
 - (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e     { [g_hostView msTouches:t phase:2 event:e]; }
 - (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [g_hostView msTouches:t phase:2 event:e]; }
 @end
+/* where the picture goes in a view (shim/PadLayout.c): scaled to fit, centred; upright on an unfolded iPhone Duo at the top,
+   below the camera / status pill, with the controller below it */
+static CGRect MSPictureRect(UIView *into, double w, double h) {
+    MSRect r = MSPadPicture(MSPadScreenFor(into, w, h)); return CGRectMake(r.x, r.y, r.w, r.h);
+}
+static BOOL MSHostFitted(UIView *host, UIView *into) {
+    double w, h; MacShimScreenInfo(&w, &h, 0, 0); CGRect r = MSPictureRect(into, w, h);
+    return host.superview == into && host.autoresizingMask == UIViewAutoresizingNone && fabs(host.center.x - CGRectGetMidX(r)) < 0.5 &&
+           fabs(host.center.y - CGRectGetMidY(r)) < 0.5 && fabs(host.transform.a - r.size.width / w) < 0.001;
+}
 static void MSFitHost(UIView *host, UIView *into) {
     double w, h; MacShimScreenInfo(&w, &h, 0, 0);
     if (host.superview != into) [into insertSubview:host atIndex:0];
     host.autoresizingMask = UIViewAutoresizingNone; host.transform = CGAffineTransformIdentity;
     host.bounds = CGRectMake(0, 0, w, h);
-    CGSize c = into.bounds.size; CGFloat k = MIN(c.width / w, c.height / h); if (!(k > 0)) k = 1;
-    host.center = CGPointMake(c.width / 2, c.height / 2); host.transform = CGAffineTransformMakeScale(k, k);
+    CGRect r = MSPictureRect(into, w, h); CGFloat k = r.size.width / w; if (!(k > 0)) k = 1;
+    host.center = CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)); host.transform = CGAffineTransformMakeScale(k, k);
 }
 static void MSTVRoute(void) {                                     /* main thread */
     NSWindow *gw = g_gameWin; MSHostView *host = gw.contentView.host; UIView *phone = gw.uiWindow.rootViewController.view;
@@ -843,7 +1097,15 @@ static void MSTVRoute(void) {                                     /* main thread
         MSFitHost(host, phone);
         g_tvWin.hidden = YES; g_tvWin = nil;
         MSLogf(@"TV out: external display gone, game back on the phone");
+    } else if (g_sizeLocked && !MSHostFitted(host, phone)) {
+        /* the phone's screen changed under the running game (iPhone Duo folded/unfolded, turned upright): same picture,
+           scaled to fit */
+        MSFitHost(host, phone);
+        MSLogf(@"screen: game picture %.0fx%.0f pt fitted to the phone's %.0fx%.0f pt at %.0f,%.0f (scale %.3f)", g_sw, g_sh,
+               phone.bounds.size.width, phone.bounds.size.height, host.frame.origin.x, host.frame.origin.y, host.transform.a);
     }
+    g_stBottomGap = phone.safeAreaInsets.bottom > 0 ? 16 : 4;
+    MSLogScreens(@"route");
 }
 static void MSTVObserve(void) {
     static BOOL done; if (done) return; done = YES;
@@ -869,6 +1131,7 @@ static void MSTVObserve(void) {
 - (void)windowDidLoad {} - (void)close { [_window close]; }
 @end
 
+
 /* ---------------------------------------------------------------- NSApplication + UIKit app delegate */
 static NSApplication *g_app;
 static BOOL g_uikitUp;                          /* UIApplicationMain is already running (MSBootUIKit) */
@@ -891,6 +1154,9 @@ static BOOL MSCalledFromGameMain(void *ret);
 - (BOOL)isActive { return _active; } - (BOOL)isHidden { return NO; } - (BOOL)isRunning { return YES; }
 - (BOOL)setActivationPolicy:(NSInteger)p { _activationPolicy = p; return YES; }
 - (void)activateIgnoringOtherApps:(BOOL)f {} - (void)stop:(id)s {}
+static void MSHookGameMice(id delegate);
+static void MSPadOnlyCheck(void);
+static void MSAnnounceEarlyPads(void);
 /* The game runs its own loop and calls [NSApp finishLaunching] itself; AppKit answers with the delegate's
  * applicationWill/DidFinishLaunching:. That's where the game registers for controller and mouse connect notifications
  * (-> setupController: installs its gamepad callbacks), its key monitor and a timer. This was an empty stub, so no
@@ -903,9 +1169,11 @@ static BOOL MSCalledFromGameMain(void *ret);
     NSNotification *n = [NSNotification notificationWithName:@"NSApplicationDidFinishLaunchingNotification" object:self];
     if ([d respondsToSelector:@selector(applicationWillFinishLaunching:)]) ((void (*)(id, SEL, id))objc_msgSend)(d, @selector(applicationWillFinishLaunching:), n);
     [NSNotificationCenter.defaultCenter postNotificationName:@"NSApplicationWillFinishLaunchingNotification" object:self];
+    MSHookGameMice(d);
     if ([d respondsToSelector:@selector(applicationDidFinishLaunching:)]) ((void (*)(id, SEL, id))objc_msgSend)(d, @selector(applicationDidFinishLaunching:), n);
     [NSNotificationCenter.defaultCenter postNotification:n];
     MSLogf(@"finishLaunching: done");
+    MSAnnounceEarlyPads();
 } - (void)hide:(id)s {} - (void)unhide:(id)s {} - (void)hideOtherApplications:(id)s {}
 - (void)setMainMenu:(id)m { _mainMenu = m; }
 - (NSArray *)orderedWindows { return [_windows copy]; }
@@ -918,7 +1186,7 @@ static BOOL MSCalledFromGameMain(void *ret);
         MSLogf(@"[NSApp run] with UIKit up; entering the game's applicationDidFinishLaunching");
         NSNotification *n = [NSNotification notificationWithName:@"NSApplicationDidFinishLaunchingNotification" object:self];
         if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive)
-            MSMainAsync(^{ [self msBecomeActive:YES]; });     /* delivered on the game's first event poll */
+            MSGameAsync(^{ [self msBecomeActive:YES]; });     /* delivered on the game's first event poll */
         (void)n; [self finishLaunching];
         for (;;) CFRunLoopRun();
     }
@@ -929,14 +1197,16 @@ static BOOL MSCalledFromGameMain(void *ret);
     /* The game polls this every frame (usually with a past date). Spin the main run loop once so UIKit can deliver
        touches, key presses, display-link and scene callbacks; our input arrives through MSDispatch, so return nil. */
     NSTimeInterval t = d ? [d timeIntervalSinceNow] : 0; if (t < 0) t = 0; if (t > 0.1) t = 0.1;
-    if ([NSThread isMainThread]) {
+    if (MSOnGameThread()) {
         if (g_inBackground) {
             MSLogf(@"background: game frozen");
             while (g_inBackground) @autoreleasepool { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, false); }
             MSLogf(@"foreground: game continues");
         }
-        static BOOL awake; if (!awake) { awake = YES; UIApplication.sharedApplication.idleTimerDisabled = YES; }  /* a controller doesn't count as touching the screen: don't auto-lock mid-game */
+        static BOOL awake; if (!awake) { awake = YES; MSOnMain(^{ UIApplication.sharedApplication.idleTimerDisabled = YES; }); }  /* a controller doesn't count as touching the screen: don't auto-lock mid-game */
         MSLowLatencyWait();
+        MSPollBegin();
+        MSPadOnlyCheck();
         /* Handle EVERY pending run-loop source, not just one: returnAfterSourceHandled made it one source per game frame,
            so touches queued up behind display-link / timer / block sources and reached the game late - the laggy
            buttons and sticks. Bounded so a flood can't stall the frame. */
@@ -945,8 +1215,9 @@ static BOOL MSCalledFromGameMain(void *ret);
         {   /* camera swipe: hand the pending movement to the game, at most once per ~frame */
             static double lastFlush, keep = -1; double tn = CACurrentMediaTime();
             if (keep < 0) { keep = MSCfgD(@"LookSmooth", 0.35); if (keep < 0) keep = 0; if (keep > 0.9) keep = 0.9; }
-            if (g_lookStick < 0) g_lookStick = ![MSConfig()[@"LookMode"] isEqual:@"mouse"];
-            if (g_lookStick && tn - lastFlush > 0.006) { MSLookFlushStick(lastFlush ? tn - lastFlush : 1 / 30.0); lastFlush = tn; }
+            int lm = MSLookMode();
+            if (lm == 2) {}                              /* floating stick: set straight from the touches */
+            else if (g_lookStick && tn - lastFlush > 0.006) { MSLookFlushStick(lastFlush ? tn - lastFlush : 1 / 30.0); lastFlush = tn; }
             else if (!g_lookStick && tn - lastFlush > 0.006) {
                 os_unfair_lock_lock(&g_lookLock); CGPoint d = CGPointMake(g_lookPending.x * (1 - keep), g_lookPending.y * (1 - keep));
                 if (fabs(g_lookPending.x) < 0.05 && fabs(g_lookPending.y) < 0.05) d = g_lookPending;     /* tail: send the rest */
@@ -955,13 +1226,14 @@ static BOOL MSCalledFromGameMain(void *ret);
             }
             MSGCMouseFlush();
         }
+        MSPadFlushCoalesced();                           /* sticks / analog triggers: newest value, once per frame */
         MSInputReport();
         double now = CACurrentMediaTime();
-        if (g_mqAsked > g_mqBeat && now - g_mqAsked > 0.25) {         /* main queue starved: run its blocks here */
+        if (!g_offMain && g_mqAsked > g_mqBeat && now - g_mqAsked > 0.25) {         /* main queue starved: run its blocks here */
             static int n; if (n++ < 3) MSLogf(@"main dispatch queue not serviced for %.1f s - draining it from the game loop", now - g_mqAsked);
             _dispatch_main_queue_callback_4CF(NULL);
         }
-        if (now - g_mqAsked > 0.5) { g_mqAsked = now; dispatch_async(dispatch_get_main_queue(), ^{ g_mqBeat = CACurrentMediaTime(); }); }
+        if (!g_offMain && now - g_mqAsked > 0.5) { g_mqAsked = now; dispatch_async(dispatch_get_main_queue(), ^{ g_mqBeat = CACurrentMediaTime(); }); }
     }
     else if (t > 0) [NSThread sleepForTimeInterval:t];
     return nil;
@@ -998,9 +1270,10 @@ static BOOL MSCalledFromGameMain(void *ret);
 - (void)setDelegate:(id)d {
     _delegate = d;
     /* activation that arrived before the game had a delegate (UIKit boots first) is delivered now */
-    if (d && g_activePending) { g_activePending = NO; MSMainAsync(^{ [self msBecomeActive:YES]; }); }
+    if (d && g_activePending) { g_activePending = NO; MSGameAsync(^{ [self msBecomeActive:YES]; }); }
 }
 - (void)msBecomeActive:(BOOL)a {
+    if (!MSOnGameThread()) { MSGameAsync(^{ [self msBecomeActive:a]; }); return; }
     if (a && !_delegate) { g_activePending = YES; MSLogf(@"app active before the game set its delegate - held back"); return; }
     if (!a) g_activePending = NO;
     if (a == _active) return; _active = a; MSLogf(@"game told: app %@ (delegate %@)", a ? @"active" : @"inactive", NSStringFromClass([_delegate class]));
@@ -1035,11 +1308,16 @@ static BOOL MSCalledFromGameMain(void *ret);
 }
 - (void)applicationDidBecomeActive:(UIApplication *)app { MSLogf(@"app became active"); MSRefreshScreen(); if (NSApp) [(NSApplication *)NSApp msBecomeActive:YES]; }
 - (void)applicationWillResignActive:(UIApplication *)app { [(NSApplication *)NSApp msBecomeActive:NO]; }
+- (BOOL)msWaitForScene { return NO; }
 - (void)applicationWillTerminate:(UIApplication *)app {
+    /* Swiping the app away while the game runs on its own thread (frozen in the background): the game's
+       applicationWillTerminate: ran the engine shutdown here on the main thread and the engine trapped in it (SIGTRAP,
+       a crash report on every swipe-close). Saves are already on disk when the game writes them; just leave. */
+    if (g_offMain) { MSLogf(@"app closed by the user - leaving without the engine's shutdown"); _exit(0); }
     id d = [(NSApplication *)NSApp delegate];
     if ([d respondsToSelector:@selector(applicationWillTerminate:)]) ((void (*)(id, SEL, id))objc_msgSend)(d, @selector(applicationWillTerminate:), nil);
 }
-- (UIInterfaceOrientationMask)application:(UIApplication *)a supportedInterfaceOrientationsForWindow:(UIWindow *)w { return UIInterfaceOrientationMaskLandscape; }
+- (UIInterfaceOrientationMask)application:(UIApplication *)a supportedInterfaceOrientationsForWindow:(UIWindow *)w { return MSAllowedOrientations(); }
 @end
 
 /* ---------------------------------------------------------------- keyboard -> NSEvent */
@@ -1119,28 +1397,66 @@ static void MSGCMouseButton(BOOL right, BOOL down) {
         MSOpenMouseGate(); [h msButton:down right:right at:MSGCMouseAt(h)];
     });
 }
-static void MSAttachMouse(GCMouse *m) {
+/* Mice are counted once each (iOS can announce one that GCMouse.mice already listed, and AssistiveTouch's virtual mouse
+   comes and goes every few seconds - the old plain counter crept up and never got back to 0). A mouse only takes over
+   (touch controls hidden, taps = clicks) once it has really been moved or its right button / wheel used: with
+   AssistiveTouch switched on and no mouse plugged in, iOS still reports a mouse, and that used to leave the phone with
+   no touch controls and every tap turned into a click. */
+static NSHashTable<GCMouse *> *g_gcmMice, *g_gcmUsed;
+static void MSGCMouseRecount(void) {                          /* main thread */
+    int was = g_gcmCount;
+    g_gcmAttached = (int)g_gcmMice.count; g_gcmCount = (int)g_gcmUsed.count;
+    if (was != g_gcmCount) MacShimSetPointerLocked(g_pointerLocked);
+}
+static void MSGCMouseUsed(GCMouse *m) {                       /* any thread */
+    MSMainAsync(^{
+        if (!m || ![g_gcmMice containsObject:m] || [g_gcmUsed containsObject:m]) return;
+        [g_gcmUsed addObject:m];
+        os_unfair_lock_lock(&g_gcmLock); g_gcmPending = CGPointZero; os_unfair_lock_unlock(&g_gcmLock);
+        MSGCMouseRecount();
+        MSLogf(@"mouse: %@ is in use - touch controls hidden while it's connected", m.vendorName ?: @"mouse");
+    });
+}
+static void MSAttachMouse(GCMouse *m) {                       /* main thread */
     GCMouseInput *in = m.mouseInput; if (!in) return;
-    g_gcmCount++; g_gcmConnectAt = CACurrentMediaTime();
+    if (!g_gcmMice) { g_gcmMice = [NSHashTable weakObjectsHashTable]; g_gcmUsed = [NSHashTable weakObjectsHashTable]; }
+    if ([g_gcmMice containsObject:m]) return;                  /* already attached */
+    [g_gcmMice addObject:m]; g_gcmConnectAt = CACurrentMediaTime();
     static dispatch_queue_t q; if (!q) q = dispatch_queue_create("cyport.mouse", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
     m.handlerQueue = q;                                    /* handlers run at once, off the busy main thread */
     static double speed; if (!speed) speed = MSCfgD(@"MouseSpeed", 1.0);
+    __weak GCMouse *wm = m; __block int moved = 0;
     in.mouseMovedHandler = ^(GCMouseInput *mi, float dx, float dy) {
         double k = speed * MSLookSensitivity() / 1.5;
         g_gcmMoves++; g_gcmLastMoveAt = CACurrentMediaTime();
         static int logged; if (logged++ < 3) MSLogf(@"mouse: motion %+.1f %+.1f", dx, dy);
+        if ((dx != 0 || dy != 0) && ++moved == 3) MSGCMouseUsed(wm);
         os_unfair_lock_lock(&g_gcmLock); g_gcmPending.x += dx * k; g_gcmPending.y -= dy * k; os_unfair_lock_unlock(&g_gcmLock);   /* GC: +y is up */
     };
     in.leftButton.pressedChangedHandler = ^(GCControllerButtonInput *b, float v, BOOL pressed) { MSGCMouseButton(NO, pressed); };
-    in.rightButton.pressedChangedHandler = ^(GCControllerButtonInput *b, float v, BOOL pressed) { MSGCMouseButton(YES, pressed); };
+    in.rightButton.pressedChangedHandler = ^(GCControllerButtonInput *b, float v, BOOL pressed) { if (pressed) MSGCMouseUsed(wm); MSGCMouseButton(YES, pressed); };
     in.scroll.valueChangedHandler = ^(GCControllerDirectionPad *pad, float x, float y) {
         if (x == 0 && y == 0) return;
+        MSGCMouseUsed(wm);
         MSMainAsync(^{ MSHostView *h = g_hostView; if (h) { MSOpenMouseGate(); [h msScrollBy:CGPointMake(x * 10, y * 10) at:MSGCMouseAt(h)]; } });
     };
+    MSGCMouseRecount();
     MacShimSetPointerLocked(g_pointerLocked);                 /* re-evaluates prefersPointerLocked */
-    MSLogf(@"mouse connected: %@ (GameController) - touch controls hidden while it's connected", m.vendorName ?: @"mouse");
+    MSLogf(@"mouse connected: %@ (GameController) - it takes over from the touch controls once it's moved", m.vendorName ?: @"mouse");
 }
+/* Controller only: while a real controller is connected, no mouse, scroll or keyboard event reaches the game. The game
+   switches its whole input mode (prompts, camera, menu cursor) to keyboard + mouse on any such event and back on the
+   next pad input - a resting palm, an AssistiveTouch pointer or a stray key flipped it back and forth (tester: "the
+   right stick sometimes acts like a mouse", "START takes a long time"). Start screen switch "Touch + mouse with
+   controller" (CyPortKBMWithController) or plist KeyboardMouseWithController / TouchWithController = YES turn it off. */
+static _Atomic long long g_padOnlyDropped;
+static BOOL MSIsKBMEvent(NSUInteger t) { return (t >= MSLDown && t <= MSFlagsChanged) || t == MSScroll || (t >= MSODown && t <= MSODrag); }
 static void MSDispatch(NSEvent *e) {
+    if (!MSOnGameThread()) { MSGameAsync(^{ MSDispatch(e); }); return; }    /* touch / mouse / keys come from the main thread */
+    if (MSIsKBMEvent(e.type) && MSPadOnly()) {
+        if (g_padOnlyDropped++ < 3) MSLogf(@"controller only: event type %lu not sent to the game (a controller is connected)", (unsigned long)e.type);
+        return;
+    }
     NSArray *ms; @synchronized (g_monitors) { ms = [g_monitors copy]; }
     for (MSMonitor *m in ms) if (m.mask & (1ULL << e.type)) {
         NSEvent *in = e; e = m.handler(e);
@@ -1285,6 +1601,14 @@ static NSString *MSGB(uint64_t b) { return [NSString stringWithFormat:@"%.1f GB"
         if (MSLooksLikeGameFolder(sub)) u = [NSURL fileURLWithPath:sub isDirectory:YES];
         else { _status.text = @"That folder doesn't contain archive, engine and r6. Pick the \"Cyberpunk 2077\" folder itself."; [u stopAccessingSecurityScopedResource]; return; }
     }
+    {   /* a Windows copy (Steam / GOG / Epic for PC): a different build, and no Mac shaders - the game can't run it */
+        NSFileManager *fm = NSFileManager.defaultManager;
+        if ([fm fileExistsAtPath:[u.path stringByAppendingPathComponent:@"archive/pc"]] && ![fm fileExistsAtPath:[u.path stringByAppendingPathComponent:@"archive/Mac"]]) {
+            MSLogf(@"setup: picked folder is a Windows copy (archive/pc, no archive/Mac) - not imported");
+            _status.text = @"That's the Windows version of the game. CyPort needs the Mac version's files, which come with your Steam or GOG purchase: tap \"Download from Steam, GOG or Epic…\", or copy the Mac version from a Mac.";
+            [u stopAccessingSecurityScopedResource]; return;
+        }
+    }
     NSError *e = nil; NSData *bm = [u bookmarkDataWithOptions:0 includingResourceValuesForKeys:nil relativeToURL:nil error:&e];
     if (!_pickForSSD) {
         if (bm) [NSUserDefaults.standardUserDefaults setObject:bm forKey:kImportSrcKey];
@@ -1380,11 +1704,14 @@ static NSString *MSGB(uint64_t b) { return [NSString stringWithFormat:@"%.1f GB"
     return nil;
 }
 - (BOOL)prefersStatusBarHidden { return YES; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }  /* laid out sideways (Info.plist also lists upright, for the Duo) */
 @end
 @interface MSSetupDelegate : UIResponder <UIApplicationDelegate> @property(nonatomic, strong) UIWindow *window; @end
 @implementation MSSetupDelegate
+- (BOOL)msWaitForScene { return YES; }
 - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)o {
-    self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds]; self.window.rootViewController = [MSSetupVC new]; [self.window makeKeyAndVisible]; return YES;
+    if (!MSAppScene()) return YES;                    /* MSSceneDelegate calls this again once the scene is there */
+    self.window = [[UIWindow alloc] initWithWindowScene:MSAppScene()]; self.window.rootViewController = [MSSetupVC new]; [self.window makeKeyAndVisible]; return YES;
 }
 @end
 static void MSRunSetup(void) {                  /* replaces the game's startup; the user reopens the app afterwards */
@@ -1398,9 +1725,9 @@ static void *g_gameMain;                        /* main() of the game, from LC_M
 static BOOL MSCalledFromGameMain(void *ret) {
     static dispatch_once_t o;
     dispatch_once(&o, ^{
-        const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(0);
+        const struct mach_header_64 *h = (const struct mach_header_64 *)MSGameHeader();
         const struct load_command *lc = (const struct load_command *)(h + 1);
-        for (uint32_t i = 0; i < h->ncmds; i++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize))
+        if (!g_gameMain) for (uint32_t i = 0; h && i < h->ncmds; i++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize))
             if (lc->cmd == LC_MAIN) g_gameMain = (char *)h + ((const struct entry_point_command *)lc)->entryoff;
     });
     return g_gameMain && (char *)ret >= (char *)g_gameMain && (char *)ret < (char *)g_gameMain + 0x80;
@@ -1805,13 +2132,13 @@ static void MSSyncStartScreenFrom(NSDictionary *v) {
 @implementation MSRestartVC
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return MSAllowedOrientations(); }
 @end
 static UIWindow *g_restartWin;
 static void MSShowRestartPopup(NSArray *changed) {
     if (g_restartWin) return;                                    /* already showing */
     UIWindowScene *sc = MSAppScene();
-    g_restartWin = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    g_restartWin = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:MSPhoneScreen().bounds];
     g_restartWin.windowLevel = UIWindowLevelAlert + 20; g_restartWin.backgroundColor = UIColor.clearColor;
     g_restartWin.rootViewController = [MSRestartVC new]; g_restartWin.rootViewController.view.backgroundColor = UIColor.clearColor;
     g_restartWin.hidden = NO;
@@ -1883,17 +2210,33 @@ static void MSWatchGameSettings(void) {
     MSLogf(@"watching in-game settings for changes that need a restart");
 }
 @interface MSBootDelegate : MSUIDelegate @end
+/* the game's thread: its own run loop (a far-off timer keeps it from being empty, so polls can wait), then main() */
+static void *MSGameThreadMain(void *ready) {
+    pthread_setname_np("Game main");
+    @autoreleasepool {
+        g_gameRL = CFRunLoopGetCurrent();
+        CFRunLoopTimerRef keep = CFRunLoopTimerCreateWithHandler(NULL, CFAbsoluteTimeGetCurrent() + 1e9, 1e9, 0, 0, ^(CFRunLoopTimerRef t) {});
+        CFRunLoopAddTimer(g_gameRL, keep, kCFRunLoopCommonModes);
+    }
+    dispatch_semaphore_signal((__bridge dispatch_semaphore_t)ready);
+    int r = ((int (*)(int, char **, char **, const char **))g_gameMain)(*_NSGetArgc(), *_NSGetArgv(), *_NSGetEnviron(), NULL);
+    MSLogf(@"game main() returned %d", r); exit(r);
+}
 @implementation MSBootDelegate
+- (BOOL)msWaitForScene { return YES; }
 - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opts {
+    if (!MSAppScene()) { MSLogf(@"UIKit launched before the game (boot); start screen waits for the app's scene"); return YES; }
     MSLogf(@"UIKit launched before the game (boot)");
     [NSNotificationCenter.defaultCenter addObserverForName:UIScreenDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification *x) {
         [NSNotificationCenter.defaultCenter postNotificationName:NSApplicationDidChangeScreenParametersNotification object:NSApp]; }];
-    self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    self.window = [[UIWindow alloc] initWithWindowScene:MSAppScene()];
     MSLauncherVC *lv = nil;
     __block void (^playAction)(void) = nil;            /* set below, once `go` exists */
     /* the SwiftUI start screen (Launcher.swift); the UIKit one stays as a fallback */
     Class sw = NSClassFromString(@"MSSwiftLauncher"); UIViewController *svc = nil;
     if (sw) {
+        if (MSDataRoot() && [sw respondsToSelector:NSSelectorFromString(@"setGameRoot:")])          /* Update Cyberpunk works on it */
+            ((void (*)(id, SEL, id))objc_msgSend)(sw, NSSelectorFromString(@"setGameRoot:"), MSDataRoot());
         NSMutableArray *names = [NSMutableArray array], *notes = [NSMutableArray array];
         NSArray *n8 = @[ @"fastest", @"", @"", @"recommended", @"sharper, warmer", @"gets hot", @"very hot", @"native, very hot" ];
         for (int i = 0; i < MacShimModeCount(); i++) { [names addObject:[MSModeName(i) stringByReplacingOccurrencesOfString:@"x" withString:@" × "]]; [notes addObject:i < (int)n8.count ? n8[i] : @""]; }
@@ -1915,7 +2258,26 @@ static void MSWatchGameSettings(void) {
        anything else while one of its blocks is running - GameController, NSOperationQueue.mainQueue observers and
        every dispatch to the main queue would be stuck for the whole game. */
     void (^start)(void) = ^{
+        /* game on its own thread: start screen "Smooth controls" (CyPortGameThread, default on), plist GameThread */
+        id gt = MSConfig()[@"GameThread"]; NSNumber *pref = [NSUserDefaults.standardUserDefaults objectForKey:@"CyPortGameThread"];
+        if (gt ? [gt boolValue] : (pref ? pref.boolValue : YES)) {
+            g_offMain = YES; MSHookNotificationsForGame();
+            double mb = MSCfgD(@"MainStackMB", 64); if (mb < 8) mb = 8;
+            pthread_attr_t at; pthread_attr_init(&at);
+            pthread_attr_setstacksize(&at, ((size_t)(mb * 1048576) + 0x3fff) & ~(size_t)0x3fff);
+            pthread_attr_set_qos_class_np(&at, QOS_CLASS_USER_INTERACTIVE, 0);
+            static dispatch_semaphore_t ready; ready = dispatch_semaphore_create(0);
+            int e = pthread_create(&g_gameThread, &at, MSGameThreadMain, (__bridge void *)ready);
+            pthread_attr_destroy(&at);
+            if (e == 0) {
+                dispatch_semaphore_wait(ready, DISPATCH_TIME_FOREVER);
+                MSLogf(@"launch finished; the game's main() runs on its own thread (%.0f MB stack) - the main thread stays free for touches and controllers", mb);
+                return;
+            }
+            MSLogf(@"couldn't start the game thread (%d) - the game runs on the main thread", e); g_offMain = NO;
+        }
         MSLogf(@"launch finished; starting the game's main()");
+        MSLockScreenSize();
         /* iOS gives the main thread a 1 MB stack, macOS 8 MB, and the game runs its whole loop on the main thread.
            Run it on a big stack of its own (still the main thread) with a no-access guard below. */
         double mb = MSCfgD(@"MainStackMB", 64); int r;
@@ -1945,6 +2307,35 @@ static void MSWatchGameSettings(void) {
     return YES;
 }
 @end
+/* Scene life cycle (UIApplicationSceneManifest in Info.plist). iOS 27 only starts an app built with the iOS 27 SDK if it
+ * uses scenes, and only that SDK gets an iPhone Duo's real screen sizes instead of a zoomed 16:9 window. The app
+ * delegates build their UI once the app's scene has connected (so the start screen knows which screen it is on), and
+ * the scene's active / resign callbacks go on to the app delegate, which UIKit no longer calls itself. */
+@interface MSSceneDelegate : UIResponder <UIWindowSceneDelegate> @property(nonatomic, strong) UIWindow *window; @end
+@implementation MSSceneDelegate
+static BOOL MSIsAppScene(UIScene *s) { return [s isKindOfClass:UIWindowScene.class] && [s.session.role isEqualToString:UIWindowSceneSessionRoleApplication]; }
+- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)o {
+    if (!MSIsAppScene(scene)) return;                 /* a TV's scene: MSTVRoute puts a window on it */
+    UIWindowScene *ws = (UIWindowScene *)scene; g_appScene = ws;
+    UIApplication *app = UIApplication.sharedApplication; id d = app.delegate;
+    MSLogf(@"app scene connected (%.0fx%.0f pt)", ws.coordinateSpace.bounds.size.width, ws.coordinateSpace.bounds.size.height);
+    MSRefreshScreen();
+    UIWindow *w = [d respondsToSelector:@selector(window)] ? [d window] : nil;
+    if (!w && [d respondsToSelector:@selector(msWaitForScene)] && [d msWaitForScene])
+        [d application:app didFinishLaunchingWithOptions:@{}];      /* builds the UI now, in this scene */
+    w = [d respondsToSelector:@selector(window)] ? [d window] : nil;
+    if (w) { if (w.windowScene != ws) w.windowScene = ws; self.window = w; [w makeKeyAndVisible]; }
+}
+- (void)sceneDidDisconnect:(UIScene *)s { if (s == g_appScene) g_appScene = nil; }
+- (void)sceneDidBecomeActive:(UIScene *)s {
+    id d = UIApplication.sharedApplication.delegate;
+    if (MSIsAppScene(s) && [d respondsToSelector:@selector(applicationDidBecomeActive:)]) [d applicationDidBecomeActive:UIApplication.sharedApplication];
+}
+- (void)sceneWillResignActive:(UIScene *)s {
+    id d = UIApplication.sharedApplication.delegate;
+    if (MSIsAppScene(s) && [d respondsToSelector:@selector(applicationWillResignActive:)]) [d applicationWillResignActive:UIApplication.sharedApplication];
+}
+@end
 static void MSBootUIKit(void) {
     g_uikitUp = YES; MSLogf(@"game main() reached sharedApplication; booting UIKit first");
     if (!MSDataRoot()) MSRunSetup();            /* no game folder: folder picker instead of the game (never returns) */
@@ -1952,7 +2343,10 @@ static void MSBootUIKit(void) {
     @autoreleasepool { UIApplicationMain(*_NSGetArgc(), *_NSGetArgv(), nil, NSStringFromClass([MSBootDelegate class])); }
     exit(0);
 }
-static BOOL MSCallerIsMainExe(void *ret) { Dl_info i; return dladdr(ret, &i) && i.dli_fbase == (void *)_dyld_get_image_header(0); }
+/* the game's own Mach-O: found by type, not as image 0 - on iOS 27 image 0 is not the game, so this said "no" to every
+   game call (the engine's pool reservations never reached the compact layout below) */
+static const struct mach_header *MSMainExeHeader(void) { return MSGameHeader(); }
+static BOOL MSCallerIsMainExe(void *ret) { Dl_info i; return dladdr(ret, &i) && i.dli_fbase == (void *)MSMainExeHeader(); }
 
 int ms_NSGetExecutablePath(char *buf, uint32_t *size) __asm("__NSGetExecutablePath");
 int ms_NSGetExecutablePath(char *buf, uint32_t *size) {
@@ -1967,6 +2361,67 @@ int ms_NSGetExecutablePath(char *buf, uint32_t *size) {
     return 0;
 }
 
+/* How this copy was installed, so a tester's log says it at once: which memory entitlements the app really got
+   (what the signer granted, not what the IPA asked for), the signing account (free = profile valid 7 days),
+   SideStore / AltStore (bundle id with a team suffix) and LiveContainer (the game inside another app's process). */
+static void MSLogInstallInfo(void) {
+    typedef CFTypeRef (*TaskCreate)(CFAllocatorRef); typedef CFTypeRef (*TaskEnt)(CFTypeRef, CFStringRef, CFErrorRef *);
+    TaskCreate tc = (TaskCreate)dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf"); TaskEnt te = (TaskEnt)dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+    NSString *(^ent)(NSString *) = ^NSString *(NSString *k) {
+        if (!tc || !te) return @"?";
+        CFTypeRef t = tc(NULL); if (!t) return @"?";
+        CFTypeRef v = te(t, (__bridge CFStringRef)k, NULL); CFRelease(t);
+        BOOL on = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)v); if (v) CFRelease(v);
+        return on ? @"yes" : @"NO";
+    };
+    NSString *acct = @"no profile (ad-hoc / TrollStore / jailbreak)";
+    NSData *raw = [NSData dataWithContentsOfFile:[NSBundle.mainBundle pathForResource:@"embedded" ofType:@"mobileprovision"]];
+    if (raw) {
+        NSData *open = [@"<?xml" dataUsingEncoding:NSUTF8StringEncoding], *close = [@"</plist>" dataUsingEncoding:NSUTF8StringEncoding];
+        NSRange a = [raw rangeOfData:open options:0 range:NSMakeRange(0, raw.length)];
+        NSRange z = a.location == NSNotFound ? a : [raw rangeOfData:close options:0 range:NSMakeRange(a.location, raw.length - a.location)];
+        NSDictionary *pl = z.location == NSNotFound ? nil : [NSPropertyListSerialization propertyListWithData:[raw subdataWithRange:NSMakeRange(a.location, NSMaxRange(z) - a.location)] options:0 format:NULL error:NULL];
+        NSDate *c = pl[@"CreationDate"], *e = pl[@"ExpirationDate"]; double days = c && e ? [e timeIntervalSinceDate:c] / 86400 : 0;
+        acct = [NSString stringWithFormat:@"%@ account (profile valid %.0f days, expires %@)", days > 0 && days <= 8 ? @"FREE" : @"paid", days, e ?: @"?"];
+    }
+    NSString *bid = NSBundle.mainBundle.bundleIdentifier ?: @"?", *path = NSBundle.mainBundle.bundlePath;
+    BOOL lc = [path rangeOfString:@"LiveContainer" options:NSCaseInsensitiveSearch].location != NSNotFound || NSClassFromString(@"LCSharedUtils") != nil;
+    extern size_t os_proc_available_memory(void);
+    MSLogf(@"install: increased memory limit %@, extended virtual addressing %@, %@, bundle %@%@%@, %.0f MB available to the app now",
+           ent(@"com.apple.developer.kernel.increased-memory-limit"), ent(@"com.apple.developer.kernel.extended-virtual-addressing"), acct, bid,
+           [bid componentsSeparatedByString:@"."].lastObject.length == 10 ? @" (SideStore/AltStore style)" : @"", lc ? @", inside LiveContainer" : @"",
+           os_proc_available_memory() / 1048576.0);
+    if ([ent(@"com.apple.developer.kernel.increased-memory-limit") isEqual:@"NO"])
+        MSLogf(@"install: WARNING - no increased memory limit: iOS will end the game early (free Apple ID: enable it with GetMoreRam, then reinstall in SideStore)");
+}
+/* The engine sizes its memory use from hw.memsize: below 10 GB it runs a low-memory configuration (47 places check
+   memsize >> 30 < 10, fn 0x10001e0b4), and one budget is 75% of it (0x1027095dc). An iPhone 17 Pro Max has 12 GB, so
+   the game took the big-Mac path and planned for ~9 GB - but iOS ends an app at its per-app limit (~8 GB there, 6 GB
+   on a 16 Pro Max): testers saw memory climb to 8 GB in the open world and the game killed. Measured: 16 Pro Max (6 GB
+   limit) told 7.25 GB peaked at 5.86 GB (280 MB left); 17 Pro Max told 8 GB still reached ~7.6 GB after a long drive,
+   told 7 GB no more kills (issue #10 / PR #12). Reported now: the per-app limit + 1 GB, at most 7 GB, never more than
+   the phone has. MemSizeGB (plist) sets it by hand; MemoryFit = NO reports the real size. */
+extern size_t os_proc_available_memory(void);
+static unsigned long long g_realMemBytes;                    /* the phone's real RAM (physicalMemory before the swizzle) */
+static double g_memLimitGB;                                   /* iOS's per-app limit, measured at the first ask */
+static double MSFitMemSizeGB(void) {
+    static double fit = -1;
+    if (fit >= 0) return fit;
+    fit = 0;
+    if ([MSConfig()[@"MemoryFit"] isEqual:@NO]) return 0;
+    uint64_t real = 0; size_t rl = sizeof real;
+    static int (*rs)(const char *, void *, size_t *, void *, size_t); if (!rs) rs = (int (*)(const char *, void *, size_t *, void *, size_t))dlsym(RTLD_NEXT, "sysctlbyname");
+    if (!rs || rs("hw.memsize", &real, &rl, NULL, 0) != 0 || !real) return 0;
+    size_t avail = os_proc_available_memory(); if (!avail) return 0;          /* no limit (debugger, Mac): leave it */
+    task_vm_info_data_t v; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&v, &n) != KERN_SUCCESS) return 0;
+    g_memLimitGB = (avail + v.phys_footprint) / 1073741824.0;
+    double gb = fmin(fmin(g_memLimitGB + 1.0, MSCfgD(@"MemoryFitMaxGB", 7)), real / 1073741824.0);
+    gb = fmax(floor(gb * 4) / 4, 4);
+    fit = gb;
+    MSLogf(@"memory: iOS lets this app use ~%.2f GB of the phone's %.1f GB; the game is told %.2f GB", g_memLimitGB, real / 1073741824.0, gb);
+    return fit;
+}
 int ms_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) __asm("_sysctlbyname");
 int ms_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     NSDictionary *c = MSConfig(); const char *fake = NULL;
@@ -1974,9 +2429,10 @@ int ms_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, s
     else if (!strcmp(name, "hw.model"))            fake = [(c[@"Model"] ?: @"Mac16,1") UTF8String];
     else if (!strcmp(name, "kern.osproductversion")) fake = [(c[@"OSVersion"] ?: @"15.5") UTF8String];
     double memGB = [c[@"MemSizeGB"] doubleValue];             /* MemSizeGB: what hw.memsize reports (engine memory budgets) */
+    if (memGB <= 0 && !newp && oldp && oldlenp && !strcmp(name, "hw.memsize")) memGB = MSFitMemSizeGB();
     if (memGB > 0 && !newp && oldp && oldlenp && *oldlenp >= sizeof(uint64_t) && !strcmp(name, "hw.memsize")) {
         uint64_t v = (uint64_t)(memGB * 1073741824.0); memcpy(oldp, &v, sizeof v); *oldlenp = sizeof v;
-        static int said; if (!said++) MSLogf(@"sysctl hw.memsize -> %.0f GB (MemSizeGB)", memGB);
+        static int said; if (!said++) MSLogf(@"sysctl hw.memsize -> %.2f GB (%@)", memGB, [c[@"MemSizeGB"] doubleValue] > 0 ? @"MemSizeGB" : @"fitted to iOS's per-app limit");
         return 0;
     }
     int cpus = [c[@"CPUCount"] intValue];
@@ -2262,6 +2718,7 @@ static void MSVAInit(void) {
     }
     for (int i = 0; i < n; i++) kmunmap(maps[i], sizes[i]);
     g_vaTotalGB = total / 1073741824.0; g_vaCompact = !big;
+    if (MSCfgD(@"CompactVAGB", 0) > 0) { g_vaTotalGB = MSCfgD(@"CompactVAGB", 0); MSLogf(@"(test) acting as if %.1f GB of address space were reservable", g_vaTotalGB); }  /* test a free account's small address space on a paid install */
     double share = MSCfgD(@"CompactShare", 0.45); if (share < 0.1) share = 0.1; if (share > 0.8) share = 0.8;
     g_vaBudgetGB = g_vaTotalGB * share;
     MSLogf(@"address space: %.1f GB reservable, %@", g_vaTotalGB, big ? @"extended (64 GB region): normal pool layout"
@@ -2279,8 +2736,21 @@ static void *MSMmapOld(void *addr, size_t len, int prot, int flags, int fd, off_
 MSMapRet ms_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) __asm("_mmap");
 MSMapRet ms_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     void *ra = __builtin_return_address(0);
-    if (!addr && fd < 0 && (flags & MAP_ANON) && !(flags & MAP_FIXED) && len >= ((size_t)1 << 30) && MSIsPatchedPoolSite(ra)) {
-        MSVAInit();
+    /* With extended virtual addressing (paid account) the pools keep the plain layout that is known to work (the
+       kernel maps them at 0x70_0000_0000+). Without it (free Apple ID / SideStore) 8 GB reservations fail, and the old
+       fallback gave the engine pools that overlap other memory: those go through the compact layout here.
+       PatchedPools = YES uses this path with extended VA too. */
+    BOOL poolSite = !addr && fd < 0 && (flags & MAP_ANON) && !(flags & MAP_FIXED) && len >= ((size_t)1 << 30) && MSIsPatchedPoolSite(ra);
+    if (!addr && fd < 0 && len >= ((size_t)1 << 30)) {         /* first big reservations: say how they were recognised */
+        static int said; if (said++ < 3) {
+            const uint32_t *i = (const uint32_t *)ra; Dl_info di; BOOL dl = dladdr(ra, &di);
+            MSLogf(@"pool check: %.2f GB from %@ - game code %d (image %p, game %p), patched site %d (%#x %#x %#x)", len / 1073741824.0, MSCallerStr(ra),
+                   MSCallerIsMainExe(ra), dl ? di.dli_fbase : NULL, MSMainExeHeader(), poolSite, i[0], i[1], i[2]);
+        }
+    }
+    if (poolSite) MSVAInit();
+    if (poolSite && !g_vaCompact && ![MSConfig()[@"PatchedPools"] boolValue]) poolSite = NO;
+    if (poolSite) {
         /* per-pool override: PoolCap16GB, PoolCap64GB, ... (by the size the engine asked for), else PoolCapGB */
         double capGB = MSCfgD([NSString stringWithFormat:@"PoolCap%zuGB", len >> 30], MSCfgD(@"PoolCapGB", g_vaCompact ? MSCompactCapGB(len) : 8));
         size_t cap = (size_t)(capGB * 1073741824.0) & ~(size_t)0x3fff, real = len < cap ? len : cap, min = (size_t)256 << 20;
@@ -2357,7 +2827,7 @@ MSMapRet ms_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
         MSLogf(@"pool reservation %.2f GB FAILED even at %.0f MB (errno %d)", len / 1073741824.0, min / 1048576.0, errno);
         errno = ENOMEM; return (MSMapRet){ MAP_FAILED, 0 };
     }
-    static int warned; if (!warned && len >= ((size_t)8 << 30) && MSCallerIsMainExe(ra)) { warned = 1; MSLogf(@"pool-end patch NOT found in the game binary: using the old top-of-address-space layout (rebuild with the current tools/ios_retarget.py)"); }
+    static int warned; if (!warned && len >= ((size_t)8 << 30) && MSCallerIsMainExe(ra) && !MSIsPatchedPoolSite(ra)) { warned = 1; MSLogf(@"pool-end patch NOT found in the game binary: using the old top-of-address-space layout (rebuild with the current tools/ios_retarget.py)"); }
     void *p = MSMmapOld(addr, len, prot, flags, fd, off);
     return (MSMapRet){ p, p == MAP_FAILED ? 0 : (uintptr_t)p + len };
 }
@@ -3195,7 +3665,7 @@ static void MSLowLatencyWait(void) {                  /* main thread, start of e
 }
 static UIWindow *g_statusWin; static CGFloat g_stPad; static CALayer *g_stRoot, *g_stBg, *g_stTrack, *g_stFill; static CATextLayer *g_stTitle, *g_stHead, *g_stLog;
 static CATextLayer *MSTextLayer(CGFloat size, BOOL mono, UIColor *color) {
-    CATextLayer *t = [CATextLayer layer]; t.contentsScale = UIScreen.mainScreen.scale; t.foregroundColor = color.CGColor;
+    CATextLayer *t = [CATextLayer layer]; t.contentsScale = MSPhoneScreen().scale; t.foregroundColor = color.CGColor;
     UIFont *f = mono ? [UIFont monospacedSystemFontOfSize:size weight:UIFontWeightRegular] : [UIFont systemFontOfSize:size weight:UIFontWeightSemibold];
     t.font = (__bridge CFTypeRef)f; t.fontSize = size; t.truncationMode = kCATruncationEnd; t.wrapped = NO; return t;
 }
@@ -3277,6 +3747,16 @@ static void MSPadTiming(void) {
     if (d < 0 || d > 2) return;
     g_ptN++; g_ptSum += d; if (d > g_ptMax) g_ptMax = d;
 }
+/* Event polls (the game's nextEventMatchingMask on the main thread, once per game frame): touches and controller input
+   are handed to the game at its polls. A press and its release inside one gap used to reach the game together and short taps were sometimes lost: the
+   release now waits for the next poll (MSPadHoldRelease). */
+static long long g_pollNo;
+static NSMutableArray *g_heldReleases;                       /* main thread: blocks for the next poll */
+static void MSPollBegin(void) {                              /* main thread, start of every event poll */
+    g_pollNo++;
+    if (g_heldReleases.count) { NSArray *a = [g_heldReleases copy]; [g_heldReleases removeAllObjects]; for (void (^b)(void) in a) b(); }
+}
+static void MSPadHoldRelease(void (^b)(void)) { if (!g_heldReleases) g_heldReleases = [NSMutableArray array]; [g_heldReleases addObject:[b copy]]; }
 static void MSInputReport(void) {                     /* main thread */
     static double rep; double now = CACurrentMediaTime();
     if (now - rep < 30) return;
@@ -3286,7 +3766,94 @@ static void MSInputReport(void) {                     /* main thread */
     g_llGpuWaited = 0; g_llGpuWaitSum = 0;
     if (rep > 0 && g_ptN) MSLogf(@"controller: %lld inputs, reached the game avg %.1f ms (max %.1f ms) after the controller sent them",
                                  g_ptN, 1000 * g_ptSum / g_ptN, 1000 * g_ptMax);
+    if (rep > 0) MSFxReport();
     rep = now; g_llFrames = g_llWaited = g_llTimeouts = 0; g_llWaitSum = g_llWaitMax = 0; g_ptN = 0; g_ptSum = g_ptMax = 0;
+}
+/* Sticks and analog triggers, coalesced per game frame (DK Bananza / Mario Kart World only ever hand the game a
+ * controller's newest state). GameController calls a handler for every report a controller sends (125-1000 a second);
+ * the game turns each one into buffered input events and works through them at the start of its frame. In a slow
+ * frame dozens piled up per stick, so the controls fell behind - and stayed behind - whenever the game lagged. Now an
+ * analog change only marks its element; at the end of the event poll (before the game reads its input) each marked
+ * element's handler runs once, with the newest value. Presses and releases (buttons, d-pad, a trigger crossing its
+ * press point) still go through at once, in order, right after the analog values pending before them.
+ * PadCoalesce = NO turns it off. The on-screen controller's sticks go the same way (MSPadSetStick). */
+@interface MSCoSlot : NSObject { @public __weak id el; id handler; int kind; BOOL pressed; long long pressPoll; NSMutableOrderedSet *els; } @end
+@implementation MSCoSlot @end
+static NSMutableOrderedSet<MSCoSlot *> *g_coDirty;           /* main thread */
+static long long g_coIn, g_coOut;
+static BOOL MSCoalesceOn(void) { static int on = -1; if (on < 0) on = MSCfgD(@"PadCoalesce", 1) != 0; return on; }
+static void MSCoRun(MSCoSlot *s) {
+    id e = s->el; if (!e) return;
+    g_coOut++;
+    switch (s->kind) {
+        case 0: { GCControllerButtonInput *b = e; ((void (^)(id, float, BOOL))s->handler)(b, b.value, b.isPressed); break; }
+        case 1: { GCControllerDirectionPad *d = e; ((void (^)(id, float, float))s->handler)(d, d.xAxis.value, d.yAxis.value); break; }
+        case 2: { GCControllerAxisInput *a = e; ((void (^)(id, float))s->handler)(a, a.value); break; }
+        default: { NSArray *els = s->els.array; [s->els removeAllObjects]; for (id x in els) ((void (^)(id, id))s->handler)(e, x); break; }
+    }
+}
+static void MSPadFlushReal(void) {                           /* main thread */
+    if (!g_coDirty.count) return;
+    NSArray *d = g_coDirty.array; [g_coDirty removeAllObjects];
+    for (MSCoSlot *s in d) MSCoRun(s);
+}
+static void MSCoMark(MSCoSlot *s) { if (!g_coDirty) g_coDirty = [NSMutableOrderedSet orderedSet]; g_coIn++; [g_coDirty addObject:s]; }
+static BOOL MSCoAnalogEl(id el) {                            /* a value without a press: stick, axis */
+    return [el isKindOfClass:GCControllerAxisInput.class] || ([el isKindOfClass:GCControllerDirectionPad.class] && [(GCControllerElement *)el isAnalog]);
+}
+/* a real controller's handler, wrapped for coalescing (and PadTiming) */
+static id MSCoWrap(id self, id handler, BOOL timing) {
+    id real = [handler copy];
+    MSCoSlot *s = [MSCoSlot new]; s->el = self; s->handler = real;
+    if ([self isKindOfClass:GCControllerButtonInput.class]) {
+        s->kind = 0; s->pressed = [(GCControllerButtonInput *)self isPressed];
+        BOOL analog = [(GCControllerElement *)self isAnalog];            /* triggers */
+        return ^(GCControllerButtonInput *b, float v, BOOL p) {
+            if (timing) MSPadTiming();
+            if (!MSOnGameThread()) { ((void (^)(id, float, BOOL))real)(b, v, p); return; }
+            if (analog && p == s->pressed) { MSCoMark(s); return; }
+            if (!p && s->pressPoll == g_pollNo && g_pollNo) {           /* released in the frame it was pressed: next frame */
+                s->pressed = p;
+                MSPadHoldRelease(^{ if (!s->pressed) ((void (^)(id, float, BOOL))real)(b, 0, NO); });
+                return;
+            }
+            s->pressed = p; if (p) s->pressPoll = g_pollNo; [g_coDirty removeObject:s]; MSPadFlushReal();
+            ((void (^)(id, float, BOOL))real)(b, v, p);
+        };
+    }
+    if ([self isKindOfClass:GCControllerDirectionPad.class]) {
+        s->kind = 1; BOOL analog = [(GCControllerElement *)self isAnalog];   /* thumbsticks; the d-pad isn't */
+        return ^(GCControllerDirectionPad *d, float x, float y) {
+            if (timing) MSPadTiming();
+            if (!MSOnGameThread()) { ((void (^)(id, float, float))real)(d, x, y); return; }
+            if (analog) { MSCoMark(s); return; }
+            MSPadFlushReal(); ((void (^)(id, float, float))real)(d, x, y);
+        };
+    }
+    if ([self isKindOfClass:GCControllerAxisInput.class]) {
+        s->kind = 2;
+        return ^(GCControllerAxisInput *a, float v) {
+            if (timing) MSPadTiming();
+            if (!MSOnGameThread()) { ((void (^)(id, float))real)(a, v); return; }
+            MSCoMark(s);
+        };
+    }
+    s->kind = 3; s->els = [NSMutableOrderedSet orderedSet];                /* the whole gamepad: (gamepad, element) */
+    return ^(id g, GCControllerElement *el) {
+        if (!MSOnGameThread()) { ((void (^)(id, id))real)(g, el); return; }
+        if (MSCoAnalogEl(el)) { [s->els addObject:el]; MSCoMark(s); return; }
+        MSPadFlushReal(); ((void (^)(id, id))real)(g, el);
+    };
+}
+/* Share / Create / Options / Menu: while iOS watches them for its own gestures (screenshot, recording) it holds the
+   press back until it knows - the map / pause button felt slow. AlwaysReceive keeps the gesture and passes the press
+   on at once. */
+static void MSPadNoGestureDelay(GCController *c) {
+    if (!c || c.isSnapshot) return;
+    for (NSString *n in @[ GCInputButtonShare, GCInputButtonOptions, GCInputButtonMenu ]) {
+        GCControllerButtonInput *b = c.physicalInputProfile.buttons[n];
+        if (b && b.preferredSystemGestureState == GCSystemGestureStateEnabled) b.preferredSystemGestureState = GCSystemGestureStateAlwaysReceive;
+    }
 }
 static IMP g_origSetVCH[4]; static Class g_vchClass[4], g_vchHooked[4];
 static void ms_setValueChangedHandler(id self, SEL _cmd, id handler) {
@@ -3307,6 +3874,10 @@ static void ms_setValueChangedHandler(id self, SEL _cmd, id handler) {
             h = ^(GCControllerAxisInput *a, float v) { @synchronized (g_padHandlers) { [g_padFired setObject:@(CACurrentMediaTime()) forKey:weakSelf]; } ((void (^)(id, float))real)(a, v); };
         else
             h = ^(id g, GCControllerElement *el) { @synchronized (g_padHandlers) { [g_padFired setObject:@(CACurrentMediaTime()) forKey:weakSelf]; } ((void (^)(id, id))real)(g, el); };
+    } else if (handler && MSCoalesceOn()) {                       /* a real controller: newest stick value once per frame */
+        h = MSCoWrap(self, handler, MSCfgD(@"PadTiming", 0) != 0);
+        NSArray *all = g_origControllers ? ((NSArray *(*)(id, SEL))g_origControllers)(GCController.class, @selector(controllers)) : GCController.controllers;
+        for (GCController *c in all) MSPadNoGestureDelay(c);       /* the game hooks up a controller: ~21 calls, cheap */
     } else if (handler && MSCfgD(@"PadTiming", 0) != 0) {        /* a real controller: measure, change nothing (PadTiming = YES) */
         id real = [handler copy];
         if ([self isKindOfClass:GCControllerButtonInput.class])
@@ -3315,6 +3886,17 @@ static void ms_setValueChangedHandler(id self, SEL _cmd, id handler) {
             h = ^(GCControllerDirectionPad *d, float x, float y) { MSPadTiming(); ((void (^)(id, float, float))real)(d, x, y); };
         else if ([self isKindOfClass:GCControllerAxisInput.class])
             h = ^(GCControllerAxisInput *a, float v) { MSPadTiming(); ((void (^)(id, float))real)(a, v); };
+    }
+    if (h && g_offMain) {                                        /* GameController calls on the main thread: hand over */
+        id inner = [h copy];
+        if ([self isKindOfClass:GCControllerButtonInput.class])
+            h = ^(GCControllerButtonInput *b, float v, BOOL p) { if (MSOnGameThread()) ((void (^)(id, float, BOOL))inner)(b, v, p); else MSGameAsync(^{ ((void (^)(id, float, BOOL))inner)(b, v, p); }); };
+        else if ([self isKindOfClass:GCControllerDirectionPad.class])
+            h = ^(GCControllerDirectionPad *d, float x, float y) { if (MSOnGameThread()) ((void (^)(id, float, float))inner)(d, x, y); else MSGameAsync(^{ ((void (^)(id, float, float))inner)(d, x, y); }); };
+        else if ([self isKindOfClass:GCControllerAxisInput.class])
+            h = ^(GCControllerAxisInput *a, float v) { if (MSOnGameThread()) ((void (^)(id, float))inner)(a, v); else MSGameAsync(^{ ((void (^)(id, float))inner)(a, v); }); };
+        else
+            h = ^(id g, GCControllerElement *el) { if (MSOnGameThread()) ((void (^)(id, id))inner)(g, el); else MSGameAsync(^{ ((void (^)(id, id))inner)(g, el); }); };
     }
     if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, h);
 }
@@ -3345,17 +3927,49 @@ static void MSPadRun(GCControllerElement *x) {
 }
 static void MSPadNotify(GCControllerElement *el) {
     if (!el || !g_padHandlers) return;
-    if (![NSThread isMainThread]) { MSMainAsync(^{ MSPadNotify(el); }); return; }
+    if (!MSOnGameThread()) { MSGameAsync(^{ MSPadNotify(el); }); return; }
     MSPadRun(el);
     if ([el isKindOfClass:GCControllerDirectionPad.class]) { MSPadRun(((GCControllerDirectionPad *)el).xAxis); MSPadRun(((GCControllerDirectionPad *)el).yAxis); }
     for (GCControllerElement *c = el.collection; c; c = c.collection) MSPadRun(c);
     id gh; @synchronized (g_padHandlers) { gh = [g_padHandlers objectForKey:g_pad]; }
     if (gh) ((void (^)(id, id))gh)(g_pad, el);
 }
-static void MSPadSetButton(GCControllerButtonInput *b, float v) { if (!b) return; if (b.value == v) return; [b setValue:v]; MSPadNotify(b); }
+static NSMutableOrderedSet *g_vpadDirty;                    /* on-screen sticks changed this frame (main thread) */
+static void MSPadFlushVpad(void) {
+    if (!g_vpadDirty.count) return;
+    NSArray *d = g_vpadDirty.array; [g_vpadDirty removeAllObjects];
+    for (GCControllerElement *el in d) MSPadNotify(el);
+}
+static void MSPadFlushCoalesced(void) {
+    MSPadFlushVpad(); MSPadFlushReal();
+    static double rep; double now = CACurrentMediaTime();
+    if (now - rep < 30) return;
+    if (rep > 0 && g_coIn) MSLogf(@"controller: %lld stick/trigger reports in 30 s, %lld handed to the game (newest per frame)", g_coIn, g_coOut);
+    rep = now; g_coIn = g_coOut = 0;
+}
+static NSMapTable *g_vbPressPoll;                           /* on-screen button -> poll it was pressed in */
+static void MSPadSetButton(GCControllerButtonInput *b, float v) {
+    if (!b) return;
+    if (!MSOnGameThread()) { MSGameAsync(^{ MSPadSetButton(b, v); }); return; }    /* touches: main thread -> the game's */
+    if (!g_vbPressPoll) g_vbPressPoll = [NSMapTable weakToStrongObjectsMapTable];
+    if (v == 0 && [[g_vbPressPoll objectForKey:b] longLongValue] == g_pollNo && g_pollNo) {   /* a tap within one frame */
+        MSPadHoldRelease(^{ if (b.value != 0 && [[g_vbPressPoll objectForKey:b] longLongValue] < g_pollNo) { [b setValue:0]; MSPadFlushVpad(); MSPadNotify(b); } });
+        return;
+    }
+    if (b.value == v) return;
+    if (v > 0) [g_vbPressPoll setObject:@(g_pollNo) forKey:b];
+    [b setValue:v]; MSPadFlushVpad(); MSPadNotify(b);
+}
 static void MSPadSetStick(GCControllerDirectionPad *d, float x, float y) {
-    if (!d) return; float ox = d.xAxis.value, oy = d.yAxis.value; [d setValueForXAxis:x yAxis:y];
-    if (ox != x || oy != y) MSPadNotify(d);
+    if (!d) return;
+    if (!MSOnGameThread()) { MSGameAsync(^{ MSPadSetStick(d, x, y); }); return; }
+    float ox = d.xAxis.value, oy = d.yAxis.value; [d setValueForXAxis:x yAxis:y];
+    if (ox == x && oy == y) return;
+    if (d != g_pad.dpad && MSCoalesceOn()) {   /* the newest position, once per frame */
+        if (!g_vpadDirty) g_vpadDirty = [NSMutableOrderedSet orderedSet];
+        [g_vpadDirty addObject:d]; return;
+    }
+    MSPadFlushVpad(); MSPadNotify(d);
 }
 /* once per game frame: finger speed over the last frame -> right stick. Smoothed (the touch samples and the game's frames
    don't line up), with a response curve so slow swipes still turn (the game squares small stick values), and it eases
@@ -3374,8 +3988,10 @@ static void MSLookFlushStick(double dt) {
     os_unfair_lock_lock(&g_lookLock); CGPoint d = g_lookPending; g_lookPending = CGPointZero; os_unfair_lock_unlock(&g_lookLock);
     BOOL fingerMoving = g_lookFingerAt && CACurrentMediaTime() - g_lookFingerAt < 0.06;
     float rx = d.x / dt / full, ry = -d.y / dt / full;
-    if (fingerMoving || d.x || d.y) { vx = vx * 0.2f + rx * 0.8f; vy = vy * 0.2f + ry * 0.8f; }   /* light smoothing, quick response */
-    else { vx *= 0.35f; vy *= 0.35f; if (fabsf(vx) < 0.03f && fabsf(vy) < 0.03f) vx = vy = 0; }   /* finger still / lifted: quick ease out */
+    /* smoothing in time, not in frames: per-frame factors held the camera back for several frames at 20-30 FPS
+       (it kept turning after the finger stopped). Same feel as before at 60 FPS. */
+    if (fingerMoving || d.x || d.y) { float keep = (float)exp(-dt / 0.010); vx = vx * keep + rx * (1 - keep); vy = vy * keep + ry * (1 - keep); }
+    else { float keep = (float)exp(-dt / 0.016); vx *= keep; vy *= keep; if (fabsf(vx) < 0.03f && fabsf(vy) < 0.03f) vx = vy = 0; }
     float m = hypotf(vx, vy), outx = 0, outy = 0;
     if (m > 0.001f) { float c = powf(fminf(m, 1), curve); outx = vx / m * c; outy = vy / m * c; }
     MSPadSetStick(g_pad.rightThumbstick, outx, outy);
@@ -3385,7 +4001,135 @@ static BOOL MSRealControllerConnected(void) {
     for (GCController *c in all) if (!c.isSnapshot) return YES;
     return NO;
 }
-typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
+/* controller only (see MSDispatch): on while a real controller is connected, unless switched off */
+static BOOL MSKBMWithController(void) {
+    static int on = -1;
+    if (on < 0) {
+        id v = MSConfig()[@"KeyboardMouseWithController"] ?: MSConfig()[@"TouchWithController"];
+        on = [v respondsToSelector:@selector(boolValue)] ? [v boolValue] : MSPref(@"CyPortKBMWithController", 0) != 0;
+    }
+    return on;
+}
+static _Atomic BOOL g_padOnly;                /* updated once per game frame by MSPadOnlyCheck */
+static BOOL MSPadOnly(void) { return g_padOnly; }
+/* The game keeps its own list of GameController mice (GameApplicationDelegate mouseDidConnect: / mouseDidDisconnect:,
+   -> SetToggleMagicMouse). AssistiveTouch's virtual mouse connects and disconnects every few seconds, and each time
+   the game re-thought which device was in use. While only the controller counts, mice are kept from the game: their
+   connect is held back, and the ones it already knows are reported gone; they come back when the controller leaves. */
+static IMP g_gameMouseConn, g_gameMouseDisc; static __weak id g_gameDelegate;
+static NSHashTable<GCMouse *> *g_gameMice, *g_heldMice;     /* main thread */
+static void ms_gameMouseConn(id self, SEL _cmd, NSNotification *n) {
+    GCMouse *m = n.object; g_gameDelegate = self;
+    if (![m isKindOfClass:GCMouse.class]) { ((void (*)(id, SEL, id))g_gameMouseConn)(self, _cmd, n); return; }
+    if (MSPadOnly()) { [g_heldMice addObject:m]; MSLogf(@"controller only: mouse '%@' kept from the game", m.vendorName ?: @"mouse"); return; }
+    [g_gameMice addObject:m]; ((void (*)(id, SEL, id))g_gameMouseConn)(self, _cmd, n);
+}
+static void ms_gameMouseDisc(id self, SEL _cmd, NSNotification *n) {
+    GCMouse *m = n.object; g_gameDelegate = self;
+    [g_heldMice removeObject:m];
+    if ([m isKindOfClass:GCMouse.class] && ![g_gameMice containsObject:m]) return;     /* the game never got it */
+    [g_gameMice removeObject:m]; ((void (*)(id, SEL, id))g_gameMouseDisc)(self, _cmd, n);
+}
+/* The game's controller connect / disconnect handlers (GameApplicationDelegate controllerDidConnect: 0x1000349b4 ->
+   assignControllerToPlayers 0x1000347d0) write into the engine's per-player input table (4 pointers at 0x10853fac0,
+   getter 0x102e2b67c) without checking it exists. The engine fills it in a while after applicationDidFinishLaunching,
+   so a controller announced - or plugged in - before that crashed at once (store to NULL + 0x30). Such notifications are
+   held here and handed over, in order, as soon as the table is there. */
+#define MS_PLAYER_INPUTS (MSGame()->playerInputs)
+static BOOL MSPlayerInputsReady(void) {
+    if (!MS_PLAYER_INPUTS) {                                    /* unknown game program: wait 8 s after launch instead */
+        static double t0; double now = CACurrentMediaTime(); if (!t0) t0 = now; return now - t0 > 8;
+    }
+    void *const *t = (void *const *)(MS_PLAYER_INPUTS + MSExeSlide());
+    static double firstAt; static BOOL said;
+    int n = 0; for (int i = 0; i < 4; i++) if (t[i]) n++;
+    if (n == 4) return YES;
+    if (!t[0]) return NO;
+    double now = CACurrentMediaTime(); if (!firstAt) firstAt = now;
+    if (now - firstAt < 10) return NO;                      /* player 1 there for 10 s, the rest never came: go with it */
+    if (!said) { said = YES; MSLogf(@"controller: game has %d of 4 player input slots - handing controllers over anyway", n); }
+    return YES;
+}
+static IMP g_gamePadConn, g_gamePadDisc; static NSMutableArray *g_heldPadNotes;     /* main thread: @[ @(connect), note ] */
+static void MSReplayHeldPads(void) {                          /* main thread */
+    if (!g_heldPadNotes.count || !MSPlayerInputsReady()) return;
+    id d = g_gameDelegate; if (!d) return;
+    NSArray *held = [g_heldPadNotes copy]; [g_heldPadNotes removeAllObjects];
+    MSLogf(@"controller: game is ready for controllers - handing over %lu held notification(s)", (unsigned long)held.count);
+    for (NSArray *h in held) {
+        BOOL conn = [h[0] boolValue];
+        ((void (*)(id, SEL, id))(conn ? g_gamePadConn : g_gamePadDisc))(d, conn ? @selector(controllerDidConnect:) : @selector(controllerDidDisconnect:), h[1]);
+    }
+}
+static void MSGamePadNote(id self, SEL _cmd, NSNotification *n, BOOL conn) {
+    g_gameDelegate = self;
+    if (!MSOnGameThread()) {                                   /* the game's handlers expect its own thread */
+        MSGameAsync(^{ MSGamePadNote(self, _cmd, n, conn); }); return;
+    }
+    if (!MSPlayerInputsReady() || g_heldPadNotes.count) {
+        [g_heldPadNotes addObject:@[ @(conn), n ]];
+        static int k; if (k++ < 6) MSLogf(@"controller: %@ held until the game is ready for controllers", conn ? @"connect" : @"disconnect");
+        return;
+    }
+    ((void (*)(id, SEL, id))(conn ? g_gamePadConn : g_gamePadDisc))(self, _cmd, n);
+}
+static void ms_gamePadConn(id self, SEL _cmd, NSNotification *n) { MSGamePadNote(self, _cmd, n, YES); }
+static void ms_gamePadDisc(id self, SEL _cmd, NSNotification *n) { MSGamePadNote(self, _cmd, n, NO); }
+static void MSHookGameMice(id d) {
+    Class c = [d class];
+    Method pc = class_getInstanceMethod(c, @selector(controllerDidConnect:)), pd = class_getInstanceMethod(c, @selector(controllerDidDisconnect:));
+    if (pc && pd && !g_gamePadConn) {
+        g_heldPadNotes = [NSMutableArray array]; g_gameDelegate = d;
+        g_gamePadConn = method_setImplementation(pc, (IMP)ms_gamePadConn);
+        g_gamePadDisc = method_setImplementation(pd, (IMP)ms_gamePadDisc);
+    }
+    Method mc = class_getInstanceMethod(c, @selector(mouseDidConnect:)), md = class_getInstanceMethod(c, @selector(mouseDidDisconnect:));
+    if (!mc || !md || g_gameMouseConn) return;
+    g_gameMice = [NSHashTable weakObjectsHashTable]; g_heldMice = [NSHashTable weakObjectsHashTable]; g_gameDelegate = d;
+    g_gameMouseConn = method_setImplementation(mc, (IMP)ms_gameMouseConn);
+    g_gameMouseDisc = method_setImplementation(md, (IMP)ms_gameMouseDisc);
+}
+static void MSPadOnlyCheck(void) {                            /* main thread, once per game frame */
+    MSReplayHeldPads();
+    static double last; double now = CACurrentMediaTime();
+    if (now - last < 0.1) return; last = now;
+    BOOL on = !MSKBMWithController() && (g_vpad ? g_realPad : MSRealControllerConnected());
+    if (on == g_padOnly) return;
+    g_padOnly = on;
+    id d = g_gameDelegate;
+    if (on) {
+        if (MS_MOUSE_GATE) *(volatile uint8_t *)(MS_MOUSE_GATE + MSExeSlide()) = 0;   /* the game's "a mouse is in use" gate shut */
+        g_leftBy = 0; g_gcmLeft = g_gcmRight = NO; g_modFlags = 0;
+        os_unfair_lock_lock(&g_gcmLock); g_gcmPending = CGPointZero; os_unfair_lock_unlock(&g_gcmLock);
+        os_unfair_lock_lock(&g_lookLock); g_lookPending = CGPointZero; os_unfair_lock_unlock(&g_lookLock);
+        for (GCMouse *m in g_gameMice.allObjects) {
+            [g_gameMice removeObject:m]; [g_heldMice addObject:m];
+            if (d) ((void (*)(id, SEL, id))g_gameMouseDisc)(d, @selector(mouseDidDisconnect:), [NSNotification notificationWithName:GCMouseDidDisconnectNotification object:m]);
+        }
+        MSLogf(@"controller only: a controller is connected - touch, mouse and keyboard are kept from the game");
+    } else {
+        NSArray *present = GCMouse.mice;
+        for (GCMouse *m in g_heldMice.allObjects) {
+            [g_heldMice removeObject:m];
+            if (d && [present containsObject:m]) { [g_gameMice addObject:m]; ((void (*)(id, SEL, id))g_gameMouseConn)(d, @selector(mouseDidConnect:), [NSNotification notificationWithName:GCMouseDidConnectNotification object:m]); }
+        }
+        MSLogf(@"controller only: off (%@) - touch, mouse and keyboard reach the game again", MSKBMWithController() ? @"switched off" : @"no controller");
+    }
+}
+/* A controller that was already connected when the game started is only picked up once the game is told about it
+   (it hooks up controllers from connect notifications). That used to wait for 60 frames + 2 s (the tester's "START
+   takes a long time"); now it happens right after the game registered for those notifications. The later check in
+   MSTouchPadCreate stays as a fallback. */
+static void MSAnnounceEarlyPads(void) {
+    if (g_realHandlerSeen) return;
+    NSArray *all = g_origControllers ? ((NSArray *(*)(id, SEL))g_origControllers)(GCController.class, @selector(controllers)) : GCController.controllers;
+    for (GCController *c in all) if (!c.isSnapshot && c.extendedGamepad) {
+        g_realGP = c.extendedGamepad;
+        [NSNotificationCenter.defaultCenter postNotificationName:GCControllerDidConnectNotification object:c];
+        MSLogf(@"controller: told the game about %@ at start (it was connected before the game started)", c.vendorName);
+    }
+}
+typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* Edit: ✎ opens the layout editor; Tool: − + ↺ ✓ in it */
 @interface MSCtl : NSObject
 @property MSCtlKind kind; @property CGPoint center; @property CGFloat r; @property(copy) NSString *label;
 @property(weak) GCControllerButtonInput *button; @property int dpadX, dpadY; @property NSInteger key; @property(strong) CAShapeLayer *shape; @property(strong) CATextLayer *text;
@@ -3400,6 +4144,42 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
     CAShapeLayer *_stickBase, *_stickKnob; float _lookSpeed;
     CGPoint _lHome, _rHome; UITouch *_rTouch; CAShapeLayer *_rBase, *_rKnob; int _wasd;
     double _stickT0; CGPoint _stickP0; CGFloat _stickMax; int _lookMouse;
+    NSMapTable<UITouch *, MSCtl *> *_faceOf; CGPoint _faceC; CGFloat _faceGap, _faceR;   /* A/B/X/Y as one control */
+    CGPoint _lookC; UIImpactFeedbackGenerator *_tap; BOOL _tapOn;
+    BOOL _editing, _force, _selStick; MSCtl *_sel; UITouch *_dragT; CGPoint _dragOff;   /* touch layout editor */
+}
+/* a short tap on each press, like DK Bananza's pad (start screen "Touch vibration", CyPortTouchHaptics) */
+- (void)msFeel { if (!_tapOn) return; [_tap impactOccurredWithIntensity:0.6]; [_tap prepare]; }
+/* the A/B/X/Y diamond takes a touch anywhere near it; the key is the nearest one, and sliding the finger switches keys */
+- (BOOL)msInFace:(CGPoint)p { return !_hiddenByUser && g_pad && hypot(p.x - _faceC.x, p.y - _faceC.y) <= _faceGap + _faceR * 1.6; }
+- (BOOL)msIsFace:(MSCtl *)c { return c.button && (c.button == g_pad.buttonA || c.button == g_pad.buttonB || c.button == g_pad.buttonX || c.button == g_pad.buttonY); }
+- (MSCtl *)msFaceAt:(CGPoint)p {
+    MSCtl *best = nil; CGFloat bd = 1e9;
+    for (MSCtl *c in _ctls) if ([self msIsFace:c]) {
+        CGFloat d = hypot(p.x - c.center.x, p.y - c.center.y); if (d < bd) { bd = d; best = c; }
+    }
+    return best;
+}
+- (void)msFaceTouch:(UITouch *)t to:(MSCtl *)c {           /* nil: let go */
+    MSCtl *old = [_faceOf objectForKey:t]; if (old == c) return;
+    if (c) [_faceOf setObject:c forKey:t]; else [_faceOf removeObjectForKey:t];
+    if (old) { UITouch *still = nil; for (UITouch *o in _faceOf) if ([_faceOf objectForKey:o] == old) still = o;
+               if (still) old.touch = still;                     /* another finger still holds it */
+               else { old.touch = nil; MSPadSetButton(old.button, 0); [self msPaint:old]; } }
+    if (c && !c.touch) { c.touch = t; MSPadSetButton(c.button, 1); [self msPaint:c]; [self msFeel]; }
+}
+/* camera stick (MSLookMode 2): centred where the thumb landed; past the edge the centre comes along, so turning back
+   answers at once. Small dead zone, full tilt at 80% of the radius; Look sensitivity shortens the throw. */
+- (void)msLookStick:(CGPoint)p {
+    CGFloat R = 60, dx = p.x - _lookC.x, dy = p.y - _lookC.y, d = hypot(dx, dy);
+    if (d > R) { _lookC.x = p.x - dx * R / d; _lookC.y = p.y - dy * R / d; dx = p.x - _lookC.x; dy = p.y - _lookC.y; d = R; }
+    double full = R * 0.8 * 1.5 / MSLookSensitivity(); if (full > R) full = R; if (full < 12) full = 12;
+    CGFloat dz = R * 0.08; float x = 0, y = 0;
+    if (d > dz) { CGFloat m = fmin((d - dz) / (full - dz), 1) / d; x = dx * m; y = -dy * m; }
+    MSPadSetStick(g_pad.rightThumbstick, x, y);
+    [CATransaction begin]; [CATransaction setDisableActions:YES];
+    [self msDrawStick:_rBase knob:_rKnob at:_lookC offset:CGPointMake(dx, dy) r:R];
+    [CATransaction commit];
 }
 - (instancetype)initWithFrame:(CGRect)f {
     self = [super initWithFrame:f]; if (!self) return nil;
@@ -3407,6 +4187,9 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
     self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     id ls = MSConfig()[@"LookSpeed"]; _lookSpeed = ls ? [ls floatValue] : 1; if (_lookSpeed <= 0) _lookSpeed = 1;
     _ctls = [NSMutableArray array];
+    _faceOf = [NSMapTable strongToStrongObjectsMapTable];
+    _tap = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    { id v = MSConfig()[@"TouchHaptics"]; _tapOn = [v respondsToSelector:@selector(boolValue)] ? [v boolValue] : MSPref(@"CyPortTouchHaptics", 1) != 0; }
     GCExtendedGamepad *g = g_pad;
     struct { __unsafe_unretained NSString *l; __unsafe_unretained GCControllerButtonInput *b; int dx, dy; NSInteger key; } d[] = {
         { @"A", g.buttonA }, { @"B", g.buttonB }, { @"X", g.buttonX }, { @"Y", g.buttonY },
@@ -3422,9 +4205,11 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
         MSCtl *c = [MSCtl new]; c.kind = MSCtlButton; c.label = d[i].l; c.button = d[i].b; c.dpadX = d[i].dx; c.dpadY = d[i].dy; c.key = d[i].key; [_ctls addObject:c];
     }
     MSCtl *t = [MSCtl new]; t.kind = MSCtlToggle; t.label = @"🎮"; [_ctls addObject:t];
+    MSCtl *ed = [MSCtl new]; ed.kind = MSCtlEdit; ed.label = @"✎"; [_ctls addObject:ed];
+    for (NSString *l in @[ @"−", @"+", @"↺", @"✓" ]) { MSCtl *x = [MSCtl new]; x.kind = MSCtlTool; x.label = l; [_ctls addObject:x]; }
     for (MSCtl *c in _ctls) {
         c.shape = [CAShapeLayer layer]; c.shape.lineWidth = 1.5; [self.layer addSublayer:c.shape];
-        c.text = [CATextLayer layer]; c.text.contentsScale = UIScreen.mainScreen.scale; c.text.alignmentMode = kCAAlignmentCenter;
+        c.text = [CATextLayer layer]; c.text.contentsScale = MSPhoneScreen().scale; c.text.alignmentMode = kCAAlignmentCenter;
         c.text.foregroundColor = [UIColor colorWithWhite:1 alpha:0.85].CGColor; c.text.font = (__bridge CFTypeRef)[UIFont systemFontOfSize:14 weight:UIFontWeightBold];
         [self.layer addSublayer:c.text];
     }
@@ -3441,45 +4226,165 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
     return self;
 }
 - (void)msLayout {
-    CGSize S = self.bounds.size; if (CGSizeEqualToSize(S, _laidOut)) return; _laidOut = S;
-    UIEdgeInsets in = self.safeAreaInsets; CGFloat L = MAX(in.left, 16), R = S.width - MAX(in.right, 16), H = S.height - MAX(in.bottom, 8), T = MAX(in.top, 8);
-    NSDictionary *pos = @{
-        @"A": @[ @(R - 85), @(H - 40), @27 ],  @"B": @[ @(R - 35), @(H - 90), @27 ],  @"X": @[ @(R - 135), @(H - 90), @27 ], @"Y": @[ @(R - 85), @(H - 140), @27 ],
-        @"RT": @[ @(R - 40), @(T + 40), @30 ], @"RB": @[ @(R - 115), @(T + 34), @24 ],
-        @"LT": @[ @(L + 40), @(T + 40), @30 ], @"LB": @[ @(L + 115), @(T + 34), @24 ],
-        @"L3": @[ @(L + 24), @(H - 24), @20 ], @"R3": @[ @(R - 170), @(H - 22), @20 ],
-        @"▲": @[ @(L + 190), @(T + 22), @16 ], @"▼": @[ @(L + 190), @(T + 86), @16 ], @"◀": @[ @(L + 158), @(T + 54), @16 ], @"▶": @[ @(L + 222), @(T + 54), @16 ],
-        @"⧉": @[ @(S.width / 2 - 55), @(T + 20), @17 ], @"≡": @[ @(S.width / 2 + 55), @(T + 20), @17 ], @"🎮": @[ @(S.width / 2), @(T + 20), @17 ],
-        @"Esc": @[ @(S.width / 2 - 120), @(T + 20), @19 ], @"Space": @[ @(S.width / 2 + 120), @(T + 20), @21 ], @"Enter": @[ @(S.width / 2 + 175), @(T + 20), @21 ],
-    };
-    _lHome = CGPointMake(L + 115, H - 105); _rHome = CGPointMake(-1000, -1000);   /* no right stick: swipe on the right half to look */
+    /* iPhone Duo: shim/PadLayout.c (AltDoug, PR #12) places everything for its two screens, upright or sideways, around
+       the status pill and the game's HUD. Other phones and iPads: the fixed DK-Bananza-style layout. */
+    CGSize S = self.bounds.size; NSDictionary *pos; BOOL force = _force; _force = NO;
+    if (MSIsDuo()) {
+        /* shim/PadLayout.c places everything (screen shape, safe area, the game's picture and HUD, iPhone Duo status pill);
+           laid out again whenever one of those changes */
+        UIEdgeInsets in = self.safeAreaInsets; double gw, gh; MacShimScreenInfo(&gw, &gh, 0, 0);
+        MSPadScreen sc = MSPadScreenFor(self, gw, gh);
+        static MSPadScreen last;                     /* field by field: memcmp would also compare the struct's padding */
+        if (sc.w == last.w && sc.h == last.h && sc.top == last.top && sc.left == last.left && sc.bottom == last.bottom && sc.right == last.right &&
+            sc.gameW == last.gameW && sc.gameH == last.gameH && sc.duoInner == last.duoInner &&
+            sc.cutX0 == last.cutX0 && sc.cutY0 == last.cutY0 && sc.cutX1 == last.cutX1 && sc.cutY1 == last.cutY1 && !force) return;
+        last = sc;
+        MSPadPos pp[MS_PAD_COUNT]; MSPadLayout(sc, pp);
+        static NSDictionary *ids; static dispatch_once_t o; dispatch_once(&o, ^{ ids = @{
+            @"A": @(MS_PAD_A), @"B": @(MS_PAD_B), @"X": @(MS_PAD_X), @"Y": @(MS_PAD_Y), @"LB": @(MS_PAD_LB), @"LT": @(MS_PAD_LT),
+            @"RB": @(MS_PAD_RB), @"RT": @(MS_PAD_RT), @"L3": @(MS_PAD_L3), @"R3": @(MS_PAD_R3),
+            @"▲": @(MS_PAD_UP), @"▼": @(MS_PAD_DOWN), @"◀": @(MS_PAD_LEFT), @"▶": @(MS_PAD_RIGHT),
+            @"⧉": @(MS_PAD_VIEW), @"≡": @(MS_PAD_MENU), @"🎮": @(MS_PAD_TOGGLE), @"Esc": @(MS_PAD_ESC), @"Space": @(MS_PAD_SPACE), @"Enter": @(MS_PAD_ENTER) }; });
+        NSMutableDictionary *m = [NSMutableDictionary dictionary];
+        for (NSString *k in ids) { MSPadPos q = pp[[ids[k] intValue]]; m[k] = @[ @(q.x), @(q.y), @(q.r) ]; }
+        pos = m;
+        MSLogf(@"touch controls laid out for %.0fx%.0f pt (safe area T%.0f L%.0f B%.0f R%.0f%@)", S.width, S.height, in.top, in.left, in.bottom, in.right,
+               sc.duoInner ? @", iPhone Duo inner screen" : @"");
+        g_stickR = pp[MS_PAD_STICK].r > 0 ? pp[MS_PAD_STICK].r : 60;
+        _lHome = CGPointMake(pp[MS_PAD_STICK].x, pp[MS_PAD_STICK].y); _rHome = CGPointMake(-1000, -1000);   /* no right stick: swipe on the right half to look */
+        /* the A/B/X/Y diamond (msFaceAt) from where the layout put the four buttons */
+        CGPoint a = CGPointMake(pp[MS_PAD_A].x, pp[MS_PAD_A].y), y = CGPointMake(pp[MS_PAD_Y].x, pp[MS_PAD_Y].y);
+        _faceC = CGPointMake((pp[MS_PAD_A].x + pp[MS_PAD_B].x + pp[MS_PAD_X].x + pp[MS_PAD_Y].x) / 4, (pp[MS_PAD_A].y + pp[MS_PAD_B].y + pp[MS_PAD_X].y + pp[MS_PAD_Y].y) / 4);
+        _faceGap = hypot(a.x - y.x, a.y - y.y) / 2; _faceR = pp[MS_PAD_A].r;
+    } else {
+        if (CGSizeEqualToSize(S, _laidOut) && !force) return; _laidOut = S;
+        UIEdgeInsets in = self.safeAreaInsets; CGFloat L = MAX(in.left, 16), R = S.width - MAX(in.right, 16), H = S.height - MAX(in.bottom, 8), T = MAX(in.top, 8);
+        pos = @{
+            @"A": @[ @(R - 85), @(H - 40), @27 ],  @"B": @[ @(R - 35), @(H - 90), @27 ],  @"X": @[ @(R - 135), @(H - 90), @27 ], @"Y": @[ @(R - 85), @(H - 140), @27 ],
+            @"RT": @[ @(R - 40), @(T + 40), @30 ], @"RB": @[ @(R - 115), @(T + 34), @24 ],
+            @"LT": @[ @(L + 40), @(T + 40), @30 ], @"LB": @[ @(L + 115), @(T + 34), @24 ],
+            @"L3": @[ @(L + 24), @(H - 24), @20 ], @"R3": @[ @(R - 170), @(H - 22), @20 ],
+            @"▲": @[ @(L + 190), @(T + 22), @16 ], @"▼": @[ @(L + 190), @(T + 86), @16 ], @"◀": @[ @(L + 158), @(T + 54), @16 ], @"▶": @[ @(L + 222), @(T + 54), @16 ],
+            @"⧉": @[ @(S.width / 2 - 55), @(T + 20), @17 ], @"≡": @[ @(S.width / 2 + 55), @(T + 20), @17 ], @"🎮": @[ @(S.width / 2), @(T + 20), @17 ],
+            @"Esc": @[ @(S.width / 2 - 120), @(T + 20), @19 ], @"Space": @[ @(S.width / 2 + 120), @(T + 20), @21 ], @"Enter": @[ @(S.width / 2 + 175), @(T + 20), @21 ],
+        };
+        _lHome = CGPointMake(L + 115, H - 105); _rHome = CGPointMake(-1000, -1000);   /* no fixed right stick: the right side is the camera */
+        _faceC = CGPointMake(R - 85, H - 90); _faceGap = 50; _faceR = 27;               /* the A/B/X/Y diamond's centre (see pos) */
+        g_stickR = 60;
+    }
+    {   /* the layout editor's own buttons, then the player's saved layout for this screen size (✎ editor) */
+        NSMutableDictionary *m = [pos mutableCopy]; CGFloat top = MAX(self.safeAreaInsets.top, 8);
+        m[@"✎"] = @[ @(S.width / 2), @(top + 58), @15 ];
+        NSArray *tools = @[ @"−", @"+", @"↺", @"✓" ];
+        for (NSUInteger i = 0; i < tools.count; i++) m[tools[i]] = @[ @(S.width / 2 - 105 + 70 * (double)i), @(S.height / 2), @24 ];
+        NSDictionary *saved = [NSUserDefaults.standardUserDefaults dictionaryForKey:[self msLayoutKey]];
+        for (NSString *k in saved) {
+            NSArray *v = saved[k]; if (![v isKindOfClass:NSArray.class] || v.count != 3) continue;
+            CGPoint q = CGPointMake([v[0] doubleValue] * S.width, [v[1] doubleValue] * S.height); double r = [v[2] doubleValue];
+            if ([k isEqual:@"stick"]) { _lHome = q; g_stickR = fmax(30, fmin(r, 110)); }
+            else if (m[k] && ![tools containsObject:k]) m[k] = @[ @(q.x), @(q.y), @(fmax(12, fmin(r, 60))) ];
+        }
+        pos = m;
+        /* the A/B/X/Y diamond (msFaceAt) from where the four buttons are now */
+        NSArray *fa = pos[@"A"], *fb = pos[@"B"], *fx = pos[@"X"], *fy = pos[@"Y"];
+        if (fa && fb && fx && fy) {
+            CGPoint c = CGPointMake(([fa[0] doubleValue] + [fb[0] doubleValue] + [fx[0] doubleValue] + [fy[0] doubleValue]) / 4,
+                                    ([fa[1] doubleValue] + [fb[1] doubleValue] + [fx[1] doubleValue] + [fy[1] doubleValue]) / 4);
+            CGFloat g = 0, r = 0; for (NSArray *v in @[ fa, fb, fx, fy ]) { g = fmax(g, hypot([v[0] doubleValue] - c.x, [v[1] doubleValue] - c.y)); r = fmax(r, [v[2] doubleValue]); }
+            _faceC = c; _faceGap = g; _faceR = r;
+        }
+    }
     [CATransaction begin]; [CATransaction setDisableActions:YES];
     for (MSCtl *c in _ctls) {
         NSArray *p = pos[c.label]; c.center = CGPointMake([p[0] doubleValue], [p[1] doubleValue]); c.r = [p[2] doubleValue];
-        c.shape.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.center.x - c.r, c.center.y - c.r, 2 * c.r, 2 * c.r)].CGPath;
-        CGFloat fs = c.label.length > 2 ? 9 : c.r < 20 ? 11 : 14; c.text.fontSize = fs; c.text.frame = CGRectMake(c.center.x - c.r, c.center.y - fs * 0.62, 2 * c.r, fs * 1.3);
-        c.text.string = c.label; [self msPaint:c];
+        [self msPlace:c];
     }
-    [self msDrawStick:_stickBase knob:_stickKnob at:_lHome offset:CGPointZero r:60];
+    [self msDrawStick:_stickBase knob:_stickKnob at:_lHome offset:CGPointZero r:g_stickR];
     _rBase.hidden = _rKnob.hidden = YES;
     [CATransaction commit];
 }
+- (void)msPlace:(MSCtl *)c {
+    c.shape.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.center.x - c.r, c.center.y - c.r, 2 * c.r, 2 * c.r)].CGPath;
+    CGFloat fs = c.label.length > 2 ? 9 : c.r < 20 ? 11 : 14; c.text.fontSize = fs; c.text.frame = CGRectMake(c.center.x - c.r, c.center.y - fs * 0.62, 2 * c.r, fs * 1.3);
+    c.text.string = c.label; [self msPaint:c];
+}
+/* ---- touch layout editor (✎): drag a button or the move stick, − / + resize the one picked, ↺ back to the default
+   layout, ✓ saves. Saved per screen size (an iPhone Duo folded and unfolded keep their own), as fractions of it.
+   Idea from aledemo82's touch control editor (PR #12). */
+- (NSString *)msLayoutKey { CGSize S = self.bounds.size; return [NSString stringWithFormat:@"CyPortTouchLayout-%.0fx%.0f", S.width, S.height]; }
+- (void)msSetEditing:(BOOL)on {
+    if (on) [self msReleaseAll];
+    _editing = on; _sel = nil; _selStick = NO; _dragT = nil;
+    [CATransaction begin]; [CATransaction setDisableActions:YES];
+    for (MSCtl *x in _ctls) [self msPaint:x];
+    _stickBase.strokeColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
+    [CATransaction commit];
+    MSLogf(@"touch controls: layout editor %@", on ? @"open" : @"closed");
+}
+- (void)msSaveLayout {
+    CGSize S = self.bounds.size; if (S.width < 1 || S.height < 1) return;
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    for (MSCtl *c in _ctls) if (c.kind != MSCtlTool) d[c.label] = @[ @(c.center.x / S.width), @(c.center.y / S.height), @(c.r) ];
+    d[@"stick"] = @[ @(_lHome.x / S.width), @(_lHome.y / S.height), @(g_stickR) ];
+    [NSUserDefaults.standardUserDefaults setObject:d forKey:[self msLayoutKey]];
+    MSLogf(@"touch controls: layout saved for %.0fx%.0f pt", S.width, S.height);
+}
+- (void)msEditTouches:(NSSet<UITouch *> *)ts phase:(int)ph {
+    for (UITouch *t in ts) {
+        CGPoint p = [t locationInView:self];
+        if (ph == 0) {
+            MSCtl *c = [self msCtlAt:p];
+            if (c.kind == MSCtlTool) {
+                [_tap impactOccurredWithIntensity:0.5];
+                if ([c.label isEqual:@"✓"]) { [self msSaveLayout]; [self msSetEditing:NO]; _force = YES; [self msLayout]; return; }
+                if ([c.label isEqual:@"↺"]) {
+                    [NSUserDefaults.standardUserDefaults removeObjectForKey:[self msLayoutKey]];
+                    _sel = nil; _selStick = NO; _force = YES; [self msLayout]; MSLogf(@"touch controls: default layout"); continue;
+                }
+                double k = [c.label isEqual:@"+"] ? 1.12 : 1 / 1.12;
+                [CATransaction begin]; [CATransaction setDisableActions:YES];
+                if (_selStick) { g_stickR = fmax(30, fmin(g_stickR * k, 110)); [self msDrawStick:_stickBase knob:_stickKnob at:_lHome offset:CGPointZero r:g_stickR]; }
+                else if (_sel) { _sel.r = fmax(12, fmin(_sel.r * k, 60)); [self msPlace:_sel]; }
+                [CATransaction commit];
+                continue;
+            }
+            MSCtl *old = _sel; _sel = nil; _selStick = NO;
+            if (c) { _sel = c; _dragOff = CGPointMake(c.center.x - p.x, c.center.y - p.y); }
+            else if ([self msNear:p to:_lHome r:g_stickR + 10]) { _selStick = YES; _dragOff = CGPointMake(_lHome.x - p.x, _lHome.y - p.y); }
+            if (_sel || _selStick) _dragT = t;
+            [CATransaction begin]; [CATransaction setDisableActions:YES];
+            if (old) [self msPaint:old]; if (_sel) [self msPaint:_sel];
+            _stickBase.strokeColor = (_selStick ? [UIColor colorWithRed:0.99 green:0.93 blue:0.04 alpha:1] : [UIColor colorWithWhite:1 alpha:0.35]).CGColor;
+            [CATransaction commit];
+        } else if (t == _dragT) {
+            CGSize S = self.bounds.size; CGPoint q = CGPointMake(fmax(0, fmin(p.x + _dragOff.x, S.width)), fmax(0, fmin(p.y + _dragOff.y, S.height)));
+            [CATransaction begin]; [CATransaction setDisableActions:YES];
+            if (_selStick) { _lHome = q; [self msDrawStick:_stickBase knob:_stickKnob at:_lHome offset:CGPointZero r:g_stickR]; }
+            else if (_sel) { _sel.center = q; [self msPlace:_sel]; }
+            [CATransaction commit];
+            if (ph == 2) _dragT = nil;
+        }
+    }
+}
 - (void)msDrawStick:(CAShapeLayer *)b knob:(CAShapeLayer *)k at:(CGPoint)p offset:(CGPoint)o r:(CGFloat)r {
     b.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(p.x - r, p.y - r, 2 * r, 2 * r)].CGPath;
-    k.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(p.x + o.x - 24, p.y + o.y - 24, 48, 48)].CGPath;
+    CGFloat kr = r * 0.4; k.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(p.x + o.x - kr, p.y + o.y - kr, 2 * kr, 2 * kr)].CGPath;
     b.hidden = k.hidden = _hiddenByUser;
 }
 - (BOOL)msNear:(CGPoint)p to:(CGPoint)c r:(CGFloat)r { CGFloat dx = p.x - c.x, dy = p.y - c.y; return dx * dx + dy * dy <= r * r; }
 - (void)msPaint:(MSCtl *)c {
-    BOOL on = c.touch != nil, hide = c.kind != MSCtlToggle && _hiddenByUser;
+    BOOL on = c.touch != nil, hide = c.kind == MSCtlTool ? !_editing : (c.kind != MSCtlToggle && _hiddenByUser);
     c.shape.hidden = c.text.hidden = hide;
-    c.shape.fillColor = [UIColor colorWithWhite:1 alpha:on ? 0.45 : 0.12].CGColor;
-    c.shape.strokeColor = [UIColor colorWithWhite:1 alpha:0.4].CGColor;
+    c.shape.fillColor = [UIColor colorWithWhite:1 alpha:on ? 0.45 : c.kind == MSCtlTool ? 0.3 : 0.12].CGColor;
+    c.shape.strokeColor = (c == _sel ? [UIColor colorWithRed:0.99 green:0.93 blue:0.04 alpha:1] : [UIColor colorWithWhite:1 alpha:_editing ? 0.8 : 0.4]).CGColor;
+    c.shape.lineWidth = c == _sel ? 3 : 1.5;
     if (c.kind == MSCtlToggle) c.shape.opacity = c.text.opacity = _hiddenByUser ? 0.4 : 1;
 }
 - (MSCtl *)msCtlAt:(CGPoint)p {
     for (MSCtl *c in _ctls) {
         if (_hiddenByUser && c.kind != MSCtlToggle) continue;
+        if (c.kind == MSCtlTool && !_editing) continue;
+        if (_editing && c.kind == MSCtlToggle) continue;             /* no hiding the pad while editing it */
         CGFloat dx = p.x - c.center.x, dy = p.y - c.center.y, r = c.r + 8;
         if (dx * dx + dy * dy <= r * r) return c;
     }
@@ -3488,7 +4393,8 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
 /* empty screen: in gameplay it's ours (stick / camera); in menus it falls through to the game as a mouse click */
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
     if (self.hidden) return nil;
-    if ([self msCtlAt:p]) return self;
+    if (_editing) return self;                                  /* the editor gets every touch; the game none */
+    if ([self msCtlAt:p] || [self msInFace:p]) return self;
     if (_hiddenByUser) return nil;
     /* the drawn sticks always work (the game doesn't reliably lock the pointer or hide the cursor in gameplay); a quick
        tap on one in a menu is passed on to the game as a click, so menu items under them stay usable */
@@ -3499,18 +4405,41 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
     int x = 0, y = 0; for (MSCtl *c in _ctls) if (c.touch) { x += c.dpadX; y += c.dpadY; }
     MSPadSetStick(g_pad.dpad, x, y);
 }
+/* let go of everything: the pad was hidden (a controller or mouse took over) or a finger's end never arrived */
+- (void)msReleaseAll {
+    NSMutableSet *all = [NSMutableSet set];
+    for (UITouch *t in @[ _moveTouch ?: NSNull.null, _rTouch ?: NSNull.null, _lookTouch ?: NSNull.null ]) if (t != (id)NSNull.null) [all addObject:t];
+    for (MSCtl *c in _ctls) if (c.touch) [all addObject:c.touch];
+    for (UITouch *t in _faceOf) [all addObject:t];
+    if (all.count) [self touchesEnded:all withEvent:nil];
+    for (MSCtl *c in _ctls) if (c.touch) [self msRelease:c];
+    _moveTouch = _rTouch = _lookTouch = nil;
+}
+- (void)msDropGoneTouches {
+    NSMutableSet *gone = [NSMutableSet set];
+    for (UITouch *t in @[ _moveTouch ?: NSNull.null, _rTouch ?: NSNull.null, _lookTouch ?: NSNull.null ]) if (t != (id)NSNull.null && MSTouchGone(t)) [gone addObject:t];
+    for (MSCtl *c in _ctls) if (c.touch && MSTouchGone(c.touch)) [gone addObject:c.touch];
+    for (UITouch *t in _faceOf) if (MSTouchGone(t)) [gone addObject:t];
+    if (!gone.count) return;
+    static int n; if (n++ < 5) MSLogf(@"touch pad: %lu finger(s) whose lift never arrived let go", (unsigned long)gone.count);
+    [self touchesEnded:gone withEvent:nil];
+}
 - (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
+    if (_editing) { [self msEditTouches:ts phase:0]; return; }
+    [self msDropGoneTouches];
     for (UITouch *t in ts) {
         CGPoint p = [t locationInView:self]; MSCtl *c = [self msCtlAt:p];
+        if (c.kind == MSCtlEdit) { [self msFeel]; [self msSetEditing:YES]; return; }
         if (c && c.kind == MSCtlToggle) {
             _hiddenByUser = !_hiddenByUser; [CATransaction begin]; [CATransaction setDisableActions:YES];
             for (MSCtl *x in _ctls) [self msPaint:x];
             _stickBase.hidden = _stickKnob.hidden = _rBase.hidden = _rKnob.hidden = _hiddenByUser;
             [CATransaction commit]; continue;
         }
+        if ((!c || [self msIsFace:c]) && [self msInFace:p]) { [self msFaceTouch:t to:[self msFaceAt:p]]; continue; }
         if (c) {
             c.touch = t; MSPadSetButton(c.button, 1); if (c.dpadX || c.dpadY) [self msSyncDpad]; if (c.key) MSKey((GCKeyCode)c.key, YES);
-            [self msPaint:c]; continue;
+            [self msPaint:c]; [self msFeel]; continue;
         }
         if (!_rTouch && [self msNear:p to:_rHome r:80]) { _rTouch = t; _stickT0 = t.timestamp; _stickP0 = p; _stickMax = 0; [self msRightStick:p]; continue; }
         if (p.x < self.bounds.size.width * 0.45) {
@@ -3518,16 +4447,22 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
             _moveTouch = t; _moveOrigin = [self msNear:p to:_lHome r:85] ? _lHome : p;   /* on the stick: centred; elsewhere: it follows the thumb */
             _stickT0 = t.timestamp; _stickP0 = p; _stickMax = 0;
             [CATransaction begin]; [CATransaction setDisableActions:YES];
-            [self msDrawStick:_stickBase knob:_stickKnob at:_moveOrigin offset:CGPointZero r:60];
+            [self msDrawStick:_stickBase knob:_stickKnob at:_moveOrigin offset:CGPointZero r:g_stickR];
             [CATransaction commit];
             [self msLeftStick:p];
-        } else if (!_lookTouch) { _lookTouch = t; _lookLast = p; _lookT = t.timestamp; _lookX = _lookY = 0; }
+        } else if (!_lookTouch) {
+            _lookTouch = t; _lookLast = p; _lookT = t.timestamp; _lookX = _lookY = 0;
+            if (MSLookMode() == 2 && g_pad) { _lookC = p; _rBase.opacity = _rKnob.opacity = 1; [self msLookStick:p]; }
+        }
     }
 }
 - (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
+    if (_editing) { [self msEditTouches:ts phase:1]; return; }
     for (UITouch *t in ts) {
         CGPoint p = [t locationInView:self];
         if (t == _moveTouch || t == _rTouch) _stickMax = MAX(_stickMax, hypot(p.x - _stickP0.x, p.y - _stickP0.y));
+        if ([_faceOf objectForKey:t]) { [self msFaceTouch:t to:[self msInFace:p] || hypot(p.x - _faceC.x, p.y - _faceC.y) < _faceGap + _faceR * 2.2 ? [self msFaceAt:p] : nil]; continue; }
+        if (t == _lookTouch && MSLookMode() == 2 && g_pad) { [self msLookStick:p]; continue; }
         if (t == _moveTouch) [self msLeftStick:p];
         else if (t == _rTouch) [self msRightStick:p];
         else if (t == _lookTouch) {
@@ -3556,11 +4491,14 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
     _wasd = want;
 }
 - (void)msLeftStick:(CGPoint)p {
-    CGFloat dx = p.x - _moveOrigin.x, dy = p.y - _moveOrigin.y, len = hypot(dx, dy), k = len > 60 ? 60 / len : 1;
-    MSPadSetStick(g_pad.leftThumbstick, dx * k / 60, -dy * k / 60);
-    if (!g_pad) { float x = dx * k / 60, y = -dy * k / 60; [self msWASD:(y > 0.4) | (x < -0.4) << 1 | (y < -0.4) << 2 | (x > 0.4) << 3]; }
+    CGFloat R = g_stickR, dx = p.x - _moveOrigin.x, dy = p.y - _moveOrigin.y, len = hypot(dx, dy), k = len > R ? R / len : 1;
+    /* like DK Bananza's stick: a small dead zone (a resting thumb doesn't creep), full tilt at 80% of the ring */
+    float sx = 0, sy = 0; CGFloat d = len * k, dz = R * 0.1, full = R * 0.8;
+    if (d > dz) { CGFloat m = fmin((d - dz) / (full - dz), 1) / len; sx = dx * m; sy = -dy * m; }
+    MSPadSetStick(g_pad.leftThumbstick, sx, sy);
+    if (!g_pad) { float x = dx * k / R, y = -dy * k / R; [self msWASD:(y > 0.4) | (x < -0.4) << 1 | (y < -0.4) << 2 | (x > 0.4) << 3]; }
     [CATransaction begin]; [CATransaction setDisableActions:YES];
-    [self msDrawStick:_stickBase knob:_stickKnob at:_moveOrigin offset:CGPointMake(dx * k, dy * k) r:60];
+    [self msDrawStick:_stickBase knob:_stickKnob at:_moveOrigin offset:CGPointMake(dx * k, dy * k) r:g_stickR];
     [CATransaction commit];
 }
 - (void)msRightStick:(CGPoint)p {
@@ -3572,32 +4510,37 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
 }
 - (void)msRelease:(MSCtl *)c { c.touch = nil; MSPadSetButton(c.button, 0); if (c.key) MSKey((GCKeyCode)c.key, NO); if (c.dpadX || c.dpadY) [self msSyncDpad]; [self msPaint:c]; }
 - (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
+    if (_editing && e) { [self msEditTouches:ts phase:2]; return; }
     for (UITouch *t in ts) {
-        if ((t == _moveTouch || t == _rTouch) && !g_pointerLocked && t.timestamp - _stickT0 < 0.25 && _stickMax < 12) {
+        if ((t == _moveTouch || t == _rTouch) && e && !g_pointerLocked && t.timestamp - _stickT0 < 0.25 && _stickMax < 12) {
             MSHostView *h = g_hostView; CGPoint q = MSTouchIn(t, h);     /* quick tap on a stick in a menu: a click */
             if (h) [h msClick:q right:NO];
         }
         if (t == _moveTouch) {
             _moveTouch = nil; MSPadSetStick(g_pad.leftThumbstick, 0, 0); [self msWASD:0];
             [CATransaction begin]; [CATransaction setDisableActions:YES];
-            [self msDrawStick:_stickBase knob:_stickKnob at:_lHome offset:CGPointZero r:60];
+            [self msDrawStick:_stickBase knob:_stickKnob at:_lHome offset:CGPointZero r:g_stickR];
             [CATransaction commit];
         } else if (t == _rTouch) {
             _rTouch = nil; MSPadSetStick(g_pad.rightThumbstick, 0, 0);
             [CATransaction begin]; [CATransaction setDisableActions:YES];
             [self msDrawStick:_rBase knob:_rKnob at:_rHome offset:CGPointZero r:55];
             [CATransaction commit];
-        } else if (t == _lookTouch) { _lookTouch = nil; _lookX = _lookY = 0; g_lookFingerAt = 0; }   /* the stick eases back in MSLookFlushStick */
+        } else if (t == _lookTouch) {
+            _lookTouch = nil; _lookX = _lookY = 0; g_lookFingerAt = 0;   /* swipe: the stick eases back in MSLookFlushStick */
+            if (MSLookMode() == 2 && g_pad) { MSPadSetStick(g_pad.rightThumbstick, 0, 0); _rBase.hidden = _rKnob.hidden = YES; }
+        }
+        if ([_faceOf objectForKey:t]) { [self msFaceTouch:t to:nil]; continue; }
         for (MSCtl *c in _ctls) if (c.touch == t) [self msRelease:c];
     }
 }
 - (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self touchesEnded:ts withEvent:e]; }
 - (void)msTick:(CADisplayLink *)l {
     BOOL want = g_frames > 60 && !(g_vpad ? g_realPad : MSRealControllerConnected()) && !g_gcmCount;
-    if (want != _shown) { _shown = want; self.hidden = !want; if (want) MSLogf(@"touch controls shown"); }
+    if (want != _shown) { _shown = want; self.hidden = !want; if (want) MSLogf(@"touch controls shown"); else { if (_editing) [self msSetEditing:NO]; [self msReleaseAll]; } }
     if (!want) return;
     [self msLayout];
-    float op = (g_pointerLocked || g_cursorHidden || _moveTouch || _rTouch) ? 1 : 0.35;    /* sticks dimmed in menus */
+    float op = (g_pointerLocked || g_cursorHidden || _moveTouch || _rTouch || _lookTouch) ? 1 : 0.35;    /* sticks dimmed in menus */
     if (_stickBase.opacity != op) { [CATransaction begin]; [CATransaction setDisableActions:YES];
         _stickBase.opacity = _stickKnob.opacity = _rBase.opacity = _rKnob.opacity = op; [CATransaction commit]; }
     /* camera look is driven from touchesMoved; here it only stops when the finger rests */
@@ -3615,7 +4558,7 @@ typedef enum { MSCtlButton, MSCtlToggle } MSCtlKind;
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return MSAllowedOrientations(); }
 @end
 static UIWindow *g_padWin;
 /* test aid: AutoKeys = "20:a,40:down,60:tap@650/360,70:scroll@500/250/-400,80:rsdown" runs after the first frames
@@ -3666,6 +4609,162 @@ static void MSAutoKeys(void) {
         }
     });
 }
+/* ---------------------------------------------------------------- controller effects: DualSense adaptive triggers + rumble
+ * The game drives a DualSense's triggers (GCDualSenseAdaptiveTrigger setMode...) and both rumble motors (CoreHaptics
+ * players per controller, ControllerObserver -triggerHapticsForHapticEngine:intensity:player:) with no limit of its own.
+ * On the phone every one of those calls is a Bluetooth report to the controller, and the same channel carries the
+ * controller's own input back: tester report "the controls get lost, especially the PS5 controller; the adaptive
+ * triggers malfunction". So here:
+ *  - trigger modes: an unchanged mode is not sent again; changes go out at most every 50 ms (the newest wins) and
+ *    always from the main thread (GameController is not made for other threads);
+ *  - rumble: a new level goes out when it starts/stops or changes noticeably, otherwise at most ~15 times a second;
+ *  - triggers are reset to off when a DualSense connects (it keeps the last effect, e.g. after a crash) and when the
+ *    game goes to the background;
+ *  - start screen switches "Vibration" (CyPortVibration) and "Adaptive triggers" (CyPortAdaptiveTriggers), or plist
+ *    Vibration / AdaptiveTriggers = NO, turn them off.
+ * Logged every 30 s with the input report: "controller effects: ...". */
+static BOOL MSTriggersOn(void) { id v = MSConfig()[@"AdaptiveTriggers"]; return [v respondsToSelector:@selector(boolValue)] ? [v boolValue] : MSPref(@"CyPortAdaptiveTriggers", 1) != 0; }
+static BOOL MSRumbleOn(void)   { id v = MSConfig()[@"Vibration"];        return [v respondsToSelector:@selector(boolValue)] ? [v boolValue] : MSPref(@"CyPortVibration", 1) != 0; }
+typedef struct { int mode; float a, b, c; } MSTrigFx;           /* mode 0 off, 1 feedback, 2 weapon, 3 vibration */
+@interface MSTrigState : NSObject { @public MSTrigFx last, want; BOOL hasLast, hasWant, queued; double at; } @end
+@implementation MSTrigState @end
+static char g_trigKey;
+static NSHashTable *g_trigSeen;                                  /* main thread */
+static _Atomic long long g_trigAsked, g_trigSent, g_rumAsked, g_rumSent, g_fxOffMain;
+#define MS_TRIG_CLASSES 4
+static Class g_trigCls[MS_TRIG_CLASSES]; static IMP g_trigImp[MS_TRIG_CLASSES][4];
+static const char *const g_trigSel[4] = { "setModeOff", "setModeFeedbackWithStartPosition:resistiveStrength:",
+                                          "setModeWeaponWithStartPosition:endPosition:resistiveStrength:", "setModeVibrationWithStartPosition:amplitude:frequency:" };
+static IMP MSTrigOrig(id t, int mode) {
+    for (Class c = object_getClass(t); c; c = class_getSuperclass(c))
+        for (int i = 0; i < MS_TRIG_CLASSES; i++) if (g_trigCls[i] == c && g_trigImp[i][mode]) return g_trigImp[i][mode];
+    return NULL;
+}
+static void MSTrigApply(id t, MSTrigFx f) {                      /* main thread */
+    IMP o = MSTrigOrig(t, f.mode); if (!o) return;
+    SEL s = sel_registerName(g_trigSel[f.mode]);
+    switch (f.mode) {
+        case 0: ((void (*)(id, SEL))o)(t, s); break;
+        case 1: ((void (*)(id, SEL, float, float))o)(t, s, f.a, f.b); break;
+        case 2: ((void (*)(id, SEL, float, float, float))o)(t, s, f.a, f.b, f.c); break;
+        case 3: ((void (*)(id, SEL, float, float, float))o)(t, s, f.a, f.b, f.c); break;
+    }
+    g_trigSent++;
+}
+static BOOL MSTrigSame(MSTrigFx x, MSTrigFx y) {
+    return x.mode == y.mode && (x.mode == 0 || (fabsf(x.a - y.a) < 0.01f && fabsf(x.b - y.b) < 0.01f && fabsf(x.c - y.c) < 0.01f));
+}
+static void MSTrigPump(id t) {                                   /* main thread */
+    MSTrigState *st = objc_getAssociatedObject(t, &g_trigKey); if (!st || !st->hasWant || st->queued) return;
+    if (st->hasLast && MSTrigSame(st->want, st->last)) { st->hasWant = NO; return; }
+    double wait = 0.05 - (CACurrentMediaTime() - st->at);
+    if (wait > 0) { st->queued = YES; MSAfter(wait, ^{ st->queued = NO; MSTrigPump(t); }); return; }
+    MSTrigFx f = st->want; st->hasWant = NO; st->last = f; st->hasLast = YES; st->at = CACurrentMediaTime();
+    MSTrigApply(t, f);
+}
+static void MSTrigWant(id t, MSTrigFx f) {                       /* any thread: the game's call, or ours */
+    void (^b)(void) = ^{
+        if (!g_trigSeen) g_trigSeen = [NSHashTable weakObjectsHashTable];
+        [g_trigSeen addObject:t];
+        MSTrigState *st = objc_getAssociatedObject(t, &g_trigKey);
+        if (!st) { st = [MSTrigState new]; objc_setAssociatedObject(t, &g_trigKey, st, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+        st->want = f; st->hasWant = YES; MSTrigPump(t);
+    };
+    if (NSThread.isMainThread) b(); else MSMainAsync(b);
+}
+static void MSTrigFromGame(id t, MSTrigFx f) {
+    g_trigAsked++; if (!NSThread.isMainThread) g_fxOffMain++;
+    static int n; if (n++ < 3) MSLogf(@"controller effects: the game set an adaptive trigger (mode %d, %@ thread)%@", f.mode, NSThread.isMainThread ? @"main" : @"other", MSTriggersOn() ? @"" : @" - switched off, sent as off");
+    if (!MSTriggersOn()) f = (MSTrigFx){ 0 };
+    MSTrigWant(t, f);
+}
+static void ms_trigOff(id t, SEL c) { MSTrigFromGame(t, (MSTrigFx){ 0 }); }
+static void ms_trigFeedback(id t, SEL c, float s, float r) { MSTrigFromGame(t, (MSTrigFx){ 1, s, r, 0 }); }
+static void ms_trigWeapon(id t, SEL c, float s, float e, float r) { MSTrigFromGame(t, (MSTrigFx){ 2, s, e, r }); }
+static void ms_trigVibration(id t, SEL c, float s, float a, float f) { MSTrigFromGame(t, (MSTrigFx){ 3, s, a, f }); }
+static void MSHookTriggerClass(Class c) {                        /* main thread */
+    if (!c) return;
+    int slot = -1;
+    for (int i = 0; i < MS_TRIG_CLASSES; i++) { if (g_trigCls[i] == c) return; if (!g_trigCls[i] && slot < 0) slot = i; }
+    if (slot < 0) return;
+    IMP mine[4] = { (IMP)ms_trigOff, (IMP)ms_trigFeedback, (IMP)ms_trigWeapon, (IMP)ms_trigVibration };
+    int hooked = 0;
+    for (int k = 0; k < 4; k++) {
+        SEL s = sel_registerName(g_trigSel[k]);
+        Method m = class_getInstanceMethod(c, s); if (!m) continue;
+        IMP old = method_getImplementation(m); if (old == mine[k]) continue;
+        /* only methods the class itself has: an inherited one stays with the superclass's hook */
+        unsigned n = 0; Method *own = class_copyMethodList(c, &n); BOOL isOwn = NO;
+        for (unsigned i = 0; i < n; i++) if (own[i] == m) isOwn = YES;
+        free(own);
+        if (!isOwn) continue;
+        g_trigImp[slot][k] = old; method_setImplementation(m, mine[k]); hooked++;
+    }
+    if (hooked) { g_trigCls[slot] = c; MSLogf(@"controller effects: watching adaptive triggers on %@", NSStringFromClass(c)); }
+}
+static void MSTrigResetPad(GCController *c) {                    /* main thread: both triggers back to off */
+    if (![c.physicalInputProfile isKindOfClass:GCDualSenseGamepad.class]) return;
+    GCDualSenseGamepad *g = (GCDualSenseGamepad *)c.physicalInputProfile;
+    for (GCDualSenseAdaptiveTrigger *t in @[ g.leftTrigger, g.rightTrigger ]) {
+        MSHookTriggerClass(object_getClass(t));
+        MSTrigState *st = objc_getAssociatedObject(t, &g_trigKey); if (st) st->hasLast = NO;   /* send even if we think it's off */
+        MSTrigWant(t, (MSTrigFx){ 0 });
+    }
+}
+static void MSTrigAllOff(void) {                                 /* main thread */
+    for (id t in g_trigSeen.allObjects) MSTrigWant(t, (MSTrigFx){ 0 });
+}
+typedef struct { const void *player; float last; double at; } MSRumState;
+static MSRumState g_rum[4]; static os_unfair_lock g_rumLock = OS_UNFAIR_LOCK_INIT;
+static IMP g_origRumble;
+static void ms_rumble(id self, SEL _cmd, id engine, float level, __strong id *player) {
+    g_rumAsked++; if (!NSThread.isMainThread) g_fxOffMain++;
+    if (!MSRumbleOn()) {                                         /* switched off: just stop what may still be running */
+        if (player && *player) { ((void (*)(id, SEL, id, float, __strong id *))g_origRumble)(self, _cmd, engine, 0, player); g_rumSent++; }
+        return;
+    }
+    BOOL send = !player || !*player;                             /* no player yet: the game makes one now */
+    double now = CACurrentMediaTime();
+    os_unfair_lock_lock(&g_rumLock);
+    MSRumState *st = NULL;
+    for (int i = 0; i < 4 && !st; i++) if (g_rum[i].player == player) st = &g_rum[i];
+    for (int i = 0; i < 4 && !st; i++) if (!g_rum[i].player) { st = &g_rum[i]; st->player = player; st->last = -1; }
+    if (!st) st = &g_rum[0];
+    float d = fabsf(level - st->last);
+    if (st->last < 0 || (level <= 0.001f) != (st->last <= 0.001f) || d >= 0.1f || (d > 0.01f && now - st->at >= 1 / 15.0)) send = YES;
+    if (send) { st->last = level; st->at = now; }
+    os_unfair_lock_unlock(&g_rumLock);
+    if (!send) return;
+    g_rumSent++;
+    ((void (*)(id, SEL, id, float, __strong id *))g_origRumble)(self, _cmd, engine, level, player);
+}
+static void MSFxReport(void) {
+    static long long ta, ts, ra, rs, om;
+    if (g_trigAsked == ta && g_rumAsked == ra) return;
+    MSLogf(@"controller effects: adaptive triggers %lld asked, %lld sent; rumble %lld asked, %lld sent%@%@",
+           g_trigAsked - ta, g_trigSent - ts, g_rumAsked - ra, g_rumSent - rs,
+           g_fxOffMain - om ? [NSString stringWithFormat:@" (%lld calls off the main thread)", g_fxOffMain - om] : @"",
+           MSTriggersOn() && MSRumbleOn() ? @"" : [NSString stringWithFormat:@" [%@%@]", MSTriggersOn() ? @"" : @"triggers off ", MSRumbleOn() ? @"" : @"vibration off"]);
+    ta = g_trigAsked; ts = g_trigSent; ra = g_rumAsked; rs = g_rumSent; om = g_fxOffMain;
+}
+static void MSHookControllerEffects(void) {                      /* main thread, once */
+    if (MSCfgD(@"EffectsGuard", 1) == 0) { MSLogf(@"controller effects: guard off (EffectsGuard = NO)"); return; }
+    MSHookTriggerClass(NSClassFromString(@"GCDualSenseAdaptiveTrigger"));
+    Class co = NSClassFromString(@"ControllerObserver");
+    Method m = co ? class_getInstanceMethod(co, NSSelectorFromString(@"triggerHapticsForHapticEngine:intensity:player:")) : NULL;
+    if (m) { g_origRumble = method_setImplementation(m, (IMP)ms_rumble); MSLogf(@"controller effects: rumble limited"); }
+    else MSLogf(@"controller effects: game's rumble method not found - left alone");
+    for (GCController *c in GCController.controllers) if (!c.isSnapshot) MSTrigResetPad(c);
+    [NSNotificationCenter.defaultCenter addObserverForName:GCControllerDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+        GCController *c = n.object; if (c.isSnapshot) return;
+        MSMainAsync(^{ MSTrigResetPad(c); });
+    }];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+        MSMainAsync(^{ MSTrigAllOff(); });
+    }];
+    MSLogf(@"controller effects: vibration %@, adaptive triggers %@", MSRumbleOn() ? @"on" : @"off", MSTriggersOn() ? @"on" : @"off");
+}
+
 static void MSTouchPadCreate(UIWindowScene *sc) {                 /* main thread, before the game's main() */
     MSAutoKeys();
     if ([MSConfig()[@"TouchControls"] isEqual:@NO]) return;
@@ -3692,7 +4791,7 @@ static void MSTouchPadCreate(UIWindowScene *sc) {                 /* main thread
         Method cur = class_getClassMethod(GCController.class, @selector(current));
         if (cur) g_origCurrent = method_setImplementation(cur, (IMP)ms_current);
     }
-    g_padWin = sc ? [[MSPadWindow alloc] initWithWindowScene:sc] : [[MSPadWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    g_padWin = sc ? [[MSPadWindow alloc] initWithWindowScene:sc] : [[MSPadWindow alloc] initWithFrame:MSPhoneScreen().bounds];
     g_padWin.windowLevel = UIWindowLevelNormal + 1; g_padWin.backgroundColor = UIColor.clearColor;
     g_padWin.rootViewController = [MSPadVC new]; g_padWin.rootViewController.view.backgroundColor = UIColor.clearColor;
     MSPadView *pv = [[MSPadView alloc] initWithFrame:g_padWin.rootViewController.view.bounds];
@@ -3835,11 +4934,12 @@ static NSString *MSGPUSample(void) {                    /* progress thread: bloc
 }
 @end
 static void MSStartRefreshTicker(void) {
-    if ([MSConfig()[@"HighRefresh"] isEqual:@NO] || UIScreen.mainScreen.maximumFramesPerSecond <= 60) return;
+    double mxf; MacShimScreenInfo(0, 0, 0, &mxf);
+    if ([MSConfig()[@"HighRefresh"] isEqual:@NO] || mxf <= 60) return;
     NSThread *th = [[NSThread alloc] initWithBlock:^{
         MSRefreshTicker *k = [MSRefreshTicker new];
         CADisplayLink *l = [CADisplayLink displayLinkWithTarget:k selector:@selector(tick:)];
-        NSInteger mx = UIScreen.mainScreen.maximumFramesPerSecond;
+        NSInteger mx = (NSInteger)mxf;
         l.preferredFrameRateRange = CAFrameRateRangeMake(80, mx, mx); l.paused = YES;
         [l addToRunLoop:NSRunLoop.currentRunLoop forMode:NSRunLoopCommonModes];
         [NSRunLoop.currentRunLoop addTimer:[NSTimer timerWithTimeInterval:0.5 target:k selector:@selector(check:) userInfo:l repeats:YES] forMode:NSRunLoopCommonModes];
@@ -3903,7 +5003,7 @@ static void ms_drPresentMin(id self, SEL c, CFTimeInterval t) {
    is all the screen can show anyway. Uncapped = NO keeps the plain present. */
 static CFTimeInterval MSUncappedDur(void) {
     static double dur = -1;
-    if (dur < 0) { NSInteger mx = UIScreen.mainScreen.maximumFramesPerSecond; dur = MSCfgD(@"Uncapped", 1) != 0 && mx > 60 && ![MSConfig()[@"HighRefresh"] isEqual:@NO] ? 1.0 / mx : 0; }
+    if (dur < 0) { double f; MacShimScreenInfo(0, 0, 0, &f); NSInteger mx = (NSInteger)f; dur = MSCfgD(@"Uncapped", 1) != 0 && mx > 60 && ![MSConfig()[@"HighRefresh"] isEqual:@NO] ? 1.0 / mx : 0; }
     return dur;
 }
 static void ms_cbPresent(id self, SEL c, id d) {                /* -[MTLCommandBuffer presentDrawable:] */
@@ -3946,7 +5046,7 @@ static void MSStatusCreate(void) {                    /* main thread, before the
     if ([MSConfig()[@"ShowStatus"] isEqual:@NO]) return;
     UIWindowScene *sc = MSAppScene();
     if (!sc) for (UIWindow *w in UIApplication.sharedApplication.windows) if (w.windowScene) { sc = w.windowScene; break; }
-    g_statusWin = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    g_statusWin = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:MSPhoneScreen().bounds];
     g_statusWin.windowLevel = UIWindowLevelAlert + 5; g_statusWin.userInteractionEnabled = NO;
     g_statusWin.backgroundColor = UIColor.clearColor; g_statusWin.rootViewController = [UIViewController new];
     g_statusWin.rootViewController.view.backgroundColor = UIColor.clearColor;
@@ -3981,7 +5081,7 @@ static uint32_t MSEngineThreadHash(uint64_t x) {
 /* which slot of a pool's thread table each live thread maps to; flags two live threads on one slot */
 static NSString *MSThreadSlots(uintptr_t storage, const char *name) {
     static intptr_t slide = -1;
-    if (slide == -1) for (uint32_t k = 0; k < _dyld_image_count(); k++) { const struct mach_header *h = _dyld_get_image_header(k); if (h->filetype == MH_EXECUTE) { slide = _dyld_get_image_vmaddr_slide(k); break; } }
+    if (slide == -1) slide = MSGameSlide();
     uintptr_t obj = *(volatile uintptr_t *)(storage + slide) & ~(uintptr_t)7; if (!obj) return @"";
     volatile uint32_t *t = (volatile uint32_t *)obj; int used = 0; for (int i = 0; i < 64; i++) if (t[i]) used++;
     thread_act_array_t th; mach_msg_type_number_t n = 0; if (task_threads(mach_task_self(), &th, &n) != KERN_SUCCESS) return @"";
@@ -4003,7 +5103,7 @@ static NSString *MSThreadSlots(uintptr_t storage, const char *name) {
 }
 static NSString *MSThreadTables(BOOL *dup) {
     static intptr_t slide = -1;
-    if (slide == -1) for (uint32_t k = 0; k < _dyld_image_count(); k++) { const struct mach_header *h = _dyld_get_image_header(k); if (h->filetype == MH_EXECUTE) { slide = _dyld_get_image_vmaddr_slide(k); break; } }
+    if (slide == -1) slide = MSGameSlide();
     uintptr_t seen[1024]; int ns = 0, maxUsed = 0, tables = 0; *dup = NO; NSMutableString *d = [NSMutableString string];
     for (size_t i = 0; i < sizeof g_poolStorages / sizeof *g_poolStorages; i++) {
         uintptr_t obj = *(volatile uintptr_t *)(g_poolStorages[i] + slide) & ~(uintptr_t)7;
@@ -4023,6 +5123,26 @@ static NSString *MSThreadTables(BOOL *dup) {
     thread_act_array_t th; mach_msg_type_number_t nth = 0;
     if (task_threads(mach_task_self(), &th, &nth) == KERN_SUCCESS) { for (mach_msg_type_number_t k = 0; k < nth; k++) mach_port_deallocate(mach_task_self(), th[k]); vm_deallocate(mach_task_self(), (vm_address_t)th, nth * sizeof *th); }
     return [NSString stringWithFormat:@"%d pool tables, most slots used %d/64, %u threads%@", tables, maxUsed, nth, d];
+}
+/* where the footprint is: engine pools (resident), Metal (device allocated size), the rest; and the headroom left
+   before iOS's per-app limit (os_proc_available_memory) */
+static NSString *MSMemoryBreakdown(void) {
+    static unsigned char *vec; static size_t vecLen; size_t poolRes = 0;
+    for (int i = 0; i < g_npools; i++) {
+        MSPool q = g_pools[i]; size_t pages = q.real >> 14;
+        if (vecLen < pages) { free(vec); vec = malloc(pages); vecLen = pages; }
+        if (mincore((void *)q.base, q.real, (char *)vec) != 0) continue;
+        for (size_t k = 0; k < pages; k++) if (vec[k] & 1) poolRes++;
+    }
+    task_vm_info_data_t v; mach_msg_type_number_t n = TASK_VM_INFO_COUNT; task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&v, &n);
+    static id<MTLDevice> dev; if (!dev) dev = MTLCreateSystemDefaultDevice();
+    extern size_t os_proc_available_memory(void);
+    vm_address_t *zones = NULL; unsigned nz = 0; size_t mallocUsed = 0;              /* every malloc zone, in use */
+    if (malloc_get_all_zones(mach_task_self(), NULL, &zones, &nz) == KERN_SUCCESS)
+        for (unsigned i = 0; i < nz; i++) { malloc_statistics_t st = { 0 }; malloc_zone_statistics((malloc_zone_t *)zones[i], &st); mallocUsed += st.size_in_use; }
+    return [NSString stringWithFormat:@"memory: footprint %.0f MB (internal %.0f, compressed %.0f), malloc %.0f MB, %d pools resident %.0f MB, Metal %.0f MB, headroom %.0f MB, limit ~%.0f MB",
+            v.phys_footprint / 1048576.0, v.internal / 1048576.0, v.compressed / 1048576.0, mallocUsed / 1048576.0, g_npools, (poolRes << 14) / 1048576.0,
+            dev.currentAllocatedSize / 1048576.0, os_proc_available_memory() / 1048576.0, (v.phys_footprint + os_proc_available_memory()) / 1048576.0];
 }
 /* per pool: resident MB and the highest resident offset, to see whether a shrunk pool fills up */
 static NSString *MSPoolUsage(void) {
@@ -4049,12 +5169,20 @@ static void MSStartReadProgress(void) {
             long long b = g_readBytes, c = g_readCalls, fr = g_frames; double now = CACurrentMediaTime(), idle = g_lastReadAt ? now - g_lastReadAt : now - t0;
             if (tick % 2 == 1) { double cpu = MSCPUSeconds(); cpuPct = (cpu - lastCPU) / (now - lastT) * 100; lastCPU = cpu; lastT = now; }
             double mem = MSFootprintMB();
+            /* close to iOS's per-app limit: hand malloc's cached free pages back before iOS ends the game */
+            size_t avail = os_proc_available_memory();
+            static double lastRelief; static int reliefN;
+            if (avail && avail < ((size_t)640 << 20) && now - lastRelief > 3) {
+                lastRelief = now; size_t got = malloc_zone_pressure_relief(NULL, 0);
+                if (reliefN++ < 20) MSLogf(@"memory: only %.0f MB left before iOS's limit (footprint %.0f MB) - released %.0f MB of free malloc pages",
+                                           avail / 1048576.0, mem, got / 1048576.0);
+            }
             if (tick % 2 == 1) { fps = (fr - frLast) / (now - frT); frLast = fr; frT = now; }
             if (tick % 10 == 9) {
                 mbps = (b - b5) / 5.0 / 1048576.0;
                 if (b != b5 || quiet++ % 6 == 0)
-                    MSLogf(@"progress: %.0f s, %.2f GB read in %lld reads, %.1f MB/s, last read %.0f s ago, CPU %.0f%%, memory %.0f MB, %lld frames, %.0f FPS, mouse gate %d, main queue lag %.1f s, thermal %s, yields %lld/s (%lld slept)%@",
-                           now - t0, b / 1073741824.0, c, mbps, idle, cpuPct, mem, fr, fps, MSMouseGate(), g_mqAsked > g_mqBeat ? now - g_mqAsked : 0.0, MSThermal(), MSYieldRate(0), MSYieldRate(1),
+                    MSLogf(@"progress: %.0f s, %.2f GB read in %lld reads, %.1f MB/s, last read %.0f s ago, CPU %.0f%%, memory %.0f MB (%.0f MB left), %lld frames, %.0f FPS, mouse gate %d, main queue lag %.1f s, thermal %s, yields %lld/s (%lld slept)%@",
+                           now - t0, b / 1073741824.0, c, mbps, idle, cpuPct, mem, avail / 1048576.0, fr, fps, MSMouseGate(), g_mqAsked > g_mqBeat ? now - g_mqAsked : 0.0, MSThermal(), MSYieldRate(0), MSYieldRate(1),
                            NSProcessInfo.processInfo.lowPowerModeEnabled ? @", LOW POWER MODE" : @"");
                 static int diag = -1; if (diag < 0) diag = [MSConfig()[@"Diagnostics"] boolValue];
                 if (tick % 60 == 29 && fr > 300) { NSString *g = MSGPUSample(); if (g) MSLogf(@"%@", g); }
@@ -4064,6 +5192,7 @@ static void MSStartReadProgress(void) {
                 if (g_gcmCount) { static long long lm, lh; static long long lc; MSLogf(@"mouse: %lld motion events, %lld clicks, %lld pointer positions in the last 5 s (%s)", g_gcmMoves - lm, g_gcmClicks - lc, g_gcmHovers - lh, g_pointerLocked ? "gameplay" : "menu"); lm = g_gcmMoves; lh = g_gcmHovers; lc = g_gcmClicks; }
                 if (tick % 120 == 99 && fr > 1500) { NSString *ws = MSSampleWorkers(); if (ws) MSLogf(@"worker samples: %@", ws); }
                 if (diag && tick % 20 == 19) MSLogf(@"pools:%@", MSPoolUsage());
+                if (diag && tick % 20 == 19) MSLogf(@"%@", MSMemoryBreakdown());
                 if (diag && tick % 20 == 19) MSLogf(@"%@", MSQuarantineStats());
                 if (diag && tick % 20 == 19) MSLogf(@"gpu: %lld noCopy buffers %.0f MB, %lld textures over buffers (%lld bad)", g_noCopyN, g_noCopyBytes / 1048576.0, g_bufTexN, g_bufTexBad);
                 if (b != b5) quiet = 0;
@@ -4093,7 +5222,7 @@ static void MSStartReadProgress(void) {
                 CGFloat pw = ov == 2 ? 400 : 210;
                 [CATransaction begin]; [CATransaction setDisableActions:YES];
                 CGRect R = g_stRoot.bounds;
-                g_stBg.frame = CGRectMake(R.size.width / 2 - pw / 2, R.size.height - 24, pw, 20); g_stBg.cornerRadius = 10;
+                g_stBg.frame = CGRectMake(R.size.width / 2 - pw / 2, R.size.height - 20 - g_stBottomGap, pw, 20); g_stBg.cornerRadius = 10;
                 g_stBg.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45].CGColor;
                 g_stTitle.hidden = g_stLog.hidden = g_stTrack.hidden = YES;
                 g_stHead.frame = CGRectMake(10, 2, pw - 20, 16); g_stHead.alignmentMode = kCAAlignmentCenter; g_stHead.fontSize = 11; g_stHead.string = f;
@@ -4251,7 +5380,8 @@ static void MSOpenLog(void) {
     for (size_t i = 0; i < sizeof sigs / sizeof *sigs; i++) {
         struct sigaction sa = { 0 }; sa.sa_sigaction = MSSigInfo; sa.sa_flags = SA_SIGINFO | SA_ONSTACK; sigemptyset(&sa.sa_mask); sigaction(sigs[i], &sa, NULL);
     }
-    MSLogf(@"---- launch: %@ iOS %@ (%@), %.0f MB RAM", UIDevice.currentDevice.model, UIDevice.currentDevice.systemVersion, @"MacShim", NSProcessInfo.processInfo.physicalMemory / 1048576.0);
+    MSLogf(@"---- launch: %@ iOS %@ (%@), %.0f MB RAM", UIDevice.currentDevice.model, UIDevice.currentDevice.systemVersion, @"MacShim", (g_realMemBytes ?: NSProcessInfo.processInfo.physicalMemory) / 1048576.0);
+    MSLogInstallInfo();
 }
 
 
@@ -4375,7 +5505,7 @@ static void MSAddMacAPIs(void) {
  * of __DATA; small and medium blocks wait here (FIFO, QuarantineMB, default 256) before the real free runs, so a late
  * write lands in memory nobody owns yet. Off unless Quarantine = YES; QuarantineCheck = YES fills each held block
  * with a pattern and logs any write into it (block size, value, and who freed it) when it is released. */
-#define MS_FREE_ENTRY 0x100012cacULL
+#define MS_FREE_ENTRY (MSGame()->freeEntry)
 typedef struct { void *alloc; uintptr_t ptr; uint32_t size, filled; uint64_t t; uintptr_t ra[3]; } MSQEntry;
 static MSQEntry *g_q; static size_t g_qCap, g_qHead, g_qCount, g_qBytes, g_qMaxBytes, g_qMaxBlock;
 static os_unfair_lock g_qLock = OS_UNFAIR_LOCK_INIT;
@@ -4445,20 +5575,17 @@ static NSString *MSQuarantineStats(void) {
             g_qBytes / 1048576.0, g_qCount, MSTicksToSec(g_qOldestAge), (long long)g_qDeferred, (long long)g_qPassed, (long long)g_qDirty];
 }
 static void MSInstallFreeHook(void) {
-    const struct mach_header_64 *mh = NULL; intptr_t slide = 0;
-    for (uint32_t k = 0; k < _dyld_image_count(); k++) {
-        const struct mach_header *h = _dyld_get_image_header(k);
-        if (h->filetype == MH_EXECUTE) { mh = (const struct mach_header_64 *)h; slide = _dyld_get_image_vmaddr_slide(k); break; }
-    }
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)MSGameHeader(); intptr_t slide = MSGameSlide();
     if (!mh) return;
     uintptr_t slot = 0; const struct load_command *lc = (const void *)(mh + 1);
     for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const void *)((const char *)lc + lc->cmdsize))
         if (lc->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)lc)->segname, "__DATA"))
             slot = ((const struct segment_command_64 *)lc)->vmaddr + ((const struct segment_command_64 *)lc)->vmsize - 0x100 + slide;
+    if (!MS_FREE_ENTRY) return;
     const uint32_t *entry = (const uint32_t *)(MS_FREE_ENTRY + slide);
     if (!slot || (entry[0] & 0x9f00001f) != 0x90000010 || entry[2] != 0xd61f0200) { MSLogf(@"free hook: not in the game binary (rebuild with the current tools/ios_retarget.py)"); return; }
     g_freeCont = MS_FREE_ENTRY + 12 + slide;
-    g_medOwns = (int (*)(void *, uintptr_t))(0x10000f434ULL + slide);
+    g_medOwns = (int (*)(void *, uintptr_t))(MSGame()->medOwns + slide);
     g_qMode = [MSConfig()[@"QuarantineCheck"] boolValue] ? 2 : [MSConfig()[@"Quarantine"] boolValue] ? 1 : 0;   /* opt-in: it didn't explain the menu crash */
     if (g_qMode) {
         g_qMaxBytes = (size_t)(MSCfgD(@"QuarantineMB", 256) * 1048576.0);
@@ -4525,7 +5652,7 @@ static void MSInstallBackgroundFreeze(void) {
 __attribute__((constructor)) static void MSInit(void) {
     @autoreleasepool {
         MSOpenLog();
-        MSInstallFreeHook();
+        if (!MSIsMultiGame()) MSInstallFreeHook();            /* several versions: after MacShimMain loaded the game */
         MSInstallBackgroundFreeze();
         if (getenv("MACSHIM_PROBE_VA")) MSProbeVA();
         NSFileManager *fm = NSFileManager.defaultManager; NSString *internal = MSInternalRoot();
@@ -4545,13 +5672,21 @@ __attribute__((constructor)) static void MSInit(void) {
         MSHookGameWindow();
         [NSApplication sharedApplication];
         MSMainAsync(^{
+            MSHookControllerEffects();
+            [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+                static int k; size_t got = malloc_zone_pressure_relief(NULL, 0);
+                if (k++ < 20) MSLogf(@"memory warning from iOS (footprint %.0f MB, %.0f MB left) - released %.0f MB of free malloc pages",
+                                     MSFootprintMB(), os_proc_available_memory() / 1048576.0, got / 1048576.0);
+            }];
             if (GCKeyboard.coalescedKeyboard) MSAttachKeyboard(GCKeyboard.coalescedKeyboard);
             [NSNotificationCenter.defaultCenter addObserverForName:GCKeyboardDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification *n) { MSAttachKeyboard(n.object); }];
             for (GCMouse *m in GCMouse.mice) MSAttachMouse(m);
-            [NSNotificationCenter.defaultCenter addObserverForName:GCMouseDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification *n) { MSAttachMouse(n.object); }];
+            [NSNotificationCenter.defaultCenter addObserverForName:GCMouseDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification *n) { GCMouse *gm = n.object; MSMainAsync(^{ MSAttachMouse(gm); }); }];
             [NSNotificationCenter.defaultCenter addObserverForName:GCMouseDidDisconnectNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
-                if (g_gcmCount > 0) g_gcmCount--; MSLogf(@"mouse disconnected");
+                GCMouse *gm = n.object;
                 MSMainAsync(^{                               /* never leave a button held */
+                    [g_gcmMice removeObject:gm]; [g_gcmUsed removeObject:gm]; MSGCMouseRecount();
+                    MSLogf(@"mouse disconnected (%d still in use)", (int)g_gcmCount);
                     MSHostView *h = g_hostView; if (!h) return;
                     if (g_gcmRight) { g_gcmRight = NO; [h msButton:NO right:YES at:MSGCMouseAt(h)]; }
                     if (g_leftBy == 2) MSLeftPress(2, NO);
@@ -4654,6 +5789,11 @@ void *ms_dlopen(const char *path, int mode) {
     if (path && strstr(path, "libGameServices") && [MSConfig()[@"GameServices"] isEqual:@NO]) {
         MSLogf(@"dlopen %s -> refused (GameServices = NO)", path); return NULL;
     }
+    /* several game versions: a library by name (@rpath/..., bare name) is the loaded version's own copy */
+    if (path && g_gameDir && path[0] != '/' && (!strchr(path, '/') || !strncmp(path, "@rpath/", 7) || !strncmp(path, "@executable_path/", 17))) {
+        NSString *mine = [[g_gameDir stringByAppendingPathComponent:@"Frameworks"] stringByAppendingPathComponent:@(path).lastPathComponent];
+        if ([NSFileManager.defaultManager fileExistsAtPath:mine]) return real(mine.fileSystemRepresentation, mode);
+    }
     return real(path, mode);
 }
 static void ms_galaxyProcessData(void) {
@@ -4700,9 +5840,18 @@ static void MSPatchGalaxy(const struct mach_header *mh, intptr_t slide) {
        pointed at OnAuthSuccess, so the game hears "signed in" and goes on to the menu. Offsets are for this exact
        libGameServicesGOG.dylib and are checked against the code before patching. GalaxyFakeSignIn = NO turns it off. */
     if (![MSConfig()[@"GalaxyFakeSignIn"] isEqual:@NO]) {
-        uintptr_t base = (uintptr_t)mh, ok = base + 0x1f58, fail = base + 0x1fdc;
-        const uint32_t *ci = (const uint32_t *)ok, *cf = (const uint32_t *)fail;
-        if (ci[0] != 0xd100c3ff || cf[0] != 0xd100c3ff || cf[4] != 0xf9400408) { MSLogf(@"GOG Galaxy: unexpected auth listener code - fake sign-in not applied"); return; }
+        uintptr_t base = (uintptr_t)mh, ok = 0, fail = 0;
+        /* 2.5 and later export the listener's methods: found by name. 2.31a doesn't: its offsets, checked against the code. */
+        void *me = dlopen(di.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+        if (me) {
+            ok = (uintptr_t)dlsym(me, "_ZN2gs15GameServicesGOG12AuthListener13OnAuthSuccessEv");
+            fail = (uintptr_t)dlsym(me, "_ZN2gs15GameServicesGOG12AuthListener13OnAuthFailureEN6galaxy3api13IAuthListener13FailureReasonE");
+        }
+        if (!ok || !fail) {
+            ok = base + 0x1f58; fail = base + 0x1fdc;
+            const uint32_t *ci = (const uint32_t *)ok, *cf = (const uint32_t *)fail;
+            if (ci[0] != 0xd100c3ff || cf[0] != 0xd100c3ff || cf[4] != 0xf9400408) { MSLogf(@"GOG Galaxy: unexpected auth listener code - fake sign-in not applied"); return; }
+        } else MSLogf(@"GOG Galaxy: auth listener found by name");
         int n = 0; unsigned long sz = 0;
         uint8_t *sec = getsectiondata((const struct mach_header_64 *)mh, "__DATA_CONST", "__const", &sz);
         for (unsigned long o = 0; sec && o + 8 <= sz; o += 8) {
@@ -4737,9 +5886,13 @@ int ms_BinkStartAsyncThread(int thread, const void *param) {
     int r = real(thread, param); MSLogf(@"Bink async thread %d -> %d", thread, r); return r;
 }
 
-static unsigned long long ms_physMem(id self, SEL _cmd) { return (unsigned long long)([MSConfig()[@"MemSizeGB"] doubleValue] * 1073741824.0); }
+/* NSProcessInfo.physicalMemory says the same as hw.memsize (both game versions ask both): MemSizeGB, else the size
+   fitted to iOS's per-app limit (MSFitMemSizeGB). The real size stays in g_realMemBytes for the launch log. */
+static double MSReportedMemGB(void) { double m = [MSConfig()[@"MemSizeGB"] doubleValue]; return m > 0 ? m : MSFitMemSizeGB(); }
+static unsigned long long ms_physMem(id self, SEL _cmd) { return (unsigned long long)(MSReportedMemGB() * 1073741824.0); }
 __attribute__((constructor)) static void MSInstallMemSize(void) {
-    if ([MSConfig()[@"MemSizeGB"] doubleValue] <= 0) return;
+    g_realMemBytes = NSProcessInfo.processInfo.physicalMemory;
+    if (MSReportedMemGB() <= 0) return;
     method_setImplementation(class_getInstanceMethod(NSProcessInfo.class, @selector(physicalMemory)), (IMP)ms_physMem);
 }
 /* frame decoding: NoBinkDecode = YES skips it (frames stay as they are) - test for Bink writing past its buffers */
@@ -4787,4 +5940,57 @@ __attribute__((constructor)) static void MSInstallURLSession(void) {
     Method m;
     if ((m = class_getInstanceMethod(C, @selector(dataTaskWithRequest:completionHandler:)))) g_oDataTask = method_setImplementation(m, (IMP)ms_dataTask);
     if ((m = class_getInstanceMethod(C, @selector(uploadTaskWithRequest:fromFile:completionHandler:)))) g_oUploadTask = method_setImplementation(m, (IMP)ms_uploadTask);
+}
+
+
+/* ---------------------------------------------------------------- one app, several game versions
+ * The bundle holds Games/<version>/ (CyberpunkGame.dylib = that version's game program made loadable by
+ * tools/ios_retarget.py --game-folder, its Frameworks/, game.plist, CyPortData.json) and a small starter executable
+ * (app/starter.c) that calls this. The version is picked by the game data: the one whose compiled scripts
+ * (r6/cache/final.redscripts) have the data folder's size; without data (or data of no installed version) the
+ * version the start screen's Update chose (CyPortGameVersion), else the newest. Then its game program is loaded and
+ * its main() runs exactly as an executable's would. */
+extern char **environ;
+__attribute__((visibility("default"))) int MacShimMain(int argc, char **argv) {
+    NSString *games = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Games"];
+    NSMutableArray<NSDictionary *> *vers = [NSMutableArray array];
+    for (NSString *v in [NSFileManager.defaultManager contentsOfDirectoryAtPath:games error:nil]) {
+        NSString *dir = [games stringByAppendingPathComponent:v];
+        NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:[dir stringByAppendingPathComponent:@"game.plist"]];
+        if (pl && [NSFileManager.defaultManager fileExistsAtPath:[dir stringByAppendingPathComponent:@"CyberpunkGame.dylib"]])
+            [vers addObject:@{ @"dir": dir, @"plist": pl }];
+    }
+    if (!vers.count) { MSLogf(@"starter: no game versions in %@", games); abort(); }
+    [vers sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {      /* newest first */
+        return [b[@"plist"][@"number"] compare:a[@"plist"][@"number"] ?: @0];
+    }];
+    NSDictionary *pick = nil; NSString *why = nil;
+    NSString *root = MSDataRoot();
+    NSNumber *rs = root ? [NSFileManager.defaultManager attributesOfItemAtPath:[root stringByAppendingPathComponent:@"r6/cache/final.redscripts"] error:nil][NSFileSize] : nil;
+    if (rs) for (NSDictionary *v in vers) if ([v[@"plist"][@"redscriptsSize"] isEqual:rs]) { pick = v; why = @"matches the game data"; break; }
+    if (!pick) {
+        NSString *want = [NSUserDefaults.standardUserDefaults stringForKey:@"CyPortGameVersion"];
+        for (NSDictionary *v in vers) if ([v[@"plist"][@"version"] isEqual:want]) { pick = v; why = @"chosen on the start screen"; }
+    }
+    if (!pick) { pick = vers.firstObject; why = rs ? @"newest (the game data matches no installed version)" : @"newest (no game data yet)"; }
+    g_gameDir = pick[@"dir"];
+    NSString *dylib = [g_gameDir stringByAppendingPathComponent:@"CyberpunkGame.dylib"];
+    setenv("CYPORT_GAME_DIR", g_gameDir.fileSystemRepresentation, 1);       /* the start screen (Swift) reads it */
+    NSMutableArray *names = [NSMutableArray array]; for (NSDictionary *v in vers) [names addObject:v[@"plist"][@"version"] ?: @"?"];
+    MSLogf(@"starter: game versions in this app: %@ - starting %@ (%@)", [names componentsJoinedByString:@", "], pick[@"plist"][@"version"], why);
+    void *h = dlopen(dylib.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL);
+    if (!h) { MSLogf(@"starter: could not load %@: %s", dylib, dlerror()); abort(); }
+    for (uint32_t k = 0; k < _dyld_image_count(); k++) {
+        const char *n = _dyld_get_image_name(k);
+        if (n && strstr(n, "/CyberpunkGame.dylib") && strstr(n, g_gameDir.lastPathComponent.UTF8String)) { g_gameHeader = _dyld_get_image_header(k); break; }
+    }
+    if (!g_gameHeader) { MSLogf(@"starter: game image not found after loading"); abort(); }
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)g_gameHeader; const struct load_command *lc = (const void *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const void *)((const char *)lc + lc->cmdsize))
+        if (lc->cmd == LC_MAIN) g_gameMain = (char *)mh + ((const struct entry_point_command *)lc)->entryoff;
+    if (!g_gameMain) { MSLogf(@"starter: the game program has no entry point"); abort(); }
+    MSLogf(@"starter: game program %s loaded at %p (slide %#lx)", MSGame()->name, g_gameHeader, (long)MSGameSlide());
+    MSInstallFreeHook();
+    const char *apple[] = { NULL };
+    return ((int (*)(int, char **, char **, const char **))g_gameMain)(argc, argv, environ, apple);
 }

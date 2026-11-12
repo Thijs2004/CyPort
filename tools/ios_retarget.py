@@ -13,8 +13,13 @@ address-space reserve functions - see patch_pool_end().
   4. leaves LC_CODE_SIGNATURE untouched (the old signature is simply invalid now;
      re-sign the result yourself with `codesign -f -s <identity>`)
 
-Usage:  ios_retarget.py IN OUT [--minos 18.0] [--sdk 18.0]
+Usage:  ios_retarget.py IN OUT [--minos 18.0] [--sdk 18.0] [--game-folder]
         ios_retarget.py --info FILE
+
+--game-folder: for an app with several game versions (Games/<version>/ in the bundle, picked at launch by the shim):
+the executable becomes a loadable library (MH_DYLIB: __PAGEZERO's load command turns into LC_ID_DYLIB, LC_MAIN stays so
+the shim can call the game's main), its libraries load from its own Frameworks folder (@loader_path), and the shim is
+the app's one copy (@executable_path/Frameworks/libMacShim.dylib).
 """
 import os, re, struct, sys, argparse
 
@@ -64,17 +69,22 @@ def ver(s):
     p = [int(x) for x in s.split(".")] + [0, 0]
     return (p[0] << 16) | (p[1] << 8) | p[2]
 
+GAME_FOLDER = False
+
 def map_dylib(p):
+    shim = SHIM
     m = FW_RE.match(p)
     if m:
-        return SHIM if m.group(1) in SHIM_FRAMEWORKS else "/System/Library/Frameworks/%s.framework/%s" % (m.group(1), m.group(1))
+        return shim if m.group(1) in SHIM_FRAMEWORKS else "/System/Library/Frameworks/%s.framework/%s" % (m.group(1), m.group(1))
     if p in SHIM_DYLIBS:
-        return SHIM
+        return shim
     if p.startswith("@executable_path/../Frameworks/"):
         return "@rpath/" + p[len("@executable_path/../Frameworks/"):]
     return None
 
 def map_rpath(p):
+    if GAME_FOLDER:                                     # game: Games/<v>/X ; its libraries: Games/<v>/Frameworks/
+        return {"@executable_path/../Frameworks": "@loader_path/Frameworks", "@loader_path/../Frameworks": "@loader_path"}.get(p)
     if p in ("@executable_path/../Frameworks", "@loader_path/../Frameworks"):
         return "@executable_path/Frameworks"
     return None
@@ -138,9 +148,51 @@ def retarget(src, dst, minos, sdk):
     if not seen: raise SystemExit("no LC_BUILD_VERSION: not a modern macOS build")
     log += reroute_imports(d, m)
     if m["ftype"] == 2: log += patch_pool_end(d, m) + patch_watchdog(d, m) + patch_pool_sizes(d, m) + patch_free_hook(d, m)      # MH_EXECUTE
-    log += dedupe_dylibs(d, m)          # last: it moves load commands, so m["cmds"] offsets are stale afterwards
+    log += dedupe_dylibs(d, m)          # it moves load commands, so m["cmds"] offsets are stale afterwards
+    if GAME_FOLDER and m["ftype"] == 2: log += make_loadable(d, parse(d))
+    if GAME_FOLDER:
+        if m["ftype"] != 2: log += add_rpath(d, "@loader_path")             # a game library: its neighbours
+        log += add_rpath(d, "@executable_path/Frameworks")                  # the app's one libMacShim
     open(dst, "wb").write(d)
     return log
+
+def add_rpath(d, path):
+    """append an LC_RPATH in the free space after the load commands (before the first section's data)"""
+    m = parse(d); ncmds, szcmds = struct.unpack_from("<II", d, 16)
+    for cmd, off, sz in m["cmds"]:
+        if cmd == LC_RPATH and name_of(d, off, sz)[1] == path: return []
+    first = len(d)
+    for cmd, off, sz in m["cmds"]:
+        if cmd != LC_SEGMENT_64: continue
+        for i in range(struct.unpack_from("<I", d, off + 64)[0]):
+            so = off + 72 + 80 * i; sf = struct.unpack_from("<I", d, so + 48)[0]
+            if sf: first = min(first, sf)
+    nb = path.encode() + b"\0"; size = (12 + len(nb) + 7) & ~7; end = 32 + szcmds
+    if end + size > first or any(d[end:end + size]): return ["rpath %s: no room after the load commands; NOT added" % path]
+    d[end:end + size] = struct.pack("<III", LC_RPATH, size, 12) + nb + b"\0" * (size - 12 - len(nb))
+    struct.pack_into("<II", d, 16, ncmds + 1, szcmds + size)
+    return ["rpath %s added" % path]
+
+def make_loadable(d, m):
+    """MH_EXECUTE -> MH_DYLIB (as LiveContainer does): dyld loads it with dlopen at any address (it is PIE, chained
+    fixups are image-relative). __PAGEZERO (4 GB of nothing at address 0) stays a segment - chained fixups count
+    segments by index - but shrinks to one page right below __TEXT; LC_ID_DYLIB goes into the free header space.
+    LC_MAIN stays for the shim to find the game's main."""
+    pz = None
+    for cmd, off, sz in m["cmds"]:
+        if cmd == LC_SEGMENT_64 and cstr(d[off + 8:off + 24]) == "__PAGEZERO": pz = off
+    if pz is None: return ["game folder: no __PAGEZERO; NOT made loadable"]
+    vmaddr, vmsize = struct.unpack_from("<QQ", d, pz + 24)
+    struct.pack_into("<QQ", d, pz + 24, vmaddr + vmsize - 0x4000, 0x4000)
+    name = b"@loader_path/CyberpunkGame.dylib\0"; size = (24 + len(name) + 7) & ~7
+    ncmds, szcmds = struct.unpack_from("<II", d, 16); end = 32 + szcmds
+    if any(d[end:end + size]): return ["game folder: no header room for LC_ID_DYLIB; NOT made loadable"]
+    d[end:end + size] = struct.pack("<IIIIII", LC_ID_DYLIB, size, 24, 2, 0x10000, 0x10000) + name + b"\0" * (size - 24 - len(name))
+    struct.pack_into("<II", d, 16, ncmds + 1, szcmds + size)
+    struct.pack_into("<I", d, 12, 6)                         # filetype MH_DYLIB
+    flags = struct.unpack_from("<I", d, 24)[0]
+    struct.pack_into("<I", d, 24, flags & ~0x200000)          # no MH_PIE (executables only)
+    return ["game folder: executable -> loadable library (__PAGEZERO one page, LC_ID_DYLIB added, LC_MAIN kept)"]
 
 def reroute_imports(d, m):
     """Chained-fixups images: make `_NSGetExecutablePath` / `_sysctlbyname` bind to the shim instead of libSystem
@@ -367,7 +419,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("src", nargs="?"); ap.add_argument("dst", nargs="?")
     ap.add_argument("--info"); ap.add_argument("--minos", default="18.0"); ap.add_argument("--sdk", default="18.0")
+    ap.add_argument("--game-folder", action="store_true")
     a = ap.parse_args()
+    GAME_FOLDER = a.game_folder
     if a.info: info(a.info); sys.exit(0)
     if not (a.src and a.dst): ap.error("need IN OUT")
     for l in retarget(a.src, a.dst, a.minos, a.sdk): print("  " + l)

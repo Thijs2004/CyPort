@@ -9,7 +9,11 @@
 #                Xcode on another disk: DEVELOPER_DIR=/Volumes/x/Xcode.app/Contents/Developer ./build.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-GAME_APP="${GAME_APP:?set GAME_APP to the Cyberpunk2077.app folder}"
+# Several game versions in ONE app: GAME_APPS="/path/2.31a/Cyberpunk2077.app|/path/2.5/Cyberpunk2077.app" - each goes into
+# Games/<version>/ and the app starts the one that fits the game data it finds (see MacShimMain in shim/MacShim.m).
+GAME_APPS="${GAME_APPS:-}"
+if [ -n "$GAME_APPS" ]; then IFS='|' read -ra GAME_LIST <<< "$GAME_APPS"; GAME_APP="${GAME_LIST[${#GAME_LIST[@]}-1]}"; fi
+GAME_APP="${GAME_APP:?set GAME_APP to the Cyberpunk2077.app folder (or GAME_APPS to several, separated by |)}"
 BUNDLE_ID="${BUNDLE_ID:-com.example.cyport}"
 ENT="${ENT:-$HERE/app/entitlements-basic.plist}"
 # Output (override with OUT=/some/folder)
@@ -60,22 +64,97 @@ clang $LDFLAG -target arm64-apple-ios16.0 -isysroot "$SDK" -dynamiclib -fobjc-ar
   -framework Foundation -framework UIKit -framework GameController -framework QuartzCore \
   -framework Security -framework CoreGraphics -framework CoreFoundation -framework Metal -framework UniformTypeIdentifiers -framework WebKit -lz \
   -Wl,-reexport_framework,Foundation -Wl,-reexport_framework,CoreGraphics -Wl,-reexport_framework,Security -Wl,-reexport_framework,Metal \
-  "$HERE/shim/MacShim.m" "$HERE/shim/MacShimC.c" "$HERE/shim/StoreCodecs.c" "$HERE/shim/third_party/lzma/LzmaDec.c" $SWIFT_OBJ \
+  "$HERE/shim/MacShim.m" "$HERE/shim/MacShimC.c" "$HERE/shim/PadLayout.c" "$HERE/shim/StoreCodecs.c" "$HERE/shim/third_party/lzma/LzmaDec.c" $SWIFT_OBJ \
   -o "$APP/Frameworks/libMacShim.dylib"
 rm -f "$APP/Frameworks/Launcher.o"
 
 else
-  echo "==> 1/4 using prebuilt MacShim (compiled from shim/*.m, *.c against the iPhoneOS 16.5 SDK; REBUILD_SHIM=1 to recompile)"
+  echo "==> 1/4 using prebuilt MacShim (compiled from shim/*.m, *.c; REBUILD_SHIM=1 to recompile)"
   cp "$HERE/prebuilt/libMacShim.dylib" "$APP/Frameworks/libMacShim.dylib"
 fi
 rm -rf "$APP"/Frameworks/*.dSYM
-echo "==> 2/4 retarget game binary + libraries (macOS -> iOS load commands only)"
-python3 "$HERE/tools/ios_retarget.py" "$GAME_APP/Contents/MacOS/Cyberpunk2077" "$APP/Cyberpunk2077" >/dev/null
+# The iOS SDK version stamped into the game: iOS shows an app at a newer iPhone's real screen size only when the app says
+# it was built with an SDK that knows that iPhone. Stamped "18.0", an iPhone Duo runs CyPort in a zoomed 16:9 window
+# (an iPhone 8-sized screen). So stamp the SDK of the Xcode on this Mac (IOS_SDK_VERSION=x.y overrides; 18.0 without Xcode).
+SDK_VER="${IOS_SDK_VERSION:-}"; SDK_NAME=""; SDK_BUILD=""
+SDK_DIR="${SDK:-$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || true)}"
+if [ -z "$SDK_VER" ] && [ -n "$SDK_DIR" ] && [ -f "$SDK_DIR/SDKSettings.plist" ]; then
+  SDK_VER="$(plutil -extract Version raw "$SDK_DIR/SDKSettings.plist" 2>/dev/null || true)"
+  SDK_NAME="$(plutil -extract CanonicalName raw "$SDK_DIR/SDKSettings.plist" 2>/dev/null || true)"
+  SDK_BUILD="$(xcrun --sdk "$SDK_DIR" --show-sdk-build-version 2>/dev/null || true)"
+fi
+case "$SDK_VER" in [0-9]*.[0-9]*) ;; [0-9]*) SDK_VER="$SDK_VER.0" ;; *) SDK_VER="18.0" ;; esac
+if [ "${SDK_VER%%.*}" -lt 18 ]; then SDK_VER="18.0"; fi
+# iOS 27 only launches an app stamped with the iOS 27+ SDK if it uses scenes (MSSceneDelegate, in the shim since the
+# iPhone Duo support). A shim without it (an older prebuilt) keeps the old stamp and no scene list, or the screen stays black.
+OLD_SHIM=0
+if ! grep -q MSSceneDelegate "$APP/Frameworks/libMacShim.dylib"; then
+  OLD_SHIM=1; SDK_VER="18.0"; SDK_NAME=""; SDK_BUILD=""
+  echo "    this MacShim predates scene support: stamping iOS SDK 18.0 (REBUILD_SHIM=1 for an iPhone Duo's real screen sizes)"
+fi
+if [ -n "$GAME_APPS" ]; then
+echo "==> 2/4 game versions -> Games/<version>/ (one app, the starter picks the version that fits the game data)"
+for ga in "${GAME_LIST[@]}"; do
+  [ -f "$ga/Contents/MacOS/Cyberpunk2077" ] || { echo "not found: $ga/Contents/MacOS/Cyberpunk2077"; exit 1; }
+  python3 "$HERE/tools/data_manifest.py" "$ga" "$OUT/.data.json" || { echo "every game version needs its data list (GOG build info)"; exit 1; }
+  v="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"].split("_")[0])' "$OUT/.data.json")"
+  G="$APP/Games/$v"; mkdir -p "$G/Frameworks"; mv "$OUT/.data.json" "$G/CyPortData.json"
+  python3 "$HERE/tools/ios_retarget.py" --game-folder "$ga/Contents/MacOS/Cyberpunk2077" "$G/CyberpunkGame.dylib" >/dev/null
+  for f in "$ga"/Contents/Frameworks/*.dylib; do python3 "$HERE/tools/ios_retarget.py" --game-folder "$f" "$G/Frameworks/$(basename "$f")" >/dev/null; done
+  python3 - "$ga" "$G" "$v" <<'PY'
+import hashlib, json, plistlib, sys
+ga, G, v = sys.argv[1:]
+d = json.load(open(G + "/CyPortData.json"))["files"]
+info = plistlib.load(open(ga + "/Contents/Info.plist", "rb"))
+digits = "".join(c for c in v.split("_")[0] if c.isdigit())
+plistlib.dump({"version": v, "number": float(digits[0] + "." + digits[1:]) if digits else 0.0,
+               "CyPortGameExe": hashlib.md5(open(ga + "/Contents/MacOS/Cyberpunk2077", "rb").read()).hexdigest(),
+               "shortVersion": info.get("CFBundleShortVersionString", "?"), "bundleVersion": info.get("CFBundleVersion", "?"),
+               "redscriptsSize": d.get("r6/cache/final.redscripts", {}).get("size", 0), "tweakdbSize": d.get("r6/cache/tweakdb.bin", {}).get("size", 0)},
+              open(G + "/game.plist", "wb"))
+print("    Games/%s: game program %s" % (v, info.get("CFBundleShortVersionString")))
+PY
+done
+# the starter is the app's executable, so it carries the SDK stamp (see above): iOS 27+ SDK = real screen sizes on
+# an iPhone Duo, and then UIKit insists on the scene life cycle (MSSceneDelegate); a shim without it gets 18.0
+clang -target arm64-apple-ios16.0 -isysroot "$SDK_DIR" -O2 "$HERE/app/starter.c" -L"$APP/Frameworks" -lMacShim \
+  -Wl,-rpath,@executable_path/Frameworks -Wl,-platform_version,ios,18.0,$SDK_VER -o "$APP/Cyberpunk2077"
+echo "    starter stamped with iOS SDK $SDK_VER"
+else
+echo "==> 2/4 retarget game binary + libraries (macOS -> iOS load commands only, iOS SDK $SDK_VER)"
+python3 "$HERE/tools/ios_retarget.py" --sdk "$SDK_VER" "$GAME_APP/Contents/MacOS/Cyberpunk2077" "$APP/Cyberpunk2077" >/dev/null
 chmod +x "$APP/Cyberpunk2077"
 for f in "$GAME_APP"/Contents/Frameworks/*.dylib; do
+  # the libraries keep SDK 18.0: stamped newer, dyld checks them more strictly and refuses libBink2MacArm64.dylib
+  # ("mis-aligned LINKEDIT string pool"); only the main executable's SDK decides the screen size
   python3 "$HERE/tools/ios_retarget.py" "$f" "$APP/Frameworks/$(basename "$f")" >/dev/null
 done
+fi
 sed "s/__BUNDLE_ID__/$BUNDLE_ID/" "$HERE/app/Info.plist" > "$APP/Info.plist"
+if [ "$OLD_SHIM" = 1 ]; then plutil -remove UIApplicationSceneManifest "$APP/Info.plist"; fi
+# the same SDK in the Info.plist keys Xcode writes (iOS reads both)
+plutil -replace DTPlatformName -string iphoneos "$APP/Info.plist"
+plutil -replace DTPlatformVersion -string "$SDK_VER" "$APP/Info.plist"
+plutil -replace DTSDKName -string "${SDK_NAME:-iphoneos$SDK_VER}" "$APP/Info.plist"
+[ -n "$SDK_BUILD" ] && { plutil -replace DTSDKBuild -string "$SDK_BUILD" "$APP/Info.plist"; plutil -replace DTPlatformBuild -string "$SDK_BUILD" "$APP/Info.plist"; }
+# the game's own version (the start screen and the store downloads match the game data to it)
+for k in CFBundleShortVersionString CFBundleVersion; do
+  v="$(/usr/libexec/PlistBuddy -c "Print :$k" "$GAME_APP/Contents/Info.plist" 2>/dev/null || true)"
+  [ -n "$v" ] && /usr/libexec/PlistBuddy -c "Set :$k $v" "$APP/Info.plist"
+done
+# which game program this is: the shim picks its addresses inside the game by it (kMSGames in shim/MacShim.m)
+# (several versions: each Games/<version>/game.plist has its own)
+if [ -z "$GAME_APPS" ]; then
+EXE_MD5="$(md5 -q "$GAME_APP/Contents/MacOS/Cyberpunk2077" 2>/dev/null || md5sum "$GAME_APP/Contents/MacOS/Cyberpunk2077" | cut -d' ' -f1)"
+/usr/libexec/PlistBuddy -c "Add :CyPortGameExe string $EXE_MD5" "$APP/Info.plist"
+grep -q "$EXE_MD5" "$HERE/shim/MacShim.m" || echo "    NOTE: game program $EXE_MD5 is not in kMSGames (shim/MacShim.m): mouse gate / controller-ready check / free hook stay off"
+fi
+# which game data this game program needs (sizes + checksums from GOG's public build info): the start screen checks
+# the data against it, and "Update Cyberpunk" downloads only the files that differ. Skipped (with a note) when offline.
+if [ "${NO_DATA_MANIFEST:-0}" != "1" ] && [ -z "$GAME_APPS" ]; then
+  python3 "$HERE/tools/data_manifest.py" "$GAME_APP" "$APP/CyPortData.json" \
+    || { rm -f "$APP/CyPortData.json"; echo "    (no CyPortData.json: the app won't check or update the game data)"; }
+fi
 # first-run graphics settings (everything at its lowest); the shim copies it when the game has no UserSettings.json yet
 [ -f "$HERE/app/DefaultUserSettings.json" ] && cp "$HERE/app/DefaultUserSettings.json" "$APP/DefaultUserSettings.json"
 # app icon (legacy CFBundleIconFiles PNGs, see Info.plist)
@@ -106,7 +185,7 @@ if "com.apple.developer.kernel.extended-virtual-addressing" not in ent:
 plistlib.dump(ent, open(out, "wb")); print("    entitlements from profile:", ", ".join(sorted(ent)))
 PY
   fi
-  for f in "$APP"/Frameworks/*.dylib; do codesign -f -s "$SIGN_ID" "$f"; done
+  for f in "$APP"/Frameworks/*.dylib "$APP"/Games/*/Frameworks/*.dylib "$APP"/Games/*/CyberpunkGame.dylib; do [ -f "$f" ] && codesign -f -s "$SIGN_ID" "$f"; done
   codesign -f -s "$SIGN_ID" --entitlements "$ENT" "$APP"
   codesign --verify --deep --strict "$APP" && echo "    signature OK"
   (cd "$OUT" && zip -qry CyPort.ipa Payload)
@@ -118,7 +197,7 @@ else
   # ad-hoc signature carrying app/entitlements-sideload.plist: the game binary still has the Mac build's signature and
   # entitlements, and SideStore/AltStore keep only entitlements the app itself lists (so the memory limit was dropped)
   if command -v codesign >/dev/null; then
-    for f in "$APP"/Frameworks/*.dylib; do codesign -f -s - "$f" 2>/dev/null; done
+    for f in "$APP"/Frameworks/*.dylib "$APP"/Games/*/Frameworks/*.dylib "$APP"/Games/*/CyberpunkGame.dylib; do [ -f "$f" ] && codesign -f -s - "$f" 2>/dev/null; done
     codesign -f -s - --entitlements "$HERE/app/entitlements-sideload.plist" "$APP" && echo "    ad-hoc signed with app/entitlements-sideload.plist"
   fi
   (cd "$OUT" && zip -qry CyPort-unsigned.ipa Payload)
