@@ -2733,9 +2733,16 @@ static double MSCompactCapGB(size_t asked) {
     return fmin(a, fmax(0.25, u / 2));
 }
 static void *MSMmapOld(void *addr, size_t len, int prot, int flags, int fd, off_t off);
+/* The caller's address is read in this small wrapper: the body below has a big stack frame, so the compiler starts it
+   with a ___chkstk_darwin call that overwrites the link register first - __builtin_return_address(0) there gave an
+   address inside this shim, every pool reservation looked like "not game code" and the compact (free Apple ID) layout
+   was never used (issue #11). */
+static MSMapRet MSMmapBody(void *addr, size_t len, int prot, int flags, int fd, off_t off, void *ra) __attribute__((noinline));
 MSMapRet ms_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) __asm("_mmap");
 MSMapRet ms_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
-    void *ra = __builtin_return_address(0);
+    return MSMmapBody(addr, len, prot, flags, fd, off, __builtin_return_address(0));
+}
+static MSMapRet MSMmapBody(void *addr, size_t len, int prot, int flags, int fd, off_t off, void *ra) {
     /* With extended virtual addressing (paid account) the pools keep the plain layout that is known to work (the
        kernel maps them at 0x70_0000_0000+). Without it (free Apple ID / SideStore) 8 GB reservations fail, and the old
        fallback gave the engine pools that overlap other memory: those go through the compact layout here.
