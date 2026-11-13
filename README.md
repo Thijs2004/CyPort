@@ -196,6 +196,7 @@ while loading. If it is killed with no crash log, the memory limit is still the 
 | `Drawables` = 2, `LowLatencyLockstep` = YES, `PadTiming` = YES | older low-latency methods (cost FPS) / controller delay measurement |
 | `FramePacing` = NO | no frame pacing hooks at all |
 | `Diagnostics` = YES | memory pool / GPU memory statistics in the log every 10 s |
+| `AudioPools` = NO | don't wrap the per-tick AVAudio setters (`setPosition:`, `setVolume:`...) in an autorelease pool. Wwise's audio thread never drains one, so without it autoreleased memory piles up for the whole session |
 | `WorkerSampler` = YES | worker-thread profile in the log every ~60 s (pauses the workers briefly – causes a hitch) |
 | `GPUSampler` = NO, `ConsoleLog` = YES | no GPU busy-time lines / also send the log to the system console |
 | `MemSizeGB` (number) | the RAM size the game is told (it sizes its memory budgets from it). Default: iOS's per-app limit + 1 GB, at most 7 GB (`MemoryFitMaxGB`), so the game stays under the limit; `MemoryFit` = NO = the real size |
