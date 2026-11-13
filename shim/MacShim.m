@@ -304,6 +304,13 @@ static CGRect MSUIFromAK(CGRect r) { double k = MSAKScale(); return CGRectMake(r
 - (CGRect)visibleFrame { return [self frame]; }
 - (CGFloat)backingScaleFactor { double s; MacShimScreenInfo(0, 0, &s, 0); return [MSConfig()[@"Retina2x"] isEqual:@NO] ? s : 2; }
 - (NSInteger)maximumFramesPerSecond { double f; MacShimScreenInfo(0, 0, 0, &f); return (NSInteger)f; }
+/* The game asks for these every frame (macOS 12+ NSScreen). Unimplemented, each call went through message forwarding,
+   whose NSInvocation / NSMethodSignature are autoreleased - and this runs on the game thread outside any pool, so they
+   were never freed: system malloc grew ~7 MB a minute until iOS killed the game. It also returned garbage in d0. Both
+   report the screen's current rate (min = max: fixed refresh, no variable refresh rate; CyPort paces frames itself). */
+- (NSTimeInterval)minimumRefreshInterval { double f = 0; MacShimScreenInfo(0, 0, 0, &f); return f > 0 ? 1.0 / f : 1.0 / 60; }
+- (NSTimeInterval)maximumRefreshInterval { double f = 0; MacShimScreenInfo(0, 0, 0, &f); return f > 0 ? 1.0 / f : 1.0 / 60; }
+- (NSTimeInterval)displayUpdateGranularity { return 0; }
 - (CGFloat)maximumExtendedDynamicRangeColorComponentValue {
     __block CGFloat v = 1; MSOnMain(^{ id n = [MSPhoneScreen() valueForKey:@"currentEDRHeadroom"]; if ([n respondsToSelector:@selector(doubleValue)]) v = [n doubleValue]; }); return v < 1 ? 1 : v; }
 - (CGFloat)maximumPotentialExtendedDynamicRangeColorComponentValue {
@@ -5178,7 +5185,9 @@ static void MSStartReadProgress(void) {
         double t0 = CACurrentMediaTime(), lastCPU = MSCPUSeconds(), lastT = t0, mbps = 0, cpuPct = 0;
         long long b5 = 0, frLast = 0; int quiet = 0; BOOL saved = NO, done = NO; double framesSince = 0, frT = t0, fps = 0;
         double expect = [NSUserDefaults.standardUserDefaults doubleForKey:@"MacShimLoadBytes"]; if (expect < 0.2e9) expect = 4e9;
-        for (int tick = 0;; tick++) {
+        /* a pool per tick: this block never returns, so what it autoreleased (log strings, the overlay's text and
+           colours) was never released */
+        for (int tick = 0;; tick++) @autoreleasepool {
             usleep(500000);
             long long b = g_readBytes, c = g_readCalls, fr = g_frames; double now = CACurrentMediaTime(), idle = g_lastReadAt ? now - g_lastReadAt : now - t0;
             if (tick % 2 == 1) { double cpu = MSCPUSeconds(); cpuPct = (cpu - lastCPU) / (now - lastT) * 100; lastCPU = cpu; lastT = now; }
@@ -5368,7 +5377,12 @@ static void MSException(NSException *e) { MSLogf(@"*** UNCAUGHT EXCEPTION %@: %@
 static void MSOpenLog(void) {
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject, *p = [docs stringByAppendingPathComponent:@"macshim.log"];
     NSDictionary *at = [NSFileManager.defaultManager attributesOfItemAtPath:p error:nil];
-    int flags = O_WRONLY | O_CREAT | O_APPEND; if ([at fileSize] > 512 * 1024) flags |= O_TRUNC;
+    int flags = O_WRONLY | O_CREAT | O_APPEND;
+    if ([at fileSize] > 512 * 1024) {           /* too big: keep it as macshim-previous.log (the run that crashed), start a new one */
+        NSString *prev = [docs stringByAppendingPathComponent:@"macshim-previous.log"];
+        [NSFileManager.defaultManager removeItemAtPath:prev error:nil];
+        if (![NSFileManager.defaultManager moveItemAtPath:p toPath:prev error:nil]) flags |= O_TRUNC;
+    }
     g_logfd = open(p.fileSystemRepresentation, flags, 0644);
     {   /* the game's own stdout/stderr (engine log lines, asserts) -> Documents/game_output.log */
         NSString *gp = [docs stringByAppendingPathComponent:@"game_output.log"];
@@ -5436,11 +5450,27 @@ static void MSFixDesc(id d, const char *what) {
         [(MTLTextureDescriptor *)d setStorageMode:MTLStorageModeShared];
     }
 }
-static id ms_bufLen(id self, SEL c, NSUInteger len, NSUInteger o) { return ((id (*)(id, SEL, NSUInteger, NSUInteger))g_oBufLen)(self, c, len, MSFixOpts(o, "buffer")); }
-static id ms_bufBytes(id self, SEL c, const void *p, NSUInteger len, NSUInteger o) { return ((id (*)(id, SEL, const void *, NSUInteger, NSUInteger))g_oBufBytes)(self, c, p, len, MSFixOpts(o, "buffer(bytes)")); }
-static id ms_tex(id self, SEL c, MTLTextureDescriptor *d) { MSFixDesc(d, "texture"); return ((id (*)(id, SEL, id))g_oTex)(self, c, d); }
-static id ms_heapBuf(id self, SEL c, NSUInteger len, NSUInteger o) { return ((id (*)(id, SEL, NSUInteger, NSUInteger))g_oHeapBuf)(self, c, len, MSFixOpts(o, "heap buffer")); }
-static id ms_heapTex(id self, SEL c, MTLTextureDescriptor *d) { MSFixDesc(d, "heap texture"); return ((id (*)(id, SEL, id))g_oHeapTex)(self, c, d); }
+/* The seven Metal "new..." hooks below hand the game a +1 object, exactly like the methods they wrap. Without
+   NS_RETURNS_RETAINED, ARC retains the result and autoreleases it on the way out: on an engine thread that never drains
+   an autorelease pool that extra reference is never dropped and every buffer/texture made there leaks (GPU memory
+   creeping up until iOS kills the game). */
+typedef id (*MSNewBufLenFn)(id, SEL, NSUInteger, NSUInteger) NS_RETURNS_RETAINED;
+typedef id (*MSNewBufBytesFn)(id, SEL, const void *, NSUInteger, NSUInteger) NS_RETURNS_RETAINED;
+typedef id (*MSNewTexFn)(id, SEL, id) NS_RETURNS_RETAINED;
+typedef id (*MSNewNoCopyFn)(id, SEL, void *, NSUInteger, NSUInteger, id) NS_RETURNS_RETAINED;
+typedef id (*MSNewBufTexFn)(id, SEL, id, NSUInteger, NSUInteger) NS_RETURNS_RETAINED;
+static id ms_bufLen(id self, SEL c, NSUInteger len, NSUInteger o) NS_RETURNS_RETAINED;
+static id ms_bufBytes(id self, SEL c, const void *p, NSUInteger len, NSUInteger o) NS_RETURNS_RETAINED;
+static id ms_tex(id self, SEL c, MTLTextureDescriptor *d) NS_RETURNS_RETAINED;
+static id ms_heapBuf(id self, SEL c, NSUInteger len, NSUInteger o) NS_RETURNS_RETAINED;
+static id ms_heapTex(id self, SEL c, MTLTextureDescriptor *d) NS_RETURNS_RETAINED;
+static id ms_noCopy(id self, SEL c, void *p, NSUInteger len, NSUInteger o, id dealloc) NS_RETURNS_RETAINED;
+static id ms_bufTex(id self, SEL c, MTLTextureDescriptor *d, NSUInteger off, NSUInteger bpr) NS_RETURNS_RETAINED;
+static id ms_bufLen(id self, SEL c, NSUInteger len, NSUInteger o) { return ((MSNewBufLenFn)g_oBufLen)(self, c, len, MSFixOpts(o, "buffer")); }
+static id ms_bufBytes(id self, SEL c, const void *p, NSUInteger len, NSUInteger o) { return ((MSNewBufBytesFn)g_oBufBytes)(self, c, p, len, MSFixOpts(o, "buffer(bytes)")); }
+static id ms_tex(id self, SEL c, MTLTextureDescriptor *d) { MSFixDesc(d, "texture"); return ((MSNewTexFn)g_oTex)(self, c, d); }
+static id ms_heapBuf(id self, SEL c, NSUInteger len, NSUInteger o) { return ((MSNewBufLenFn)g_oHeapBuf)(self, c, len, MSFixOpts(o, "heap buffer")); }
+static id ms_heapTex(id self, SEL c, MTLTextureDescriptor *d) { MSFixDesc(d, "heap texture"); return ((MSNewTexFn)g_oHeapTex)(self, c, d); }
 /* GPU memory audit: buffers wrapped around the game's own memory, and textures laid over buffers (a size mistake there
  * lets the GPU write past the buffer into neighbouring engine memory) */
 static IMP g_oNoCopy, g_oBufTex;
@@ -5448,7 +5478,7 @@ static id ms_noCopy(id self, SEL c, void *p, NSUInteger len, NSUInteger o, id de
     long long n = g_noCopyN++; g_noCopyBytes += (long long)len;
     if (n < 12 || (len & 0x3fff) || ((uintptr_t)p & 0x3fff)) MSLogf(@"Metal: noCopy buffer #%lld %p +%#lx opts %#lx%s", n, p, (unsigned long)len, (unsigned long)o,
         ((len & 0x3fff) || ((uintptr_t)p & 0x3fff)) ? " NOT PAGE ALIGNED" : "");
-    return ((id (*)(id, SEL, void *, NSUInteger, NSUInteger, id))g_oNoCopy)(self, c, p, len, o, dealloc);
+    return ((MSNewNoCopyFn)g_oNoCopy)(self, c, p, len, o, dealloc);
 }
 static id ms_bufTex(id self, SEL c, MTLTextureDescriptor *d, NSUInteger off, NSUInteger bpr) {
     long long n = g_bufTexN++;
@@ -5459,7 +5489,7 @@ static id ms_bufTex(id self, SEL c, MTLTextureDescriptor *d, NSUInteger off, NSU
     if (n < 8 || (bad && g_bufTexBad < 20)) MSLogf(@"Metal: texture over buffer #%lld %lux%lux%lu fmt %lu off %lu bpr %lu need %lu buf %lu align %lu%s", n,
         (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.depth, (unsigned long)d.pixelFormat, (unsigned long)off, (unsigned long)bpr,
         (unsigned long)need, (unsigned long)b.length, (unsigned long)align, bad ? " <-- OVERFLOWS / MISALIGNED" : "");
-    return ((id (*)(id, SEL, id, NSUInteger, NSUInteger))g_oBufTex)(self, c, d, off, bpr);
+    return ((MSNewBufTexFn)g_oBufTex)(self, c, d, off, bpr);
 }
 static void MSAddMacAPIs(void) {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice(); if (!dev) { MSLogf(@"no Metal device!"); return; }
@@ -5642,7 +5672,51 @@ static BOOL ms_engineStart(id self, SEL _cmd, NSError **err) {
     @synchronized (g_audioEngines) { [g_audioEngines addObject:self]; }
     return ((BOOL (*)(id, SEL, NSError **))g_origEngineStart)(self, _cmd, err);
 }
+/* ---------------------------------------------------------------- audio: autorelease pools for per-tick AVAudio setters
+ * Wwise's audio thread (AK::AudioMgr) updates every 3D voice each tick - -[AVAudioPlayerNode setPosition:] and friends.
+ * AVFAudio autoreleases inside those calls and that thread never drains a pool, so its pool pages piled up for the
+ * whole session (malloc sampler: 4 KB pool pages from libobjc <- AudioToolboxCore <- AVFAudio <- Cyberpunk2077). Each
+ * call now runs in its own @autoreleasepool. Only methods whose type encoding matches exactly are wrapped;
+ * AudioPools = NO turns it off. */
+typedef struct { float a, b, c; } MSF3;
+typedef struct { Class cls; SEL sel; IMP orig; } MSAudioOrig;
+static MSAudioOrig g_audioOrig[64]; static int g_audioOrigN;
+static IMP MSAudioOrigFor(id self, SEL sel) {
+    for (Class c = object_getClass(self); c; c = class_getSuperclass(c))
+        for (int i = 0; i < g_audioOrigN; i++) if (g_audioOrig[i].cls == c && g_audioOrig[i].sel == sel) return g_audioOrig[i].orig;
+    return NULL;
+}
+static void ms_audioSetF3(id self, SEL sel, MSF3 v) { IMP o = MSAudioOrigFor(self, sel); if (o) @autoreleasepool { ((void (*)(id, SEL, MSF3))o)(self, sel, v); } }
+static void ms_audioSetF(id self, SEL sel, float v) { IMP o = MSAudioOrigFor(self, sel); if (o) @autoreleasepool { ((void (*)(id, SEL, float))o)(self, sel, v); } }
+static void MSInstallAudioPools(void) {
+    if ([MSConfig()[@"AudioPools"] isEqual:@NO]) return;
+    NSArray *classes = @[ @"AVAudioPlayerNode", @"AVAudioMixerNode", @"AVAudioEnvironmentNode", @"AVAudioUnitSampler",
+                          @"AVAudioSourceNode", @"AVAudioMixingDestination", @"AVAudioInputNode" ];
+    NSArray *f3 = @[ @"setPosition:", @"setListenerPosition:", @"setListenerAngularOrientation:" ];
+    NSArray *f1 = @[ @"setObstruction:", @"setOcclusion:", @"setReverbBlend:", @"setVolume:", @"setPan:", @"setRate:" ];
+    int n = 0;
+    for (NSString *cn in classes) {
+        Class c = NSClassFromString(cn); if (!c) continue;
+        for (NSString *sn in [f3 arrayByAddingObjectsFromArray:f1]) {
+            SEL sel = NSSelectorFromString(sn); Method m = class_getInstanceMethod(c, sel); if (!m) continue;
+            Class def = c; while (class_getSuperclass(def) && class_getInstanceMethod(class_getSuperclass(def), sel) == m) def = class_getSuperclass(def);
+            BOOL done = NO; for (int i = 0; i < g_audioOrigN; i++) if (g_audioOrig[i].cls == def && g_audioOrig[i].sel == sel) done = YES;
+            if (done || g_audioOrigN >= 64) continue;
+            BOOL isF3 = [f3 containsObject:sn];
+            char *rt = method_copyReturnType(m), *at = method_copyArgumentType(m, 2);
+            BOOL ok = rt && at && !strcmp(rt, "v") && method_getNumberOfArguments(m) == 3 &&
+                      (isF3 ? (strncmp(at, "{", 1) == 0 && strstr(at, "=fff}") != NULL) : !strcmp(at, "f"));
+            free(rt); free(at);
+            if (!ok) { MSLogf(@"audio pools: %@ %@ has an unexpected type - left alone", NSStringFromClass(def), sn); continue; }
+            g_audioOrig[g_audioOrigN].cls = def; g_audioOrig[g_audioOrigN].sel = sel;
+            g_audioOrig[g_audioOrigN].orig = method_getImplementation(m); g_audioOrigN++;
+            method_setImplementation(m, isF3 ? (IMP)ms_audioSetF3 : (IMP)ms_audioSetF); n++;
+        }
+    }
+    MSLogf(@"audio pools: %d AVAudio setters run in their own autorelease pool", n);
+}
 static void MSInstallBackgroundFreeze(void) {
+    MSInstallAudioPools();
     g_audioEngines = [NSHashTable weakObjectsHashTable];
     Class c = NSClassFromString(@"AVAudioEngine");
     Method m = c ? class_getInstanceMethod(c, NSSelectorFromString(@"startAndReturnError:")) : NULL;
