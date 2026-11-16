@@ -196,9 +196,16 @@ while loading. If it is killed with no crash log, the memory limit is still the 
 | `Drawables` = 2, `LowLatencyLockstep` = YES, `PadTiming` = YES | older low-latency methods (cost FPS) / controller delay measurement |
 | `FramePacing` = NO | no frame pacing hooks at all |
 | `Diagnostics` = YES | memory pool / GPU memory statistics in the log every 10 s |
+| `AudioPools` = NO | don't wrap the per-tick AVAudio setters (`setPosition:`, `setVolume:`...) in an autorelease pool. Wwise's audio thread never drains one, so without it autoreleased memory piles up for the whole session |
 | `WorkerSampler` = YES | worker-thread profile in the log every ~60 s (pauses the workers briefly – causes a hitch) |
 | `GPUSampler` = NO, `ConsoleLog` = YES | no GPU busy-time lines / also send the log to the system console |
 | `MemSizeGB` (number) | the RAM size the game is told (it sizes its memory budgets from it). Default: iOS's per-app limit + 1 GB, at most 7 GB (`MemoryFitMaxGB`), so the game stays under the limit; `MemoryFit` = NO = the real size |
+| `PadPoll` = NO, `PadCoalesce` = NO | controller sticks / triggers: don't read them once per frame / hand every report to the game unmerged |
+| `PadRumbleLimit` = NO | controller rumble (2.5): send every update the game makes (no merging, no "start now") – the old late / too-long rumble |
+| `PhoneRumble` = NO | no phone rumble with touch controls (start screen: Phone vibration) |
+| `SilentModeSound` = NO, `MixAudio` = YES | the silent switch mutes the game / other apps' music keeps playing (start screen switches) |
+| `MacOS26` = YES/NO | the game is told macOS 26, which unlocks Apple's MetalFX frame generation (start screen: Apple frame generation) |
+| `GPUBudgetGB` (number), `GPUBudgetFit` = YES | tell the game less GPU memory than Metal recommends (off by default: smaller GPU heaps can make the game crash itself) |
 | `CompactPools` = YES / NO | force / never use the small-address-space memory layout (used automatically without extended virtual addressing, e.g. a free Apple ID) |
 | `ResMode` (0–7), `AutoPlay`, `AutoKeys` | testing aids |
 

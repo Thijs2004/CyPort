@@ -31,6 +31,9 @@ LC_DYLD_CHAINED_FIXUPS = 0x80000034
 # _mmap/_munmap/_madvise/_mprotect: the engine reserves ~118 GB of address space at startup; an iPhone gets ~65 GB even with
 # extended-virtual-addressing, so the shim shrinks the big reservations (see "address-space budget" in MacShim.m)
 REROUTE = {"__NSGetExecutablePath", "_sysctlbyname", "_mmap", "_munmap", "_madvise", "_mprotect",
+           # @available(macOS 26, *): on iOS dyld answers "no" to every macOS question - Apple's MetalFX frame generation
+           # (and the rest of the game's macOS 26 paths) stayed off; the shim answers with the iOS version (26 = 26)
+           "__availability_version_check",
            # case-insensitive retry for game paths (the Mac build assumes a case-insensitive file system)
            "_opendir", "_realpath$DARWIN_EXTSN", "_stat", "_access", "_fopen", "_open",
            # retry + log failed or short reads (game data on an external SSD; the engine treats a short read as fatal)

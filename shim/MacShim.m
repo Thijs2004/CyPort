@@ -60,7 +60,7 @@ static NSInteger MSPref(NSString *k, NSInteger def);
 static void MSStatusCreate(void);
 static void MSTouchPadCreate(UIWindowScene *sc);
 static void MSTVRoute(void); static void MSTVObserve(void);
-static void MSLowLatencyWait(void); static void MSInputReport(void); static void MSPollBegin(void); static void MSFxReport(void); static void MSHookControllerEffects(void);
+static void MSLowLatencyWait(void); static void MSInputReport(void); static void MSPollBegin(void); static void MSFxReport(void); static void MSRumReport(void); static void MSHookControllerEffects(void);
 /* TV out: the phone shows the picture too (TVMirror = NO: phone stays black, saves a little power) */
 @class CAMetalLayer; static CAMetalLayer *g_mirrorLayer; static _Atomic BOOL g_mirrorOn;
 static BOOL MSMirrorFit(UIView *v, CGRect *r);
@@ -89,6 +89,9 @@ static _Atomic double g_mqBeat, g_mqAsked;
    needed the memory and closed it). */
 static _Atomic BOOL g_inBackground;
 static NSHashTable *g_audioEngines;
+static BOOL MSMacOS26On(void); static int g_mac26;
+static _Atomic BOOL g_smoothStop;              /* frame generation went on while playing: smooth pacing stops now */
+static void MSAudioSessionSetup(const char *why);
 extern void _dispatch_main_queue_callback_4CF(void *msg);
 static void MSMainAsync(dispatch_block_t b) { CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, b); CFRunLoopWakeUp(CFRunLoopGetMain()); }
 /* Game on its own thread (GameThread, default on; start screen "Smooth controls"). The Mac game runs its whole loop on
@@ -304,6 +307,13 @@ static CGRect MSUIFromAK(CGRect r) { double k = MSAKScale(); return CGRectMake(r
 - (CGRect)visibleFrame { return [self frame]; }
 - (CGFloat)backingScaleFactor { double s; MacShimScreenInfo(0, 0, &s, 0); return [MSConfig()[@"Retina2x"] isEqual:@NO] ? s : 2; }
 - (NSInteger)maximumFramesPerSecond { double f; MacShimScreenInfo(0, 0, 0, &f); return (NSInteger)f; }
+/* The game asks for these every frame (macOS 12+ NSScreen). Unimplemented, each call went through message forwarding,
+   whose NSInvocation / NSMethodSignature are autoreleased - and this runs on the game thread outside any pool, so they
+   were never freed: system malloc grew ~7 MB a minute until iOS killed the game. It also returned garbage in d0. Both
+   report the screen's current rate (min = max: fixed refresh, no variable refresh rate; CyPort paces frames itself). */
+- (NSTimeInterval)minimumRefreshInterval { double f = 0; MacShimScreenInfo(0, 0, 0, &f); return f > 0 ? 1.0 / f : 1.0 / 60; }
+- (NSTimeInterval)maximumRefreshInterval { double f = 0; MacShimScreenInfo(0, 0, 0, &f); return f > 0 ? 1.0 / f : 1.0 / 60; }
+- (NSTimeInterval)displayUpdateGranularity { return 0; }
 - (CGFloat)maximumExtendedDynamicRangeColorComponentValue {
     __block CGFloat v = 1; MSOnMain(^{ id n = [MSPhoneScreen() valueForKey:@"currentEDRHeadroom"]; if ([n respondsToSelector:@selector(doubleValue)]) v = [n doubleValue]; }); return v < 1 ? 1 : v; }
 - (CGFloat)maximumPotentialExtendedDynamicRangeColorComponentValue {
@@ -1967,6 +1977,72 @@ static BOOL MSApplySteady30(NSMutableString *txt) {
     return ch;
 }
 static BOOL MSSmoothOn(void);
+/* "Restore defaults" on the start screen (CyPortResetGameGraphics, set by the launcher): at the next Play the game's
+   graphics and display settings go back to the bundled DefaultUserSettings.json (the phone-tuned first-run settings),
+   then the first-run tweaks run again (VSync / FPS cap off for smooth pacing, MetalFX Performance, frame generation off).
+   Audio, controls, key bindings, gameplay, language and subtitles are left alone. Text edits only, group by group
+   (option names repeat across groups, and re-serialising the file made the game reset it - see MSApplyGameSettings). */
+static NSRange MSJSONGroupRange(NSString *t, NSString *group) {            /* the {...} of the group with that group_name */
+    NSRange g = [t rangeOfString:[NSString stringWithFormat:@"\"group_name\"\\s*:\\s*\"%@\"", [NSRegularExpression escapedPatternForString:group]] options:NSRegularExpressionSearch];
+    if (g.location == NSNotFound) return g;
+    NSUInteger n = t.length, stack[64]; int sp = 0; BOOL str = NO, esc = NO; NSUInteger open = NSNotFound; int depth = 0;
+    for (NSUInteger i = 0; i < n; i++) {
+        unichar c = [t characterAtIndex:i];
+        if (str) { if (esc) esc = NO; else if (c == '\\') esc = YES; else if (c == '"') str = NO; continue; }
+        if (i == g.location && open == NSNotFound) { if (!sp) return NSMakeRange(NSNotFound, 0); open = stack[sp - 1]; depth = sp; }
+        if (c == '"') str = YES;
+        else if (c == '{') { if (sp < 64) stack[sp] = i; sp++; }
+        else if (c == '}') { if (open != NSNotFound && sp == depth) return NSMakeRange(open, i - open + 1); sp--; if (sp < 0) return NSMakeRange(NSNotFound, 0); }
+    }
+    return NSMakeRange(NSNotFound, 0);
+}
+static int MSResetGameGraphics(NSMutableString *txt) {
+    NSString *dp = [NSBundle.mainBundle pathForResource:@"DefaultUserSettings" ofType:@"json"];
+    NSString *dt = dp ? [NSString stringWithContentsOfFile:dp encoding:NSUTF8StringEncoding error:nil] : nil;
+    NSDictionary *dj = dt ? [NSJSONSerialization JSONObjectWithData:[dt dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil] : nil;
+    if (![dj isKindOfClass:NSDictionary.class]) { MSLogf(@"restore defaults: no DefaultUserSettings.json in the app"); return 0; }
+    NSSet *groups = [NSSet setWithArray:@[ @"/graphics/presets", @"/graphics/raytracing", @"/graphics/advanced", @"/graphics/basic", @"/graphics/performance", @"/video/display" ]];
+    NSSet *skip = [NSSet setWithArray:@[ @"Resolution", @"FrameGeneration",              /* written below / by the start screen */
+                                         @"MaxMonitorBrightness", @"MinMonitorBrightness", @"PaperWhiteLevel" ]];   /* HDR calibration: scales differ by version */
+    int n = 0;
+    for (NSDictionary *grp in dj[@"data"]) {
+        NSString *gn = grp[@"group_name"]; if (![groups containsObject:gn]) continue;
+        NSRange ur = MSJSONGroupRange(txt, gn), dr = MSJSONGroupRange(dt, gn);
+        if (ur.location == NSNotFound || dr.location == NSNotFound) continue;
+        NSMutableString *ug = [[txt substringWithRange:ur] mutableCopy], *dg = [[dt substringWithRange:dr] mutableCopy];
+        for (NSDictionary *o in grp[@"options"]) {
+            NSString *name = o[@"name"]; if (![name isKindOfClass:NSString.class] || [skip containsObject:name]) continue;
+            NSString *was = nil;
+            if ([o[@"value"] isKindOfClass:NSString.class]) {
+                if (MSTextSetOption(dg, name, nil, -1, &was) && was) {
+                    NSString *cur = nil; MSTextSetOption(ug, name, nil, -1, &cur);
+                    if (cur && ![cur isEqualToString:was] && MSTextSetOption(ug, name, was, o[@"index"] ? [o[@"index"] integerValue] : -1, NULL)) n++;
+                }
+            } else if (MSTextSetRaw(dg, name, nil, &was) || was) {
+                if (was && MSTextSetRaw(ug, name, was, NULL)) n++;
+            }
+        }
+        [txt replaceCharactersInRange:ur withString:ug];
+    }
+    MSTextSetOption(txt, @"FrameGeneration", @"Off", 0, NULL);
+    MSTextSetRaw(txt, @"FSR3_FrameGeneration", @"false", NULL); MSTextSetRaw(txt, @"MetalFX_FrameGeneration", @"false", NULL);
+    MSLogf(@"restore defaults: %d graphics / display settings back to the phone defaults", n);
+    return n;
+}
+/* Frame generation + smooth pacing: pacing measures the frames the game presents, and with made-up frames in between it
+   judged the game too slow and stepped down to 30 almost at once (user: "very fast to 30"); off, the frame rate is far
+   higher. So when frame generation gets switched ON (start screen switch, or Apple's / FSR3's in the game's menu),
+   "Smooth frame pacing" is turned off - once, on that change: whoever turns pacing back on keeps it.
+   CyPortFGWasOn remembers the last state seen. */
+static void MSFrameGenPacing(BOOL fgOn, const char *where) {
+    NSUserDefaults *u = NSUserDefaults.standardUserDefaults;
+    BOOL was = [u boolForKey:@"CyPortFGWasOn"];
+    if (fgOn && !was && MSPref(@"CyPortSmoothPacing", 1) != 0 && !MSConfig()[@"SmoothPacing"]) {
+        [u setBool:NO forKey:@"CyPortSmoothPacing"]; g_smoothStop = YES;
+        MSLogf(@"frame generation switched on (%s) - smooth frame pacing turned off (it can be turned on again on the start screen)", where);
+    }
+    if (fgOn != was) [u setBool:fgOn forKey:@"CyPortFGWasOn"];
+}
 static void MSApplyGameSettings(NSSet *keys) {
     MSWriteStreamingIni();
     /* Only the resolution is written, as a text edit of its "value" (the game is offered only that one mode); the rest of
@@ -1986,7 +2062,12 @@ static void MSApplyGameSettings(NSSet *keys) {
        30), which leaves smooth pacing nothing to do. VSync Off (index 0 of the game's runtime list Off/120/60/40/30) and
        Maximum FPS off: smooth pacing then holds the highest even rate the phone keeps up with. Later launches keep
        whatever the player sets in the game. */
-    if (firstRun && txt && MSSmoothOn()) {
+    BOOL resetGfx = txt && [NSUserDefaults.standardUserDefaults boolForKey:@"CyPortResetGameGraphics"];
+    if (resetGfx) {
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:@"CyPortResetGameGraphics"];
+        MSResetGameGraphics(txt); firstChanged = YES;
+    }
+    if ((firstRun || resetGfx) && txt && MSSmoothOn()) {
         BOOL a = MSTextSetOption(txt, @"VSync", @"UI-Settings-Video-QualitySetting-Off", 0, NULL);
         BOOL b = MSTextSetRaw(txt, @"MaximumFPS_OnOff", @"false", NULL);
         if (a || b) { firstChanged = YES; MSLogf(@"first run: VSync Off, Maximum FPS off - smooth frame pacing picks the frame rate"); }
@@ -2005,18 +2086,53 @@ static void MSApplyGameSettings(NSSet *keys) {
             if (m && ![[txt substringWithRange:[m rangeAtIndex:2]] isEqualToString:want]) { [txt replaceCharactersInRange:[m rangeAtIndex:2] withString:want]; changed = YES; }
         }
     }
-    /* once: the Mac build's upscaler names don't match its menu labels - value "FSR2" is MetalFX in the menu and in the
-       engine (the MetalFX scaler is made for it), value "MetalFX" is FSR 3.1. An earlier CyPort (and its first-run
-       template) wrote "MetalFX" meaning MetalFX, so the game ran FSR 3.1. Put it on real MetalFX, Performance. */
-    if (![NSUserDefaults.standardUserDefaults boolForKey:@"CyPortUpscalerNamesFixed"]) {
-        NSString *was = nil;
-        if (MSTextSetOption(txt, @"ResolutionScaling", nil, -1, &was) && [was isEqualToString:@"MetalFX"]) {
-            MSTextSetOption(txt, @"ResolutionScaling", @"FSR2", 1, NULL);
-            MSTextSetOption(txt, @"FSR2", @"Performance", 3, NULL);
-            MSTextSetOption(txt, @"MetalFX", @"Performance", 3, NULL);
-            changed = YES; MSLogf(@"upscaler: was FSR 3.1 (value \"MetalFX\"), now MetalFX Performance (value \"FSR2\")");
+    /* Upscaler: Apple's MetalFX, Performance - on a first start, after "Restore defaults", and once for older installs.
+       The value that means MetalFX differs by version: 2.3.1 has its names swapped (value "FSR2" is MetalFX in its menu
+       and engine, "MetalFX" is FSR 3.1); 2.5 names them right ("MetalFX" = MetalFX: its menu shows MetalFX and the
+       MetalFX scaler is made for it; "FSR2" is FSR). The old one-time fix-up and the first-run template used 2.3.1's
+       names, so 2.5 players got FSR - put back on MetalFX once (CyPortUpscaler25Fixed). */
+    {
+        BOOL swapped = !strncmp(MSGame()->name, "2.31a", 5);
+        NSString *mfx = swapped ? @"FSR2" : @"MetalFX", *fsr = swapped ? @"MetalFX" : @"FSR2";
+        NSInteger mfxIdx = swapped ? 1 : 2;
+        NSUserDefaults *u = NSUserDefaults.standardUserDefaults; NSString *was = nil;
+        MSTextSetOption(txt, @"ResolutionScaling", nil, -1, &was);
+        BOOL force = firstRun || resetGfx;
+        BOOL once = swapped ? ![u boolForKey:@"CyPortUpscalerNamesFixed"] : ![u boolForKey:@"CyPortUpscaler25Fixed"];
+        if (was && (force || (once && [was isEqualToString:fsr])) && (![was isEqualToString:mfx] || force)) {
+            MSTextSetOption(txt, @"ResolutionScaling", mfx, mfxIdx, NULL);
+            MSTextSetOption(txt, mfx, @"Performance", 3, NULL);
+            changed = YES; MSLogf(@"upscaler: Apple MetalFX, Performance (value \"%@\" in %s; was \"%@\")", mfx, MSGame()->name, was);
         }
-        [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"CyPortUpscalerNamesFixed"];
+        [u setBool:YES forKey:swapped ? @"CyPortUpscalerNamesFixed" : @"CyPortUpscaler25Fixed"];
+    }
+    /* start screen "Apple frame generation" on: Apple's MetalFX frame generation switched on in the game too (before,
+       the switch only made the option appear and it still had to be turned on in Graphics). FSR3's goes off - one
+       interpolator at a time. Written as the game saves it: FrameGeneration "MetalFX" (index 2 of Off/FSR3/MetalFX),
+       MetalFX_FrameGeneration true. Switch off: left as the game has it (the option is hidden then anyway). */
+    if (!MSMacOS26On() && txt) {                                  /* switch off: Apple's off in the game too (FSR3 left alone) */
+        NSString *was = nil, *b1 = nil;
+        MSTextSetOption(txt, @"FrameGeneration", nil, -1, &was); MSTextSetRaw(txt, @"MetalFX_FrameGeneration", nil, &b1);
+        BOOL ch = NO;
+        if ([was isEqualToString:@"MetalFX"]) ch |= MSTextSetOption(txt, @"FrameGeneration", @"Off", 0, NULL);
+        if ([b1 isEqualToString:@"true"]) ch |= MSTextSetRaw(txt, @"MetalFX_FrameGeneration", @"false", NULL);
+        if (ch) { changed = YES; MSLogf(@"frame generation: Apple MetalFX switched off in the game's settings (start screen switch off)"); }
+    }
+    if (MSMacOS26On() && txt) {
+        NSString *was = nil, *b1 = nil, *b2 = nil;
+        MSTextSetOption(txt, @"FrameGeneration", nil, -1, &was); MSTextSetRaw(txt, @"MetalFX_FrameGeneration", nil, &b1); MSTextSetRaw(txt, @"FSR3_FrameGeneration", nil, &b2);
+        if (![was isEqualToString:@"MetalFX"] || ![b1 isEqualToString:@"true"] || [b2 isEqualToString:@"true"]) {
+            BOOL a = MSTextSetOption(txt, @"FrameGeneration", @"MetalFX", 2, NULL);
+            BOOL m = MSTextSetRaw(txt, @"MetalFX_FrameGeneration", @"true", NULL);
+            MSTextSetRaw(txt, @"FSR3_FrameGeneration", @"false", NULL);
+            if (a || m) { changed = YES; MSLogf(@"frame generation: Apple MetalFX switched on in the game's settings (was %@, FSR3 %@)", was ?: @"not set", b2 ?: @"-"); }
+            else MSLogf(@"frame generation: the game's settings have no frame generation options yet - set it once in Graphics");
+        }
+    }
+    {   /* frame generation on after the edits above (switch, or set in the game)? then pacing steps aside once */
+        NSString *fg = nil, *f3 = nil, *fa = nil;
+        MSTextSetOption(txt, @"FrameGeneration", nil, -1, &fg); MSTextSetRaw(txt, @"FSR3_FrameGeneration", nil, &f3); MSTextSetRaw(txt, @"MetalFX_FrameGeneration", nil, &fa);
+        MSFrameGenPacing((fg && ![fg isEqualToString:@"Off"]) || [f3 isEqualToString:@"true"] || [fa isEqualToString:@"true"], "at Play");
     }
     if (MSApplyFrameRate(txt)) changed = YES;
     if (MSApplySteady30(txt)) changed = YES;
@@ -2104,7 +2220,7 @@ static NSDictionary *MSRestartSettingsSnapshot(void) {
     NSData *d = [NSData dataWithContentsOfFile:MSUserSettingsPath()]; if (!d) return nil;
     NSDictionary *j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil]; if (![j isKindOfClass:NSDictionary.class]) return nil;
     NSSet *watch = [NSSet setWithArray:@[ @"Resolution", @"WindowMode", @"ResolutionScaling", @"MetalFX", @"FSR2", @"FSR3", @"FrameGeneration",
-                                          @"FSR3_FrameGeneration", @"VSync", @"DynamicResolutionScaling", @"TextureQuality",
+                                          @"FSR3_FrameGeneration", @"MetalFX_FrameGeneration", @"VSync", @"DynamicResolutionScaling", @"TextureQuality",
                                           @"MaximumFPS_OnOff", @"MaximumFPS_Value", @"QuickPresets" ]];
     NSMutableDictionary *snap = [NSMutableDictionary dictionary];
     for (NSDictionary *grp in j[@"data"]) if ([grp isKindOfClass:NSDictionary.class]) for (NSDictionary *o in grp[@"options"])
@@ -2122,6 +2238,17 @@ static void MSSyncStartScreenFrom(NSDictionary *v) {
         if (q != NSNotFound) [u setInteger:q forKey:@"MacShimUpQuality"];
     }
     BOOL fg = [v[@"FrameGeneration"] isEqual:@"FSR3"]; [u setBool:fg forKey:@"MacShimFrameGen"];
+    /* Apple frame generation: the start screen switch follows the game's menu - turned off (or switched to FSR3) in the
+       game = switch off; on in the game = switch on. */
+    if (v[@"FrameGeneration"] || v[@"FSR3_FrameGeneration"] || v[@"MetalFX_FrameGeneration"])
+        MSFrameGenPacing((v[@"FrameGeneration"] && ![v[@"FrameGeneration"] isEqual:@"Off"]) || [v[@"FSR3_FrameGeneration"] boolValue] || [v[@"MetalFX_FrameGeneration"] boolValue], "in the game's menu");
+    if (v[@"FrameGeneration"] || v[@"MetalFX_FrameGeneration"]) {
+        BOOL apple = [v[@"FrameGeneration"] isEqual:@"MetalFX"] && [v[@"MetalFX_FrameGeneration"] boolValue];
+        if (apple != (MSPref(@"CyPortAppleFrameGen", 0) != 0)) {
+            [u setBool:apple forKey:@"CyPortAppleFrameGen"];
+            MSLogf(@"Apple frame generation turned %@ in the game - start screen switch set %@", apple ? @"on" : @"off", apple ? @"on" : @"off");
+        }
+    }
     if (v[@"DynamicResolutionScaling"]) [u setBool:[v[@"DynamicResolutionScaling"] boolValue] forKey:@"MacShimDRS"];
     int vs = [v[@"MaximumFPS_OnOff"] boolValue] ? [v[@"MaximumFPS_Value"] intValue] : [v[@"VSync"] intValue];
     if (vs > 0) { int fps = fg ? vs / 2 : vs, best = 0, bd = 1000;
@@ -2143,7 +2270,7 @@ static void MSShowRestartPopup(NSArray *changed) {
     g_restartWin.rootViewController = [MSRestartVC new]; g_restartWin.rootViewController.view.backgroundColor = UIColor.clearColor;
     g_restartWin.hidden = NO;
     NSDictionary *names = @{ @"Resolution": @"resolution", @"WindowMode": @"window mode", @"ResolutionScaling": @"upscaler", @"MetalFX": @"MetalFX quality",
-                             @"FSR2": @"FSR 2 quality", @"FSR3": @"FSR 3 quality", @"FrameGeneration": @"frame generation", @"FSR3_FrameGeneration": @"frame generation",
+                             @"FSR2": @"FSR 2 quality", @"FSR3": @"FSR 3 quality", @"FrameGeneration": @"frame generation", @"FSR3_FrameGeneration": @"frame generation", @"MetalFX_FrameGeneration": @"frame generation",
                              @"VSync": @"FPS limit / VSync", @"DynamicResolutionScaling": @"dynamic resolution", @"TextureQuality": @"texture quality" };
     NSMutableOrderedSet *list = [NSMutableOrderedSet orderedSet]; for (NSString *k in changed) [list addObject:names[k] ?: k];
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Restart to apply settings"
@@ -2171,6 +2298,9 @@ static void MSWatchGameSettings(void) {
     static NSDate *lastMod;
     void (^check)(void) = ^{
         pending = NO;
+        /* the grace clock starts when the game draws, checked on every tick: it used to start at the first SAVE, so the
+           first change made in the game's menu only moved the baseline and was ignored (no restart popup, no switch sync) */
+        if (g_frames > 60 && !drawingSince) drawingSince = CACurrentMediaTime();
         NSDate *mod = [NSFileManager.defaultManager attributesOfItemAtPath:MSUserSettingsPath() error:nil].fileModificationDate;
         if (mod && lastMod && [mod isEqualToDate:lastMod]) return;         /* not saved again */
         BOOL saved = lastMod != nil; lastMod = mod;
@@ -2179,7 +2309,6 @@ static void MSWatchGameSettings(void) {
             MSLogf(@"game saved its settings (%.0f s after start)%@", CACurrentMediaTime() - t0, d.count ? [@": " stringByAppendingString:[d componentsJoinedByString:@", "]] : @" - nothing that needs a restart"); }
         /* startup grace: the game rewrites (normalises) the file while it loads; until it has drawn for 5 s only
            the baseline moves */
-        if (g_frames > 60 && !drawingSince) drawingSince = CACurrentMediaTime();
         if (!base || !drawingSince || CACurrentMediaTime() - drawingSince < 5) { base = now; return; }
         if (base && g_paceMode > 0 && (![now[@"MaximumFPS_OnOff"] isEqual:base[@"MaximumFPS_OnOff"]] || ![now[@"MaximumFPS_Value"] isEqual:base[@"MaximumFPS_Value"]] || ![now[@"VSync"] isEqual:base[@"VSync"]])) {
             static int said; if (!said++) MSLogf(@"frame rate changed in the game's menu - CyPort keeps pacing at %d FPS (macshim.plist FrameRate)", (int)g_paceFPS);
@@ -2243,6 +2372,7 @@ static void *MSGameThreadMain(void *ready) {
         void (^onPlay)(NSInteger, NSInteger) = ^(NSInteger res, NSInteger ov) {
             [NSUserDefaults.standardUserDefaults setInteger:res forKey:@"MacShimResMode2"];
             [NSUserDefaults.standardUserDefaults setInteger:ov forKey:@"MacShimOverlay"];
+            g_mac26 = -1;                                        /* "Apple frame generation" may have been switched */
             MSApplyGameSettings([NSSet set]);
             if (playAction) playAction();
         };
@@ -2258,6 +2388,8 @@ static void *MSGameThreadMain(void *ready) {
        anything else while one of its blocks is running - GameController, NSOperationQueue.mainQueue observers and
        every dispatch to the main queue would be stuck for the whole game. */
     void (^start)(void) = ^{
+        MSAudioSessionSetup("play");
+        MSLogf(@"Apple frame generation: %@", MSMacOS26On() ? @"on (the game sees macOS 26)" : @"off (the game sees macOS 15.5)");
         /* game on its own thread: start screen "Smooth controls" (CyPortGameThread, default on), plist GameThread */
         id gt = MSConfig()[@"GameThread"]; NSNumber *pref = [NSUserDefaults.standardUserDefaults objectForKey:@"CyPortGameThread"];
         if (gt ? [gt boolValue] : (pref ? pref.boolValue : YES)) {
@@ -2429,12 +2561,47 @@ static double MSFitMemSizeGB(void) {
     MSLogf(@"memory: iOS lets this app use ~%.2f GB of the phone's %.1f GB; the game is told %.2f GB", g_memLimitGB, real / 1073741824.0, gb);
     return fit;
 }
+/* @available(macOS 26, *) in the game -> _availability_version_check({macOS, 26.0}). On iOS dyld only answers for iOS,
+ * so every macOS question came back NO: the game hid Apple's MetalFX frame generation (MTLFXFrameInterpolator, needs
+ * macOS 26) and only offered FSR3's, which is laggy. Since 2025 Apple numbers macOS and iOS alike (26 = 26), so a macOS
+ * question is now asked as the same iOS version; macOS 10-15 count as iOS 13 (always true here). Other platforms pass
+ * through. Start screen "Apple frame generation" (CyPortAppleFrameGen, default OFF) / plist MacOS26 = NO: the old answer. */
+typedef struct { uint32_t platform, version; } MSBuildVersion;
+static int g_mac26 = -1;                       /* -1: read again (at launch, and at PLAY: the switch may have changed) */
+static BOOL MSMacOS26On(void) {
+    int on = g_mac26;
+    if (on < 0) { id v = MSConfig()[@"MacOS26"]; on = [v respondsToSelector:@selector(boolValue)] ? [v boolValue] : MSPref(@"CyPortAppleFrameGen", 0) != 0; g_mac26 = on; }
+    return on;
+}
+bool ms_availability(uint32_t count, MSBuildVersion *versions) __asm("__availability_version_check");
+bool ms_availability(uint32_t count, MSBuildVersion *versions) {
+    static bool (*real)(uint32_t, MSBuildVersion *);
+    if (!real) { void *ls = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY | RTLD_NOLOAD); real = (bool (*)(uint32_t, MSBuildVersion *))dlsym(ls ?: RTLD_DEFAULT, "_availability_version_check");
+                 if ((void *)real == (void *)ms_availability) real = NULL; }
+    if (!real) return false;
+    BOOL anyMac = NO; for (uint32_t i = 0; i < count; i++) if (versions[i].platform == 1) anyMac = YES;
+    if (!anyMac || count > 8) return real(count, versions);           /* the shim's own iOS checks: untouched */
+    static _Thread_local int depth; if (depth) return real(count, versions);
+    depth++; BOOL on = MSMacOS26On(); depth--;
+    if (!on) return real(count, versions);
+    MSBuildVersion v[8]; uint32_t n = count; BOOL mac = NO;
+    for (uint32_t i = 0; i < n; i++) {
+        v[i] = versions[i];
+        if (v[i].platform == 1 /* PLATFORM_MACOS */) {
+            mac = YES; v[i].platform = 2 /* PLATFORM_IOS */;
+            if ((v[i].version >> 16) < 26) v[i].version = 13 << 16;
+        }
+    }
+    bool r = real(n, v);
+    if (mac) { static int said; if (said++ < 12) MSLogf(@"availability: game asked for macOS %u.%u - %@", versions[0].version >> 16, (versions[0].version >> 8) & 0xff, r ? @"yes" : @"no"); }
+    return r;
+}
 int ms_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) __asm("_sysctlbyname");
 int ms_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     NSDictionary *c = MSConfig(); const char *fake = NULL;
     if (!strcmp(name, "machdep.cpu.brand_string")) fake = [(c[@"CPUBrand"] ?: @"Apple M4") UTF8String];
     else if (!strcmp(name, "hw.model"))            fake = [(c[@"Model"] ?: @"Mac16,1") UTF8String];
-    else if (!strcmp(name, "kern.osproductversion")) fake = [(c[@"OSVersion"] ?: @"15.5") UTF8String];
+    else if (!strcmp(name, "kern.osproductversion")) fake = [(c[@"OSVersion"] ?: (MSMacOS26On() ? @"26.5" : @"15.5")) UTF8String];   /* matches the availability answer */
     double memGB = [c[@"MemSizeGB"] doubleValue];             /* MemSizeGB: what hw.memsize reports (engine memory budgets) */
     if (memGB <= 0 && !newp && oldp && oldlenp && !strcmp(name, "hw.memsize")) memGB = MSFitMemSizeGB();
     if (memGB > 0 && !newp && oldp && oldlenp && *oldlenp >= sizeof(uint64_t) && !strcmp(name, "hw.memsize")) {
@@ -3567,7 +3734,9 @@ static BOOL MSSmoothOn(void) {
     return [v respondsToSelector:@selector(boolValue)] ? [v boolValue] : MSPref(@"CyPortSmoothPacing", 1) != 0;
 }
 static void MSSmoothFrame(double tOut) {                 /* render thread, after every nextDrawable */
-    static int on = -1; if (on < 0) on = MSSmoothOn(); if (!on || g_paceMode > 0 || g_inBackground) return;
+    static int on = -1; if (on < 0) on = MSSmoothOn();
+    if (g_smoothStop && on) { on = 0; if (g_paceMode <= 0) MSPaceSet(0, @"smooth pacing off: frame generation is on"); }
+    if (!on || g_paceMode > 0 || g_inBackground) return;
     static double last, winStart, probeAt, backoff = 20; static int n, late, step, top, probing, probeFrom, probeWins, badWins;
     int maxHz = (int)lround(g_fps); if (maxHz < 60) maxHz = 60;
     double gd = g_gameMinDur; int cap = gd > 0 ? (int)lround(1 / gd) : maxHz; if (cap > maxHz) cap = maxHz;
@@ -3780,7 +3949,7 @@ static void MSInputReport(void) {                     /* main thread */
     g_llGpuWaited = 0; g_llGpuWaitSum = 0;
     if (rep > 0 && g_ptN) MSLogf(@"controller: %lld inputs, reached the game avg %.1f ms (max %.1f ms) after the controller sent them",
                                  g_ptN, 1000 * g_ptSum / g_ptN, 1000 * g_ptMax);
-    if (rep > 0) MSFxReport();
+    if (rep > 0) { MSFxReport(); MSRumReport(); }
     rep = now; g_llFrames = g_llWaited = g_llTimeouts = 0; g_llWaitSum = g_llWaitMax = 0; g_ptN = 0; g_ptSum = g_ptMax = 0;
 }
 /* Sticks and analog triggers, coalesced per game frame (DK Bananza / Mario Kart World only ever hand the game a
@@ -3791,25 +3960,60 @@ static void MSInputReport(void) {                     /* main thread */
  * element's handler runs once, with the newest value. Presses and releases (buttons, d-pad, a trigger crossing its
  * press point) still go through at once, in order, right after the analog values pending before them.
  * PadCoalesce = NO turns it off. The on-screen controller's sticks go the same way (MSPadSetStick). */
-@interface MSCoSlot : NSObject { @public __weak id el; id handler; int kind; BOOL pressed; long long pressPoll; NSMutableOrderedSet *els; } @end
+/* el is strong: it used to be __weak and read back nil for real controllers' elements (tester log #15: "N stick/trigger
+   reports, 0 handed to the game" - every coalesced stick/trigger value was dropped). element -> handler -> slot -> element
+   is a cycle, but a controller's elements live as long as the controller anyway. */
+@interface MSCoSlot : NSObject { @public id el; id handler; int kind; BOOL pressed, analog; long long pressPoll; float lx, ly; NSMutableOrderedSet *els; } @end
 @implementation MSCoSlot @end
-static NSMutableOrderedSet<MSCoSlot *> *g_coDirty;           /* main thread */
-static long long g_coIn, g_coOut;
+static NSMutableOrderedSet<MSCoSlot *> *g_coDirty;           /* game thread */
+static long long g_coIn, g_coOut, g_coPolled;
+static _Atomic long long g_gcSent[3], g_gcArrived;     /* g_gcArrived: any thread, before the hop to the game thread */                        /* reports GameController delivered: buttons, triggers, sticks */
+static NSHashTable<MSCoSlot *> *g_coAll;                     /* every analog slot of a real controller (weak) */
 static BOOL MSCoalesceOn(void) { static int on = -1; if (on < 0) on = MSCfgD(@"PadCoalesce", 1) != 0; return on; }
 static void MSCoRun(MSCoSlot *s) {
     id e = s->el; if (!e) return;
     g_coOut++;
     switch (s->kind) {
-        case 0: { GCControllerButtonInput *b = e; ((void (^)(id, float, BOOL))s->handler)(b, b.value, b.isPressed); break; }
-        case 1: { GCControllerDirectionPad *d = e; ((void (^)(id, float, float))s->handler)(d, d.xAxis.value, d.yAxis.value); break; }
-        case 2: { GCControllerAxisInput *a = e; ((void (^)(id, float))s->handler)(a, a.value); break; }
+        case 0: { GCControllerButtonInput *b = e; float v = b.value; s->lx = v; ((void (^)(id, float, BOOL))s->handler)(b, v, b.isPressed); break; }
+        case 1: { GCControllerDirectionPad *d = e; float x = d.xAxis.value, y = d.yAxis.value; s->lx = x; s->ly = y; ((void (^)(id, float, float))s->handler)(d, x, y); break; }
+        case 2: { GCControllerAxisInput *a = e; float v = a.value; s->lx = v; ((void (^)(id, float))s->handler)(a, v); break; }
         default: { NSArray *els = s->els.array; [s->els removeAllObjects]; for (id x in els) ((void (^)(id, id))s->handler)(e, x); break; }
     }
 }
-static void MSPadFlushReal(void) {                           /* main thread */
-    if (!g_coDirty.count) return;
-    NSArray *d = g_coDirty.array; [g_coDirty removeAllObjects];
-    for (MSCoSlot *s in d) MSCoRun(s);
+/* Sticks and triggers are also read straight from the controller once per frame: tester reports + every log since
+   coalescing went in showed no stick/trigger report ever reaching the game thread (sticks and triggers dead, buttons
+   fine) - so the game no longer depends on GameController's per-report callbacks for them. A value that changed since
+   the game last got it is handed over, whatever did or didn't arrive through the callbacks. */
+static void MSPadPollReal(void) {
+    NSArray *all; @synchronized (g_coAll) { all = g_coAll.allObjects; }
+    for (MSCoSlot *s in all) {
+        id e = s->el; if (!e) continue;
+        switch (s->kind) {
+            case 0: {
+                GCControllerButtonInput *b = e; BOOL p = b.isPressed; float v = b.value;
+                if (p != s->pressed) { s->pressed = p; if (p) s->pressPoll = g_pollNo; [g_coDirty removeObject:s]; g_coPolled++; MSCoRun(s); }
+                else if (fabsf(v - s->lx) > 0.002f) { [g_coDirty removeObject:s]; g_coPolled++; MSCoRun(s); }
+                break;
+            }
+            case 1: {
+                GCControllerDirectionPad *d = e;
+                if (fabsf(d.xAxis.value - s->lx) > 0.002f || fabsf(d.yAxis.value - s->ly) > 0.002f) { [g_coDirty removeObject:s]; g_coPolled++; MSCoRun(s); }
+                break;
+            }
+            case 2: {
+                GCControllerAxisInput *a = e;
+                if (fabsf(a.value - s->lx) > 0.002f) { [g_coDirty removeObject:s]; g_coPolled++; MSCoRun(s); }
+                break;
+            }
+        }
+    }
+}
+static void MSPadFlushReal(void) {                           /* game thread, once per event poll */
+    if (g_coDirty.count) {
+        NSArray *d = g_coDirty.array; [g_coDirty removeAllObjects];
+        for (MSCoSlot *s in d) MSCoRun(s);
+    }
+    if (g_coAll.count && MSCfgD(@"PadPoll", 1) != 0) MSPadPollReal();
 }
 static void MSCoMark(MSCoSlot *s) { if (!g_coDirty) g_coDirty = [NSMutableOrderedSet orderedSet]; g_coIn++; [g_coDirty addObject:s]; }
 static BOOL MSCoAnalogEl(id el) {                            /* a value without a press: stick, axis */
@@ -3819,10 +4023,21 @@ static BOOL MSCoAnalogEl(id el) {                            /* a value without 
 static id MSCoWrap(id self, id handler, BOOL timing) {
     id real = [handler copy];
     MSCoSlot *s = [MSCoSlot new]; s->el = self; s->handler = real;
+    BOOL analogEl = [(GCControllerElement *)self isAnalog] || [self isKindOfClass:GCControllerAxisInput.class];
+    if (analogEl && ![self isKindOfClass:GCExtendedGamepad.class]) {   /* sticks, triggers, axes: also polled per frame */
+        if ([self isKindOfClass:GCControllerButtonInput.class]) { s->pressed = [(GCControllerButtonInput *)self isPressed]; s->lx = [(GCControllerButtonInput *)self value]; }
+        else if ([self isKindOfClass:GCControllerDirectionPad.class]) { s->lx = [(GCControllerDirectionPad *)self xAxis].value; s->ly = [(GCControllerDirectionPad *)self yAxis].value; }
+        else if ([self isKindOfClass:GCControllerAxisInput.class]) s->lx = [(GCControllerAxisInput *)self value];
+        if (!g_coAll) g_coAll = [NSHashTable weakObjectsHashTable];
+        @synchronized (g_coAll) { [g_coAll addObject:s]; }
+        objc_setAssociatedObject(self, (void *)&g_coAll, s, OBJC_ASSOCIATION_RETAIN);   /* lives as long as the element */
+    }
     if ([self isKindOfClass:GCControllerButtonInput.class]) {
         s->kind = 0; s->pressed = [(GCControllerButtonInput *)self isPressed];
         BOOL analog = [(GCControllerElement *)self isAnalog];            /* triggers */
+        s->analog = analog;
         return ^(GCControllerButtonInput *b, float v, BOOL p) {
+            g_gcSent[analog ? 1 : 0]++;
             if (timing) MSPadTiming();
             if (!MSOnGameThread()) { ((void (^)(id, float, BOOL))real)(b, v, p); return; }
             if (analog && p == s->pressed) { MSCoMark(s); return; }
@@ -3838,6 +4053,7 @@ static id MSCoWrap(id self, id handler, BOOL timing) {
     if ([self isKindOfClass:GCControllerDirectionPad.class]) {
         s->kind = 1; BOOL analog = [(GCControllerElement *)self isAnalog];   /* thumbsticks; the d-pad isn't */
         return ^(GCControllerDirectionPad *d, float x, float y) {
+            g_gcSent[analog ? 2 : 0]++;
             if (timing) MSPadTiming();
             if (!MSOnGameThread()) { ((void (^)(id, float, float))real)(d, x, y); return; }
             if (analog) { MSCoMark(s); return; }
@@ -3847,6 +4063,7 @@ static id MSCoWrap(id self, id handler, BOOL timing) {
     if ([self isKindOfClass:GCControllerAxisInput.class]) {
         s->kind = 2;
         return ^(GCControllerAxisInput *a, float v) {
+            g_gcSent[2]++;
             if (timing) MSPadTiming();
             if (!MSOnGameThread()) { ((void (^)(id, float))real)(a, v); return; }
             MSCoMark(s);
@@ -3874,6 +4091,7 @@ static void ms_setValueChangedHandler(id self, SEL _cmd, id handler) {
     IMP orig = NULL;
     for (int i = 0; i < 4; i++) if (g_vchHooked[i] && [self isKindOfClass:g_vchHooked[i]]) { orig = g_origSetVCH[i]; break; }
     if (handler && !MSIsPadObject(self)) g_realHandlerSeen = YES;
+    if (g_coAll) objc_setAssociatedObject(self, (void *)&g_coAll, nil, OBJC_ASSOCIATION_RETAIN);   /* old per-frame poll slot: the game's old handler is gone */
     static int n; if (n++ < 40) MSLogf(@"game set a gamepad handler on %@%@", NSStringFromClass([self class]), MSIsPadObject(self) ? @" (on-screen controller)" : @"");
     id h = handler;
     if (handler && MSIsPadObject(self)) {
@@ -3904,11 +4122,11 @@ static void ms_setValueChangedHandler(id self, SEL _cmd, id handler) {
     if (h && g_offMain) {                                        /* GameController calls on the main thread: hand over */
         id inner = [h copy];
         if ([self isKindOfClass:GCControllerButtonInput.class])
-            h = ^(GCControllerButtonInput *b, float v, BOOL p) { if (MSOnGameThread()) ((void (^)(id, float, BOOL))inner)(b, v, p); else MSGameAsync(^{ ((void (^)(id, float, BOOL))inner)(b, v, p); }); };
+            h = ^(GCControllerButtonInput *b, float v, BOOL p) { g_gcArrived++; if (MSOnGameThread()) ((void (^)(id, float, BOOL))inner)(b, v, p); else MSGameAsync(^{ ((void (^)(id, float, BOOL))inner)(b, v, p); }); };
         else if ([self isKindOfClass:GCControllerDirectionPad.class])
-            h = ^(GCControllerDirectionPad *d, float x, float y) { if (MSOnGameThread()) ((void (^)(id, float, float))inner)(d, x, y); else MSGameAsync(^{ ((void (^)(id, float, float))inner)(d, x, y); }); };
+            h = ^(GCControllerDirectionPad *d, float x, float y) { g_gcArrived++; if (MSOnGameThread()) ((void (^)(id, float, float))inner)(d, x, y); else MSGameAsync(^{ ((void (^)(id, float, float))inner)(d, x, y); }); };
         else if ([self isKindOfClass:GCControllerAxisInput.class])
-            h = ^(GCControllerAxisInput *a, float v) { if (MSOnGameThread()) ((void (^)(id, float))inner)(a, v); else MSGameAsync(^{ ((void (^)(id, float))inner)(a, v); }); };
+            h = ^(GCControllerAxisInput *a, float v) { g_gcArrived++; if (MSOnGameThread()) ((void (^)(id, float))inner)(a, v); else MSGameAsync(^{ ((void (^)(id, float))inner)(a, v); }); };
         else
             h = ^(id g, GCControllerElement *el) { if (MSOnGameThread()) ((void (^)(id, id))inner)(g, el); else MSGameAsync(^{ ((void (^)(id, id))inner)(g, el); }); };
     }
@@ -3954,12 +4172,17 @@ static void MSPadFlushVpad(void) {
     NSArray *d = g_vpadDirty.array; [g_vpadDirty removeAllObjects];
     for (GCControllerElement *el in d) MSPadNotify(el);
 }
+static void MSPadMirrorGeneric(void); static void MSFIReport(void);
 static void MSPadFlushCoalesced(void) {
+    MSPadMirrorGeneric(); MSFIReport();
     MSPadFlushVpad(); MSPadFlushReal();
     static double rep; double now = CACurrentMediaTime();
     if (now - rep < 30) return;
-    if (rep > 0 && g_coIn) MSLogf(@"controller: %lld stick/trigger reports in 30 s, %lld handed to the game (newest per frame)", g_coIn, g_coOut);
-    rep = now; g_coIn = g_coOut = 0;
+    long long gb = g_gcSent[0], gt = g_gcSent[1], gs = g_gcSent[2], ga = g_gcArrived;
+    if (rep > 0 && (g_coIn || g_coOut || gb || gt || gs || ga))
+        MSLogf(@"controller: in 30 s %lld callbacks from GameController; on the game thread %lld button, %lld trigger, %lld stick reports; %lld stick/trigger reports reached the game thread, %lld values handed to the game (%lld found by the per-frame read), %lu analog inputs watched",
+               ga, gb, gt, gs, g_coIn, g_coOut, g_coPolled, (unsigned long)g_coAll.count);
+    rep = now; g_coIn = g_coOut = g_coPolled = 0; g_gcSent[0] = g_gcSent[1] = g_gcSent[2] = 0; g_gcArrived = 0;
 }
 static NSMapTable *g_vbPressPoll;                           /* on-screen button -> poll it was pressed in */
 static void MSPadSetButton(GCControllerButtonInput *b, float v) {
@@ -4012,8 +4235,51 @@ static void MSLookFlushStick(double dt) {
 }
 static BOOL MSRealControllerConnected(void) {
     NSArray *all = g_origControllers ? ((NSArray *(*)(id, SEL))g_origControllers)(GCController.class, @selector(controllers)) : GCController.controllers;
-    for (GCController *c in all) if (!c.isSnapshot) return YES;
+    for (GCController *c in all) if (!c.isSnapshot && c.extendedGamepad) return YES;   /* others: bridged, see below */
     return NO;
+}
+/* Controllers iOS doesn't give a standard gamepad profile (some generic USB / Bluetooth HID pads: physicalInputProfile
+   only, no extendedGamepad) - the game only reads extendedGamepads, so it never saw them, and they used to withdraw the
+   on-screen pad too. Their buttons and sticks now drive the on-screen controller, once per frame. */
+static GCController *MSGenericPad(void) {
+    static __weak GCController *pad; static double checked;
+    double now = CACurrentMediaTime();
+    if (now - checked < 1) return pad;
+    checked = now;
+    NSArray *all = g_origControllers ? ((NSArray *(*)(id, SEL))g_origControllers)(GCController.class, @selector(controllers)) : GCController.controllers;
+    GCController *found = nil;
+    for (GCController *c in all) if (!c.isSnapshot && !c.extendedGamepad && c.physicalInputProfile.buttons.count >= 4) { found = c; break; }
+    if (found != pad) {
+        if (found) MSLogf(@"controller: %@ (%@) has no standard gamepad profile - its %lu buttons / %lu sticks drive the on-screen controller",
+                          found.vendorName, found.productCategory, (unsigned long)found.physicalInputProfile.buttons.count, (unsigned long)found.physicalInputProfile.dpads.count);
+        else if (pad) MSLogf(@"controller: generic controller gone");
+        pad = found;
+    }
+    return pad;
+}
+static void MSPadSetButton(GCControllerButtonInput *b, float v);
+static void MSPadSetStick(GCControllerDirectionPad *d, float x, float y);
+static void MSPadMirrorGeneric(void) {                       /* game thread, once per event poll */
+    if (!g_pad || g_realPad) return;
+    GCController *c = MSGenericPad(); if (!c) return;
+    GCPhysicalInputProfile *p = c.physicalInputProfile;
+    NSDictionary<NSString *, GCControllerButtonInput *> *bs = p.buttons;
+    struct { __unsafe_unretained NSString *n; __unsafe_unretained GCControllerButtonInput *to; } map[] = {
+        { GCInputButtonA, g_pad.buttonA }, { GCInputButtonB, g_pad.buttonB }, { GCInputButtonX, g_pad.buttonX }, { GCInputButtonY, g_pad.buttonY },
+        { GCInputLeftShoulder, g_pad.leftShoulder }, { GCInputRightShoulder, g_pad.rightShoulder },
+        { GCInputLeftTrigger, g_pad.leftTrigger }, { GCInputRightTrigger, g_pad.rightTrigger },
+        { GCInputLeftThumbstickButton, g_pad.leftThumbstickButton }, { GCInputRightThumbstickButton, g_pad.rightThumbstickButton },
+        { GCInputButtonMenu, g_pad.buttonMenu }, { GCInputButtonOptions, g_pad.buttonOptions },
+    };
+    for (size_t i = 0; i < sizeof map / sizeof *map; i++) {
+        GCControllerButtonInput *from = bs[map[i].n]; if (!from || !map[i].to) continue;
+        float v = from.value; if (map[i].to.value != v) MSPadSetButton(map[i].to, v);
+    }
+    NSDictionary<NSString *, GCControllerDirectionPad *> *ds = p.dpads;
+    GCControllerDirectionPad *ls = ds[GCInputLeftThumbstick], *rs = ds[GCInputRightThumbstick], *dp = ds[GCInputDirectionPad];
+    if (ls) MSPadSetStick(g_pad.leftThumbstick, ls.xAxis.value, ls.yAxis.value);
+    if (rs) MSPadSetStick(g_pad.rightThumbstick, rs.xAxis.value, rs.yAxis.value);
+    if (dp) MSPadSetStick(g_pad.dpad, dp.xAxis.value, dp.yAxis.value);
 }
 /* controller only (see MSDispatch): on while a real controller is connected, unless switched off */
 static BOOL MSKBMWithController(void) {
@@ -4728,12 +4994,15 @@ static void MSTrigResetPad(GCController *c) {                    /* main thread:
 static void MSTrigAllOff(void) {                                 /* main thread */
     for (id t in g_trigSeen.allObjects) MSTrigWant(t, (MSTrigFx){ 0 });
 }
+static NSHashTable *g_phoneEngines; static BOOL MSPhoneRumbleOn(void);
+static id MSPhoneLock(void) { static id l; static dispatch_once_t o; dispatch_once(&o, ^{ l = [NSObject new]; }); return l; }
 typedef struct { const void *player; float last; double at; } MSRumState;
 static MSRumState g_rum[4]; static os_unfair_lock g_rumLock = OS_UNFAIR_LOCK_INIT;
 static IMP g_origRumble;
 static void ms_rumble(id self, SEL _cmd, id engine, float level, __strong id *player) {
     g_rumAsked++; if (!NSThread.isMainThread) g_fxOffMain++;
-    if (!MSRumbleOn()) {                                         /* switched off: just stop what may still be running */
+    BOOL phone = NO; @synchronized (MSPhoneLock()) { phone = engine && [g_phoneEngines containsObject:engine]; }
+    if (phone ? !MSPhoneRumbleOn() : !MSRumbleOn()) {                /* the phone's engine follows "Phone vibration" */                                         /* switched off: just stop what may still be running */
         if (player && *player) { ((void (*)(id, SEL, id, float, __strong id *))g_origRumble)(self, _cmd, engine, 0, player); g_rumSent++; }
         return;
     }
@@ -4779,6 +5048,192 @@ static void MSHookControllerEffects(void) {                      /* main thread,
     MSLogf(@"controller effects: vibration %@, adaptive triggers %@", MSRumbleOn() ? @"on" : @"off", MSTriggersOn() ? @"on" : @"off");
 }
 
+/* ---------------------------------------------------------------- phone rumble (touch controls)
+ * The game rumbles a controller through GameController + CoreHaptics: controller.haptics -> createEngineWithLocality:
+ * -> a CHHapticEngine it plays its own patterns on (2.5: Haptics_internal m_hapticsEngine / m_hapticsPlayer; 2.3.1:
+ * ControllerObserver). The on-screen controller is a snapshot with no haptics, so with touch controls nothing rumbled.
+ * Now the on-screen controller's haptics hand out engines on the PHONE's Taptic Engine: the game's own rumble
+ * (explosions, gunfire, crashes) plays on the phone, as on a controller. A real controller takes over from the
+ * on-screen one (the game then rumbles that controller) and the phone engines are stopped. Start screen "Phone
+ * vibration" (CyPortPhoneRumble, default on) / plist PhoneRumble = NO: off. */
+static BOOL MSPhoneRumbleOn(void) { id v = MSConfig()[@"PhoneRumble"]; return [v respondsToSelector:@selector(boolValue)] ? [v boolValue] : MSPref(@"CyPortPhoneRumble", 1) != 0; }
+/* g_phoneEngines (declared above): engines handed to the game (weak) */
+@interface MSPhoneHaptics : NSObject @end
+@implementation MSPhoneHaptics
+- (NSSet *)supportedLocalities { return [NSSet setWithObjects:GCHapticsLocalityDefault, GCHapticsLocalityAll, GCHapticsLocalityHandles, GCHapticsLocalityLeftHandle, GCHapticsLocalityRightHandle, nil]; }
+- (id)createEngineWithLocality:(NSString *)locality {
+    static void *ch; if (!ch) ch = dlopen("/System/Library/Frameworks/CoreHaptics.framework/CoreHaptics", RTLD_LAZY);
+    Class E = NSClassFromString(@"CHHapticEngine"); if (!E) return nil;
+    id caps = [E respondsToSelector:@selector(capabilitiesForHardware)] ? ((id (*)(id, SEL))objc_msgSend)(E, @selector(capabilitiesForHardware)) : nil;
+    if (caps && ![[caps valueForKey:@"supportsHaptics"] boolValue]) { MSLogf(@"phone rumble: this phone has no Taptic Engine"); return nil; }
+    NSError *e = nil;
+    id eng = ((id (*)(id, SEL, NSError **))objc_msgSend)([E alloc], NSSelectorFromString(@"initAndReturnError:"), &e);
+    if (!eng) { MSLogf(@"phone rumble: no haptic engine (%@)", e.localizedDescription); return nil; }
+    [eng setValue:@YES forKey:@"autoShutdownEnabled"];          /* idles down between effects: saves battery */
+    [eng setValue:@YES forKey:@"playsHapticsOnly"];
+    __weak id weng = eng;
+    [eng setValue:^{ id x = weng; if (x) ((void (*)(id, SEL, id))objc_msgSend)(x, NSSelectorFromString(@"startWithCompletionHandler:"), nil); } forKey:@"resetHandler"];
+    @synchronized (MSPhoneLock()) { if (!g_phoneEngines) g_phoneEngines = [NSHashTable weakObjectsHashTable]; [g_phoneEngines addObject:eng]; }
+    static int n; if (n++ < 4) MSLogf(@"phone rumble: the game's rumble (%@) plays on the phone", locality);
+    return eng;
+}
+@end
+static void MSPhoneRumbleStopAll(void) {
+    NSArray *es; @synchronized (MSPhoneLock()) { es = g_phoneEngines.allObjects; }
+    for (id e in es) ((void (*)(id, SEL, id))objc_msgSend)(e, NSSelectorFromString(@"stopWithCompletionHandler:"), nil);
+    if (es.count) MSLogf(@"phone rumble: stopped (a controller took over)");
+}
+static IMP g_origHaptics;
+/* ---------------------------------------------------------------- controller rumble, 2.5 (CoreHaptics level)
+ * 2.5 has no ControllerObserver (the 2.3.1 limiter above never ran): it makes a CHHapticEngine per controller
+ * (controller.haptics -> createEngineWithLocality:) and drives pattern players with sendParameters:atTime:error: from
+ * its game thread, every frame. Each call is a Bluetooth report to the controller: they queued up behind each other,
+ * so rumble came late, and a stop waited behind old intensity updates - rumble ran on too long (tester + user report).
+ * Now, for players on a controller's engine only:
+ *  - all calls go to one serial queue per player, off the game thread (a slow Bluetooth send no longer stalls a frame);
+ *  - intensity / sharpness updates are coalesced: only the newest one goes out, at most ~30 a second, a change to or
+ *    from zero at once;
+ *  - start / stop are sent at once, in order, and a stop drops any update still waiting;
+ *  - times are "now" (CHHapticTimeImmediate): a time in the engine's future made effects start late.
+ * "Controller vibration" off: nothing is sent (starts and updates). PadRumbleLimit = NO: the game's calls pass unchanged. */
+@interface MSRumPlayer : NSObject { @public id params; BOOL want, queued; double lastAt; float lastI; dispatch_queue_t q; } @end
+@implementation MSRumPlayer @end
+static char g_padEngineKey, g_padPlayerKey;
+static IMP g_oCreateEngine, g_oCreatePlayer, g_oCreateAdvPlayer;
+typedef struct { Class c; IMP send, start, stop; } MSRumCls;           /* each player class keeps its own originals */
+static MSRumCls g_rumCls[8]; static int g_rumClsN;
+static MSRumCls *MSRumOrig(id o) {                                    /* per object: the first original of each method up the chain */
+    static _Thread_local MSRumCls r; r = (MSRumCls){ 0 }; BOOL any = NO;
+    for (Class c = object_getClass(o); c; c = class_getSuperclass(c))
+        for (int i = 0; i < g_rumClsN; i++) if (g_rumCls[i].c == c) {
+            if (!r.send) r.send = g_rumCls[i].send; if (!r.start) r.start = g_rumCls[i].start; if (!r.stop) r.stop = g_rumCls[i].stop; any = YES; }
+    return any ? &r : NULL;
+}
+static _Atomic long long g_prAsked, g_prSent;
+static BOOL MSPadRumbleLimitOn(void) { static int on = -1; if (on < 0) on = MSCfgD(@"PadRumbleLimit", 1) != 0; return on; }
+static float MSRumIntensity(NSArray *params, BOOL *has) {
+    static NSString *ik; if (!ik) { NSString *__strong *k = (NSString *__strong *)dlsym(RTLD_DEFAULT, "CHHapticDynamicParameterIDHapticIntensityControl"); ik = k ? *k : @"HapticIntensityControl"; }
+    float v = 0; *has = NO;
+    if ([params isKindOfClass:NSArray.class]) for (id p in params) if ([[p valueForKey:@"parameterID"] isEqual:ik]) { v = [[p valueForKey:@"value"] floatValue]; *has = YES; }
+    return v;
+}
+static void MSRumSendNow(id player, MSRumPlayer *st) {          /* on st->q */
+    id ps = st->params; st->want = NO; if (!ps) return;
+    if (!MSRumbleOn()) return;                                   /* "Controller vibration" off: nothing goes out */
+    BOOL has; st->lastI = MSRumIntensity(ps, &has); st->lastAt = CACurrentMediaTime(); g_prSent++;
+    NSError *e = nil; ((BOOL (*)(id, SEL, id, double, NSError **))MSRumOrig(player)->send)(player, NSSelectorFromString(@"sendParameters:atTime:error:"), ps, 0, &e);
+}
+static void MSRumPump(id player, MSRumPlayer *st) {             /* on st->q */
+    if (!st->want) { st->queued = NO; return; }
+    BOOL has; float i = MSRumIntensity(st->params, &has);
+    double wait = 1 / 30.0 - (CACurrentMediaTime() - st->lastAt);
+    BOOL edge = has && ((i <= 0.001f) != (st->lastI <= 0.001f));  /* starts or stops: no waiting */
+    if (wait > 0 && !edge) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)), st->q, ^{ MSRumPump(player, st); });
+        return;
+    }
+    st->queued = NO; MSRumSendNow(player, st);
+}
+static BOOL ms_rumSendParams(id self, SEL _cmd, id params, double t, NSError **err) {
+    MSRumPlayer *st = objc_getAssociatedObject(self, &g_padPlayerKey);
+    MSRumCls *oc = MSRumOrig(self); if (!oc || !oc->send) return NO;
+    if (!st) return ((BOOL (*)(id, SEL, id, double, NSError **))oc->send)(self, _cmd, params, t, err);   /* phone / not ours */
+    g_prAsked++;
+    static int n; if (n++ < 6) { BOOL h; MSLogf(@"controller rumble: game update intensity %.2f at time %.3f (%@ thread)", MSRumIntensity(params, &h), t, NSThread.isMainThread ? @"main" : @"game"); }
+    id wself = self;   /* strong: weak refs to some framework objects read back nil */
+    dispatch_async(st->q, ^{
+        id pl = wself; if (!pl) return;
+        st->params = params; st->want = YES;
+        if (!st->queued) { st->queued = YES; MSRumPump(pl, st); }
+    });
+    return YES;
+}
+static BOOL ms_rumStartAt(id self, SEL _cmd, double t, NSError **err) {
+    MSRumPlayer *st = objc_getAssociatedObject(self, &g_padPlayerKey);
+    MSRumCls *oc = MSRumOrig(self); if (!oc || !oc->start) return NO; IMP startImp = oc->start;
+    if (!st) return ((BOOL (*)(id, SEL, double, NSError **))oc->start)(self, _cmd, t, err);
+    static int n; if (n++ < 4) MSLogf(@"controller rumble: game starts an effect at time %.3f - sent now", t);
+    id wself = self;   /* strong: weak refs to some framework objects read back nil */
+    dispatch_async(st->q, ^{ id pl = wself; if (!pl) return; NSError *e = nil;
+        if (MSRumbleOn()) ((BOOL (*)(id, SEL, double, NSError **))startImp)(pl, _cmd, 0, &e); });
+    return YES;
+}
+static BOOL ms_rumStopAt(id self, SEL _cmd, double t, NSError **err) {
+    MSRumPlayer *st = objc_getAssociatedObject(self, &g_padPlayerKey);
+    MSRumCls *oc = MSRumOrig(self); if (!oc || !oc->stop) return NO; IMP stopImp = oc->stop;
+    if (!st) return ((BOOL (*)(id, SEL, double, NSError **))oc->stop)(self, _cmd, t, err);
+    id wself = self;   /* strong: weak refs to some framework objects read back nil */
+    dispatch_async(st->q, ^{ id pl = wself; if (!pl) return; NSError *e = nil;
+        st->want = NO; st->lastI = 0;                             /* updates still waiting are dropped */
+        ((BOOL (*)(id, SEL, double, NSError **))stopImp)(pl, _cmd, 0, &e); });
+    return YES;
+}
+static void MSRumHookPlayerClass(Class c) {
+    static NSMutableSet *done; if (!done) done = [NSMutableSet set];
+    @synchronized (done) {
+        if (!c || [done containsObject:c] || g_rumClsN >= 8) return; [done addObject:c];
+        /* only methods this class has itself; an inherited one is covered when its own class is hooked */
+        MSRumCls rc = { c, NULL, NULL, NULL };
+        unsigned n = 0; Method *own = class_copyMethodList(c, &n);
+        for (unsigned i = 0; i < n; i++) {
+            SEL sl = method_getName(own[i]);
+            if (sl == NSSelectorFromString(@"sendParameters:atTime:error:")) rc.send = method_setImplementation(own[i], (IMP)ms_rumSendParams);
+            else if (sl == NSSelectorFromString(@"startAtTime:error:")) rc.start = method_setImplementation(own[i], (IMP)ms_rumStartAt);
+            else if (sl == NSSelectorFromString(@"stopAtTime:error:")) rc.stop = method_setImplementation(own[i], (IMP)ms_rumStopAt);
+        }
+        free(own);
+        if (!rc.send && !rc.start && !rc.stop) { Class sup = class_getSuperclass(c); [done removeObject:c]; MSRumHookPlayerClass(sup); return; }
+        g_rumCls[g_rumClsN++] = rc;
+        MSLogf(@"controller rumble: limiting %@", NSStringFromClass(c));
+    }
+}
+static id MSRumMarkPlayer(id engine, id player) {
+    if (!player || !objc_getAssociatedObject(engine, &g_padEngineKey)) return player;
+    MSRumPlayer *st = [MSRumPlayer new]; st->q = dispatch_queue_create("controller-rumble", DISPATCH_QUEUE_SERIAL); st->lastI = 0;
+    objc_setAssociatedObject(player, &g_padPlayerKey, st, OBJC_ASSOCIATION_RETAIN);
+    MSRumHookPlayerClass(object_getClass(player));
+    return player;
+}
+static id ms_createPlayer(id self, SEL _cmd, id pattern, NSError **err) {
+    return MSRumMarkPlayer(self, ((id (*)(id, SEL, id, NSError **))g_oCreatePlayer)(self, _cmd, pattern, err));
+}
+static id ms_createAdvPlayer(id self, SEL _cmd, id pattern, NSError **err) {
+    return MSRumMarkPlayer(self, ((id (*)(id, SEL, id, NSError **))g_oCreateAdvPlayer)(self, _cmd, pattern, err));
+}
+static id ms_createEngine(id self, SEL _cmd, NSString *loc) {
+    id e = ((id (*)(id, SEL, id))g_oCreateEngine)(self, _cmd, loc);
+    if (!e) return e;
+    objc_setAssociatedObject(e, &g_padEngineKey, @YES, OBJC_ASSOCIATION_RETAIN);
+    static NSMutableSet *done; if (!done) done = [NSMutableSet set];
+    Class c = object_getClass(e);
+    @synchronized (done) { if (![done containsObject:c]) { [done addObject:c]; Method m;
+        if ((m = class_getInstanceMethod(c, NSSelectorFromString(@"createPlayerWithPattern:error:")))) g_oCreatePlayer = method_setImplementation(m, (IMP)ms_createPlayer);
+        if ((m = class_getInstanceMethod(c, NSSelectorFromString(@"createAdvancedPlayerWithPattern:error:")))) g_oCreateAdvPlayer = method_setImplementation(m, (IMP)ms_createAdvPlayer); } }
+    static int n; if (n++ < 4) MSLogf(@"controller rumble: the game made a rumble engine on the controller (%@)", loc);
+    return e;
+}
+static void MSRumHookHapticsObject(id h) {                       /* a real controller's GCDeviceHaptics */
+    if (!h || !MSPadRumbleLimitOn() || [h isKindOfClass:MSPhoneHaptics.class]) return;
+    static Class done; Class c = object_getClass(h); if (c == done) return;
+    Method m = class_getInstanceMethod(c, @selector(createEngineWithLocality:));
+    if (m && method_getImplementation(m) != (IMP)ms_createEngine) { g_oCreateEngine = method_setImplementation(m, (IMP)ms_createEngine); done = c; }
+}
+static void MSRumReport(void) {
+    static long long a, sn; if (g_prAsked == a) return;
+    MSLogf(@"controller rumble: %lld updates from the game, %lld sent to the controller (newest only, <= 30/s)", g_prAsked - a, g_prSent - sn);
+    a = g_prAsked; sn = g_prSent;
+}
+static id ms_haptics(GCController *self, SEL _cmd) {
+    if (self == g_vpad) {
+        if (g_realPad || !MSPhoneRumbleOn()) return nil;
+        static MSPhoneHaptics *ph; if (!ph) ph = [MSPhoneHaptics new];
+        return ph;
+    }
+    id h = g_origHaptics ? ((id (*)(id, SEL))g_origHaptics)(self, _cmd) : nil;
+    MSRumHookHapticsObject(h);
+    return h;
+}
+
 static void MSTouchPadCreate(UIWindowScene *sc) {                 /* main thread, before the game's main() */
     MSAutoKeys();
     if ([MSConfig()[@"TouchControls"] isEqual:@NO]) return;
@@ -4802,6 +5257,9 @@ static void MSTouchPadCreate(UIWindowScene *sc) {                 /* main thread
         g_origExtGamepad = method_setImplementation(eg, (IMP)ms_extendedGamepad);
         Method pp = class_getInstanceMethod(GCController.class, @selector(physicalInputProfile));
         if (pp) g_origPhys = method_setImplementation(pp, (IMP)ms_physicalInputProfile);
+        Method hp = class_getInstanceMethod(GCController.class, @selector(haptics));
+        if (hp) g_origHaptics = method_setImplementation(hp, (IMP)ms_haptics);
+        MSLogf(@"phone rumble: %@", MSPhoneRumbleOn() ? @"on with touch controls" : @"off (Phone vibration switch)");
         Method cur = class_getClassMethod(GCController.class, @selector(current));
         if (cur) g_origCurrent = method_setImplementation(cur, (IMP)ms_current);
     }
@@ -4822,6 +5280,7 @@ static void MSTouchPadCreate(UIWindowScene *sc) {                 /* main thread
             [g_pad.leftThumbstick setValueForXAxis:0 yAxis:0]; [g_pad.rightThumbstick setValueForXAxis:0 yAxis:0]; [g_pad.dpad setValueForXAxis:0 yAxis:0];
             [NSNotificationCenter.defaultCenter postNotificationName:(real ? GCControllerDidDisconnectNotification : GCControllerDidConnectNotification) object:g_vpad];
             MSLogf(real ? @"real controller connected: on-screen controller withdrawn" : @"real controller gone: on-screen controller back");
+            if (real) MSPhoneRumbleStopAll();
         };
         for (NSString *n in @[ GCControllerDidConnectNotification, GCControllerDidDisconnectNotification ])
             [NSNotificationCenter.defaultCenter addObserverForName:n object:nil queue:nil usingBlock:^(NSNotification *x) {
@@ -5178,7 +5637,9 @@ static void MSStartReadProgress(void) {
         double t0 = CACurrentMediaTime(), lastCPU = MSCPUSeconds(), lastT = t0, mbps = 0, cpuPct = 0;
         long long b5 = 0, frLast = 0; int quiet = 0; BOOL saved = NO, done = NO; double framesSince = 0, frT = t0, fps = 0;
         double expect = [NSUserDefaults.standardUserDefaults doubleForKey:@"MacShimLoadBytes"]; if (expect < 0.2e9) expect = 4e9;
-        for (int tick = 0;; tick++) {
+        /* a pool per tick: this block never returns, so what it autoreleased (log strings, the overlay's text and
+           colours) was never released */
+        for (int tick = 0;; tick++) @autoreleasepool {
             usleep(500000);
             long long b = g_readBytes, c = g_readCalls, fr = g_frames; double now = CACurrentMediaTime(), idle = g_lastReadAt ? now - g_lastReadAt : now - t0;
             if (tick % 2 == 1) { double cpu = MSCPUSeconds(); cpuPct = (cpu - lastCPU) / (now - lastT) * 100; lastCPU = cpu; lastT = now; }
@@ -5368,7 +5829,12 @@ static void MSException(NSException *e) { MSLogf(@"*** UNCAUGHT EXCEPTION %@: %@
 static void MSOpenLog(void) {
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject, *p = [docs stringByAppendingPathComponent:@"macshim.log"];
     NSDictionary *at = [NSFileManager.defaultManager attributesOfItemAtPath:p error:nil];
-    int flags = O_WRONLY | O_CREAT | O_APPEND; if ([at fileSize] > 512 * 1024) flags |= O_TRUNC;
+    int flags = O_WRONLY | O_CREAT | O_APPEND;
+    if ([at fileSize] > 512 * 1024) {           /* too big: keep it as macshim-previous.log (the run that crashed), start a new one */
+        NSString *prev = [docs stringByAppendingPathComponent:@"macshim-previous.log"];
+        [NSFileManager.defaultManager removeItemAtPath:prev error:nil];
+        if (![NSFileManager.defaultManager moveItemAtPath:p toPath:prev error:nil]) flags |= O_TRUNC;
+    }
     g_logfd = open(p.fileSystemRepresentation, flags, 0644);
     {   /* the game's own stdout/stderr (engine log lines, asserts) -> Documents/game_output.log */
         NSString *gp = [docs stringByAppendingPathComponent:@"game_output.log"];
@@ -5436,11 +5902,27 @@ static void MSFixDesc(id d, const char *what) {
         [(MTLTextureDescriptor *)d setStorageMode:MTLStorageModeShared];
     }
 }
-static id ms_bufLen(id self, SEL c, NSUInteger len, NSUInteger o) { return ((id (*)(id, SEL, NSUInteger, NSUInteger))g_oBufLen)(self, c, len, MSFixOpts(o, "buffer")); }
-static id ms_bufBytes(id self, SEL c, const void *p, NSUInteger len, NSUInteger o) { return ((id (*)(id, SEL, const void *, NSUInteger, NSUInteger))g_oBufBytes)(self, c, p, len, MSFixOpts(o, "buffer(bytes)")); }
-static id ms_tex(id self, SEL c, MTLTextureDescriptor *d) { MSFixDesc(d, "texture"); return ((id (*)(id, SEL, id))g_oTex)(self, c, d); }
-static id ms_heapBuf(id self, SEL c, NSUInteger len, NSUInteger o) { return ((id (*)(id, SEL, NSUInteger, NSUInteger))g_oHeapBuf)(self, c, len, MSFixOpts(o, "heap buffer")); }
-static id ms_heapTex(id self, SEL c, MTLTextureDescriptor *d) { MSFixDesc(d, "heap texture"); return ((id (*)(id, SEL, id))g_oHeapTex)(self, c, d); }
+/* The seven Metal "new..." hooks below hand the game a +1 object, exactly like the methods they wrap. Without
+   NS_RETURNS_RETAINED, ARC retains the result and autoreleases it on the way out: on an engine thread that never drains
+   an autorelease pool that extra reference is never dropped and every buffer/texture made there leaks (GPU memory
+   creeping up until iOS kills the game). */
+typedef id (*MSNewBufLenFn)(id, SEL, NSUInteger, NSUInteger) NS_RETURNS_RETAINED;
+typedef id (*MSNewBufBytesFn)(id, SEL, const void *, NSUInteger, NSUInteger) NS_RETURNS_RETAINED;
+typedef id (*MSNewTexFn)(id, SEL, id) NS_RETURNS_RETAINED;
+typedef id (*MSNewNoCopyFn)(id, SEL, void *, NSUInteger, NSUInteger, id) NS_RETURNS_RETAINED;
+typedef id (*MSNewBufTexFn)(id, SEL, id, NSUInteger, NSUInteger) NS_RETURNS_RETAINED;
+static id ms_bufLen(id self, SEL c, NSUInteger len, NSUInteger o) NS_RETURNS_RETAINED;
+static id ms_bufBytes(id self, SEL c, const void *p, NSUInteger len, NSUInteger o) NS_RETURNS_RETAINED;
+static id ms_tex(id self, SEL c, MTLTextureDescriptor *d) NS_RETURNS_RETAINED;
+static id ms_heapBuf(id self, SEL c, NSUInteger len, NSUInteger o) NS_RETURNS_RETAINED;
+static id ms_heapTex(id self, SEL c, MTLTextureDescriptor *d) NS_RETURNS_RETAINED;
+static id ms_noCopy(id self, SEL c, void *p, NSUInteger len, NSUInteger o, id dealloc) NS_RETURNS_RETAINED;
+static id ms_bufTex(id self, SEL c, MTLTextureDescriptor *d, NSUInteger off, NSUInteger bpr) NS_RETURNS_RETAINED;
+static id ms_bufLen(id self, SEL c, NSUInteger len, NSUInteger o) { return ((MSNewBufLenFn)g_oBufLen)(self, c, len, MSFixOpts(o, "buffer")); }
+static id ms_bufBytes(id self, SEL c, const void *p, NSUInteger len, NSUInteger o) { return ((MSNewBufBytesFn)g_oBufBytes)(self, c, p, len, MSFixOpts(o, "buffer(bytes)")); }
+static id ms_tex(id self, SEL c, MTLTextureDescriptor *d) { MSFixDesc(d, "texture"); return ((MSNewTexFn)g_oTex)(self, c, d); }
+static id ms_heapBuf(id self, SEL c, NSUInteger len, NSUInteger o) { return ((MSNewBufLenFn)g_oHeapBuf)(self, c, len, MSFixOpts(o, "heap buffer")); }
+static id ms_heapTex(id self, SEL c, MTLTextureDescriptor *d) { MSFixDesc(d, "heap texture"); return ((MSNewTexFn)g_oHeapTex)(self, c, d); }
 /* GPU memory audit: buffers wrapped around the game's own memory, and textures laid over buffers (a size mistake there
  * lets the GPU write past the buffer into neighbouring engine memory) */
 static IMP g_oNoCopy, g_oBufTex;
@@ -5448,7 +5930,7 @@ static id ms_noCopy(id self, SEL c, void *p, NSUInteger len, NSUInteger o, id de
     long long n = g_noCopyN++; g_noCopyBytes += (long long)len;
     if (n < 12 || (len & 0x3fff) || ((uintptr_t)p & 0x3fff)) MSLogf(@"Metal: noCopy buffer #%lld %p +%#lx opts %#lx%s", n, p, (unsigned long)len, (unsigned long)o,
         ((len & 0x3fff) || ((uintptr_t)p & 0x3fff)) ? " NOT PAGE ALIGNED" : "");
-    return ((id (*)(id, SEL, void *, NSUInteger, NSUInteger, id))g_oNoCopy)(self, c, p, len, o, dealloc);
+    return ((MSNewNoCopyFn)g_oNoCopy)(self, c, p, len, o, dealloc);
 }
 static id ms_bufTex(id self, SEL c, MTLTextureDescriptor *d, NSUInteger off, NSUInteger bpr) {
     long long n = g_bufTexN++;
@@ -5459,11 +5941,71 @@ static id ms_bufTex(id self, SEL c, MTLTextureDescriptor *d, NSUInteger off, NSU
     if (n < 8 || (bad && g_bufTexBad < 20)) MSLogf(@"Metal: texture over buffer #%lld %lux%lux%lu fmt %lu off %lu bpr %lu need %lu buf %lu align %lu%s", n,
         (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.depth, (unsigned long)d.pixelFormat, (unsigned long)off, (unsigned long)bpr,
         (unsigned long)need, (unsigned long)b.length, (unsigned long)align, bad ? " <-- OVERFLOWS / MISALIGNED" : "");
-    return ((id (*)(id, SEL, id, NSUInteger, NSUInteger))g_oBufTex)(self, c, d, off, bpr);
+    return ((MSNewBufTexFn)g_oBufTex)(self, c, d, off, bpr);
+}
+/* GPU memory budget: the game sizes its Metal heaps from -[MTLDevice recommendedMaxWorkingSetSize] (~5.7 GB of fixed
+   heaps seen by a tester, PR #16) - on a 6 GB per-app limit (16 Pro Max, iPhone Air in LiveContainer, issue #19) that
+   left ~60 MB at the main menu and character creation got the game killed. The real value is logged; plist GPUBudgetGB
+   reports a smaller one (try 3.5-4 on 6 GB limits; lower textures / more streaming, less memory). */
+/* 2.5 (fn at 0x1047e77c0): working set > 0x2800fffff (~10 GB) and a GPU name without "M1"/"M2" sets a high-end flag
+   (0x1096662b2). An 8 GB iPhone never reports that much; 12 GB iPhones (17 Pro Max, Air) can - the only phones that
+   got killed by iOS. Metal's own value goes to the game (no cap: a cap can make the game crash itself when its
+   GPU heaps fill, instead of iOS ending it); logged. Opt-in: GPUBudgetFit = YES (per-app limit), GPUBudgetGB. */
+/* did the game really get Apple's frame interpolator? (supportsDevice: says NO on A18 Pro) - logged, plus how many
+   frames it makes (encodeToCommandBuffer: calls, in the 30 s progress line's "gpu" report via MSFIReport) */
+static IMP g_oFINew, g_oFINew4, g_oFIEnc; static _Atomic long long g_fiEncodes;
+static void ms_fiEncode(id self, SEL c, id cb) { g_fiEncodes++; ((void (*)(id, SEL, id))g_oFIEnc)(self, c, cb); }
+static void MSFIReport(void) {
+    static double rep; double now = CACurrentMediaTime(); if (now - rep < 30) return;
+    long long n = g_fiEncodes; g_fiEncodes = 0;
+    if (rep > 0 && g_oFIEnc) MSLogf(@"MetalFX frame generation (Apple): %lld made-up frames in 30 s (%.0f per second)", n, n / (now - rep));
+    rep = now;
+}
+static void MSFILogMade(id fi, id desc, const char *kind) {
+    MSLogf(@"MetalFX frame generation (Apple): the game asked for a %s frame interpolator (%lux%lu -> %lux%lu) - %@", kind,
+           (unsigned long)[[desc valueForKey:@"inputWidth"] unsignedLongValue], (unsigned long)[[desc valueForKey:@"inputHeight"] unsignedLongValue],
+           (unsigned long)[[desc valueForKey:@"outputWidth"] unsignedLongValue], (unsigned long)[[desc valueForKey:@"outputHeight"] unsignedLongValue],
+           fi ? [NSString stringWithFormat:@"got one (%@)", NSStringFromClass([fi class])] : @"iOS refused (nil): Apple frame generation can't run on this phone");
+    if (fi && !g_oFIEnc) { Method m = class_getInstanceMethod([fi class], NSSelectorFromString(@"encodeToCommandBuffer:"));
+                           if (m) g_oFIEnc = method_setImplementation(m, (IMP)ms_fiEncode); }
+}
+typedef id (*MSFINewFn)(id, SEL, id) NS_RETURNS_RETAINED;
+typedef id (*MSFINew4Fn)(id, SEL, id, id) NS_RETURNS_RETAINED;
+static id ms_fiNew(id self, SEL c, id dev) NS_RETURNS_RETAINED;
+static id ms_fiNew(id self, SEL c, id dev) { id r = ((MSFINewFn)g_oFINew)(self, c, dev); MSFILogMade(r, self, "Metal 3"); return r; }
+static id ms_fiNew4(id self, SEL c, id dev, id comp) NS_RETURNS_RETAINED;
+static id ms_fiNew4(id self, SEL c, id dev, id comp) { id r = ((MSFINew4Fn)g_oFINew4)(self, c, dev, comp); MSFILogMade(r, self, "Metal 4"); return r; }
+static void MSHookFrameInterpolator(Class fi) {
+    if (!fi) return; Method m;
+    if ((m = class_getInstanceMethod(fi, NSSelectorFromString(@"newFrameInterpolatorWithDevice:")))) g_oFINew = method_setImplementation(m, (IMP)ms_fiNew);
+    if ((m = class_getInstanceMethod(fi, NSSelectorFromString(@"newFrameInterpolatorWithDevice:compiler:")))) g_oFINew4 = method_setImplementation(m, (IMP)ms_fiNew4);
+}
+static IMP g_oWorkingSet;
+static uint64_t ms_workingSet(id self, SEL c) {
+    uint64_t real = ((uint64_t (*)(id, SEL))g_oWorkingSet)(self, c);
+    double gb = MSCfgD(@"GPUBudgetGB", 0); NSString *why = @"Metal's value";
+    uint64_t r = real;
+    if (gb > 0.5) { r = (uint64_t)fmin(real, gb * 1073741824.0); why = @"GPUBudgetGB"; }
+    else if ([MSConfig()[@"GPUBudgetFit"] boolValue]) {            /* opt-in only: a smaller budget can make the game's
+                                                                    own GPU heaps run full and crash it before iOS would */
+        if (!g_memLimitGB) MSFitMemSizeGB();
+        double lim = g_memLimitGB;
+        if (lim > 0 && real > lim * 1073741824.0) { r = (uint64_t)(lim * 1073741824.0); why = @"capped at iOS's per-app limit (GPUBudgetFit)"; }
+    }
+    static int said; if (!said++) MSLogf(@"gpu budget: Metal recommends %.2f GB for the GPU, the game is told %.2f GB (%@)", real / 1073741824.0, r / 1073741824.0, why);
+    return r;
 }
 static void MSAddMacAPIs(void) {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice(); if (!dev) { MSLogf(@"no Metal device!"); return; }
     Class D = object_getClass(dev);
+    { Method m = class_getInstanceMethod(D, @selector(recommendedMaxWorkingSetSize));
+      if (m) g_oWorkingSet = method_setImplementation(m, (IMP)ms_workingSet); }
+    { Class fi = NSClassFromString(@"MTLFXFrameInterpolatorDescriptor"); SEL sd = NSSelectorFromString(@"supportsDevice:"), s4 = NSSelectorFromString(@"supportsMetal4FX:");
+      BOOL ok = fi && [fi respondsToSelector:sd] && ((BOOL (*)(id, SEL, id))objc_msgSend)(fi, sd, dev);
+      BOOL ok4 = fi && [fi respondsToSelector:s4] && ((BOOL (*)(id, SEL, id))objc_msgSend)(fi, s4, dev);
+      MSLogf(@"MetalFX frame generation (Apple): %@ (Metal 4 version %@)%@", ok ? @"supported on this GPU" : @"NOT supported on this GPU", ok4 ? @"supported" : @"not supported",
+             MSMacOS26On() ? @", unlocked for the game (macOS 26 answer)" : @", hidden from the game (Apple frame generation switch off)");
+      MSHookFrameInterpolator(fi); }
     { Method m;
       if ((m = class_getInstanceMethod(D, @selector(newBufferWithBytesNoCopy:length:options:deallocator:)))) g_oNoCopy = method_setImplementation(m, (IMP)ms_noCopy);
       id<MTLBuffer> tb = [dev newBufferWithLength:16384 options:MTLResourceStorageModeShared];
@@ -5642,7 +6184,80 @@ static BOOL ms_engineStart(id self, SEL _cmd, NSError **err) {
     @synchronized (g_audioEngines) { [g_audioEngines addObject:self]; }
     return ((BOOL (*)(id, SEL, NSError **))g_origEngineStart)(self, _cmd, err);
 }
+/* ---------------------------------------------------------------- audio: autorelease pools for per-tick AVAudio setters
+ * Wwise's audio thread (AK::AudioMgr) updates every 3D voice each tick - -[AVAudioPlayerNode setPosition:] and friends.
+ * AVFAudio autoreleases inside those calls and that thread never drains a pool, so its pool pages piled up for the
+ * whole session (malloc sampler: 4 KB pool pages from libobjc <- AudioToolboxCore <- AVFAudio <- Cyberpunk2077). Each
+ * call now runs in its own @autoreleasepool. Only methods whose type encoding matches exactly are wrapped;
+ * AudioPools = NO turns it off. */
+typedef struct { float a, b, c; } MSF3;
+typedef struct { Class cls; SEL sel; IMP orig; } MSAudioOrig;
+static MSAudioOrig g_audioOrig[64]; static int g_audioOrigN;
+static IMP MSAudioOrigFor(id self, SEL sel) {
+    for (Class c = object_getClass(self); c; c = class_getSuperclass(c))
+        for (int i = 0; i < g_audioOrigN; i++) if (g_audioOrig[i].cls == c && g_audioOrig[i].sel == sel) return g_audioOrig[i].orig;
+    return NULL;
+}
+static void ms_audioSetF3(id self, SEL sel, MSF3 v) { IMP o = MSAudioOrigFor(self, sel); if (o) @autoreleasepool { ((void (*)(id, SEL, MSF3))o)(self, sel, v); } }
+static void ms_audioSetF(id self, SEL sel, float v) { IMP o = MSAudioOrigFor(self, sel); if (o) @autoreleasepool { ((void (*)(id, SEL, float))o)(self, sel, v); } }
+static void MSInstallAudioPools(void) {
+    if ([MSConfig()[@"AudioPools"] isEqual:@NO]) return;
+    NSArray *classes = @[ @"AVAudioPlayerNode", @"AVAudioMixerNode", @"AVAudioEnvironmentNode", @"AVAudioUnitSampler",
+                          @"AVAudioSourceNode", @"AVAudioMixingDestination", @"AVAudioInputNode" ];
+    NSArray *f3 = @[ @"setPosition:", @"setListenerPosition:", @"setListenerAngularOrientation:" ];
+    NSArray *f1 = @[ @"setObstruction:", @"setOcclusion:", @"setReverbBlend:", @"setVolume:", @"setPan:", @"setRate:" ];
+    int n = 0;
+    for (NSString *cn in classes) {
+        Class c = NSClassFromString(cn); if (!c) continue;
+        for (NSString *sn in [f3 arrayByAddingObjectsFromArray:f1]) {
+            SEL sel = NSSelectorFromString(sn); Method m = class_getInstanceMethod(c, sel); if (!m) continue;
+            Class def = c; while (class_getSuperclass(def) && class_getInstanceMethod(class_getSuperclass(def), sel) == m) def = class_getSuperclass(def);
+            BOOL done = NO; for (int i = 0; i < g_audioOrigN; i++) if (g_audioOrig[i].cls == def && g_audioOrig[i].sel == sel) done = YES;
+            if (done || g_audioOrigN >= 64) continue;
+            BOOL isF3 = [f3 containsObject:sn];
+            char *rt = method_copyReturnType(m), *at = method_copyArgumentType(m, 2);
+            BOOL ok = rt && at && !strcmp(rt, "v") && method_getNumberOfArguments(m) == 3 &&
+                      (isF3 ? (strncmp(at, "{", 1) == 0 && strstr(at, "=fff}") != NULL) : !strcmp(at, "f"));
+            free(rt); free(at);
+            if (!ok) { MSLogf(@"audio pools: %@ %@ has an unexpected type - left alone", NSStringFromClass(def), sn); continue; }
+            g_audioOrig[g_audioOrigN].cls = def; g_audioOrig[g_audioOrigN].sel = sel;
+            g_audioOrig[g_audioOrigN].orig = method_getImplementation(m); g_audioOrigN++;
+            method_setImplementation(m, isF3 ? (IMP)ms_audioSetF3 : (IMP)ms_audioSetF); n++;
+        }
+    }
+    MSLogf(@"audio pools: %d AVAudio setters run in their own autorelease pool", n);
+}
+/* Audio session: nothing set one up, so iOS used its default (SoloAmbient) and the ring/silent switch muted the game.
+ * Playback plays through silent mode. Start screen "Sound in silent mode" (CyPortSilentModeSound) / plist
+ * SilentModeSound = NO goes back to Ambient (follows the switch); "Mix with other audio" (CyPortMixAudio) / plist
+ * MixAudio keeps other apps' music playing. Set at launch and again at PLAY (the switches may have changed), and
+ * re-activated after a call or Siri interrupted it. AVFAudio through the runtime: the shim doesn't link it. */
+static void MSAudioSessionSetup(const char *why) {
+    static void *av; if (!av) av = dlopen("/System/Library/Frameworks/AVFAudio.framework/AVFAudio", RTLD_LAZY);
+    Class c = NSClassFromString(@"AVAudioSession"); if (!c) { MSLogf(@"audio: no AVAudioSession"); return; }
+    id s = ((id (*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"sharedInstance"));
+    id sv = MSConfig()[@"SilentModeSound"], mv = MSConfig()[@"MixAudio"];
+    BOOL silentOK = [sv respondsToSelector:@selector(boolValue)] ? [sv boolValue] : MSPref(@"CyPortSilentModeSound", 1) != 0;
+    BOOL mix = [mv respondsToSelector:@selector(boolValue)] ? [mv boolValue] : MSPref(@"CyPortMixAudio", 0) != 0;
+    NSString *cat = silentOK ? @"AVAudioSessionCategoryPlayback" : (mix ? @"AVAudioSessionCategoryAmbient" : @"AVAudioSessionCategorySoloAmbient");
+    NSUInteger opts = silentOK && mix ? 1 /* MixWithOthers */ : 0;
+    NSError *e = nil;
+    BOOL ok = ((BOOL (*)(id, SEL, id, id, NSUInteger, NSError **))objc_msgSend)(s, NSSelectorFromString(@"setCategory:mode:options:error:"), cat, @"AVAudioSessionModeDefault", opts, &e);
+    NSError *e2 = nil;
+    BOOL act = ((BOOL (*)(id, SEL, BOOL, NSError **))objc_msgSend)(s, NSSelectorFromString(@"setActive:error:"), YES, &e2);
+    MSLogf(@"audio (%s): %@%@ - %@%@%@", why, [cat substringFromIndex:22], opts ? @" + mix" : @"", silentOK ? @"plays in silent mode" : @"silent switch mutes the game",
+           ok ? @"" : [NSString stringWithFormat:@", category failed: %@", e.localizedDescription], act ? @"" : [NSString stringWithFormat:@", activate failed: %@", e2.localizedDescription]);
+}
 static void MSInstallBackgroundFreeze(void) {
+    MSInstallAudioPools();
+    dispatch_async(dispatch_get_main_queue(), ^{ MSAudioSessionSetup("launch"); });   /* once UIKit runs, not inside dyld */
+    [NSNotificationCenter.defaultCenter addObserverForName:@"AVAudioSessionInterruptionNotification" object:nil queue:nil usingBlock:^(NSNotification *n) {
+        if ([n.userInfo[@"AVAudioSessionInterruptionTypeKey"] unsignedIntegerValue] != 0 /* Ended */) return;
+        MSAudioSessionSetup("after interruption");
+        NSArray *es; @synchronized (g_audioEngines) { es = g_audioEngines.allObjects; }
+        for (id e in es) if (!((BOOL (*)(id, SEL))objc_msgSend)(e, NSSelectorFromString(@"isRunning"))) { NSError *er = nil;
+            ((BOOL (*)(id, SEL, NSError **))objc_msgSend)(e, NSSelectorFromString(@"startAndReturnError:"), &er); }
+    }];
     g_audioEngines = [NSHashTable weakObjectsHashTable];
     Class c = NSClassFromString(@"AVAudioEngine");
     Method m = c ? class_getInstanceMethod(c, NSSelectorFromString(@"startAndReturnError:")) : NULL;

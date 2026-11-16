@@ -106,6 +106,44 @@ private struct LauncherView: View {
     @AppStorage("CyPortLookMode") private var lookMode = 2
     /// read by the shim (MSPadView msFeel): a short tap on each on-screen button press
     @AppStorage("CyPortTouchHaptics") private var touchHaptics = true
+    /// read by the shim (MSAudioSessionSetup): game sound plays with the ring/silent switch on silent
+    @AppStorage("CyPortSilentModeSound") private var silentModeSound = true
+    /// read by the shim (MSAudioSessionSetup): music from other apps keeps playing under the game
+    @AppStorage("CyPortMixAudio") private var mixAudio = false
+    /// read by the shim (MSMacOS26On): the game sees macOS 26 and Apple's MetalFX frame generation is switched on in it.
+    /// Off by default; the shim turns it off again when frame generation is turned off in the game's menu
+    @AppStorage("CyPortAppleFrameGen") private var appleFrameGen = false
+    /// read by the shim (MSPhoneRumbleOn): with touch controls the game's controller rumble plays on the phone
+    @AppStorage("CyPortPhoneRumble") private var phoneRumble = true
+    @State private var askRestore = false
+
+    /// "Restore defaults": every start screen option back to what works best on most phones, the on-screen buttons back to
+    /// their standard places, and at Play the game's graphics + display settings back to the phone defaults (MSResetGameGraphics).
+    /// Saves, cloud sign-in, game files and the game's audio / controls / gameplay settings are left alone.
+    private func restoreDefaults() {
+        if let i = model.notes.firstIndex(of: "recommended") { model.resolution = i }
+        model.overlay = 1
+        smoothPacing = true; gameThread = true; lowLatency = false; appleFrameGen = false
+        vibration = true; adaptiveTriggers = true; kbmWithController = false; phoneRumble = true
+        lookMode = 2; touchHaptics = true; lookSensitivity = 1.5
+        silentModeSound = true; mixAudio = false
+        let d = UserDefaults.standard
+        for k in d.dictionaryRepresentation().keys where k.hasPrefix("CyPortTouchLayout-") { d.removeObject(forKey: k) }
+        d.set(true, forKey: "CyPortResetGameGraphics")     // the shim resets the game's graphics settings at Play
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        storeLog("start screen: options restored to defaults")
+    }
+    private var restoreButton: some View {
+        Button { askRestore = true } label: {
+            Label("Restore defaults", systemImage: "arrow.counterclockwise")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.85))
+                .frame(width: 300, height: 40)
+                .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.15)))
+        }
+        .disabled(model.starting)
+    }
 
     private var dataText: String? {
         let v = GameData.appVersionName
@@ -237,11 +275,15 @@ private struct LauncherView: View {
                     }
 
                     switchRow("Smooth frame pacing", icon: "waveform.path", isOn: $smoothPacing,
-                              note: smoothPacing ? "Even frame times: holds 120, 60, 40 or 30 FPS, whatever the phone keeps up with." : "Off: the game's own frame cap only.")
+                              note: smoothPacing ? "Even frame times: holds 120, 60, 40 or 30 FPS, whatever the phone keeps up with." : (appleFrameGen ? "Off: best with frame generation (it turns off when frame generation goes on)." : "Off: the game's own frame cap only."))
                     switchRow("Smooth controls", icon: "hand.tap", isOn: $gameThread,
                               note: gameThread ? "The game runs on its own thread: touch and controller input don't wait for the game's frames." : "Off: the old way (controls follow the game's frame rate). Try this if the game won't start.")
                     switchRow("Low-latency input", icon: "bolt.horizontal", isOn: $lowLatency,
                               note: lowLatency ? "Snappier controls. Costs a few FPS when the GPU is the limit." : "Off: best frame rate.")
+                    switchRow("Apple frame generation", icon: "sparkles.tv", isOn: $appleFrameGen,
+                              note: appleFrameGen ? "Apple's MetalFX frame generation is on in the game. Turning it off in the game turns this off too." : "Off: no Apple frame generation.")
+                    switchRow("Phone vibration", icon: "iphone.radiowaves.left.and.right", isOn: $phoneRumble,
+                              note: phoneRumble ? "With touch controls the phone rumbles like a controller would (explosions, gunfire, crashes). Off while a controller is connected." : "Off: the phone doesn't rumble.")
                     switchRow("Controller vibration", icon: "gamecontroller", isOn: $vibration,
                               note: vibration ? "Rumble on controllers that have it." : "Off: no rumble.")
                     switchRow("Adaptive triggers", icon: "l2.button.roundedtop.horizontal", isOn: $adaptiveTriggers,
@@ -264,6 +306,10 @@ private struct LauncherView: View {
                     }
                     switchRow("Touch vibration", icon: "hand.tap", isOn: $touchHaptics,
                               note: touchHaptics ? "A short tap on each on-screen button press." : "Off: on-screen buttons are silent.")
+                    switchRow("Sound in silent mode", icon: "speaker.wave.2", isOn: $silentModeSound,
+                              note: silentModeSound ? "Game sound plays even with the silent switch on." : "Off: the silent switch mutes the game.")
+                    switchRow("Mix with other audio", icon: "music.note", isOn: $mixAudio,
+                              note: mixAudio ? "Music from other apps keeps playing under the game." : "Off: the game stops other apps' audio.")
 
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
@@ -277,6 +323,7 @@ private struct LauncherView: View {
                         Slider(value: $lookSensitivity, in: 0.25...4, step: 0.05)
                             .tint(cyberYellow).frame(width: 300)
                     }
+                    restoreButton
 
                     VStack(alignment: .leading, spacing: 8) {
                         Label("Cloud saves", systemImage: "icloud")
@@ -390,6 +437,12 @@ private struct LauncherView: View {
         }
         .preferredColorScheme(.dark)
         .onAppear { model.sync(); model.checkData() }
+        .onChange(of: appleFrameGen) { on in
+            // frame generation on: smooth pacing would see the made-up frames and drop to 30 - off once, can be turned on again
+            guard on, smoothPacing else { return }
+            smoothPacing = false
+            UserDefaults.standard.set(true, forKey: "CyPortFGWasOn")      // the shim won't turn it off a second time at Play
+        }
         .fullScreenCover(isPresented: $model.updating, onDismiss: { GameData.reset(); model.checkData() }) {
             let r = model.gameRoot ?? URL(fileURLWithPath: NSTemporaryDirectory())
             StoreView(model: StoreModel(downloadRoot: r, internalRoot: r, bookmarkKey: "", updateRoot: r))
@@ -402,6 +455,12 @@ private struct LauncherView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(dataText ?? "")
+        }
+        .alert("Restore defaults?", isPresented: $askRestore) {
+            Button("Restore", role: .destructive) { restoreDefaults() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("All options on this screen go back to the recommended settings, the on-screen buttons back to their standard places, and the game's graphics settings back to the phone defaults when you press Play. Your saves, cloud sign-in, game files and the game's audio, controls and gameplay settings stay as they are.")
         }
         .fileImporter(isPresented: $model.importing, allowedContentTypes: [.folder], allowsMultipleSelection: true) { model.importSaves($0) }
         .sheet(isPresented: $model.signingIn) {
