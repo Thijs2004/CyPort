@@ -1,3 +1,7 @@
 The MIT license (LICENSE) covers the CyPort source code only. Cyberpunk 2077 and all of its
 files are (c) CD PROJEKT S.A. and are NOT part of this project. CyPort is not
 affiliated with or endorsed by CD PROJEKT RED.
+
+Third-party code linked into the app (shim/third_party):
+- libarchive 3.8.1 (BSD 2-clause, shim/third_party/libarchive/COPYING.libarchive) - unpacks mod archives
+- liblzma from XZ Utils 5.8.1 (0BSD, shim/third_party/libarchive/COPYING.xz) - 7z / xz decoding for libarchive

@@ -1,0 +1,2 @@
+# Codeware hooks missing from its hook-offsets.txt (macos/MacV1.cpp hooks it directly on the public loader).
+0x4D7A9F8  # ScriptLoaderWrapper (codeware_postLoadScripts after the scripts load)

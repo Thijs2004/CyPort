@@ -169,6 +169,8 @@ struct StoreView: View {
     @State private var login: StoreKind?
     @State private var pickFolder = false
     @State private var deleteWindows = false
+    /// controller: B closes (like Close; not while downloading), or cancels the sign-in sheet on top
+    @State private var pad = MSPadPoller()
 
     var body: some View {
         ZStack {
@@ -196,6 +198,18 @@ struct StoreView: View {
         .sheet(isPresented: $pickFolder) {
             FolderPicker { u in pickFolder = false; if let u { model.setFolder(u) } }
         }
+        .onAppear {
+            pad.gate = { pickFolder }                              // the folder picker is the system's
+            pad.onKey = { k, _ in
+                guard k == .b else { return }
+                if login != nil { login = nil; model.refresh += 1; return }
+                if deleteWindows { deleteWindows = false; return }
+                if case .downloading = model.phase { return }
+                model.cancel(); dismiss()
+            }
+            pad.start()
+        }
+        .onDisappear { pad.stop() }
     }
 
     @ViewBuilder var content: some View {

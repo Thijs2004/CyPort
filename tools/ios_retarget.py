@@ -130,7 +130,10 @@ def info(path):
         elif cmd == LC_CODE_SIGNATURE:
             print("  code_signature (stale after retarget; re-sign)")
 
+GAME_SRC = None
+
 def retarget(src, dst, minos, sdk):
+    global GAME_SRC; GAME_SRC = src                 # baked hooks check this exact binary
     d = bytearray(thin_arm64(open(src, "rb").read())); m = parse(d); log = []; seen = False
     for cmd, off, sz in m["cmds"]:
         if cmd == LC_VERSION_MIN_MACOSX:
@@ -150,7 +153,7 @@ def retarget(src, dst, minos, sdk):
                 log.append("%s -> %s" % (old, new))
     if not seen: raise SystemExit("no LC_BUILD_VERSION: not a modern macOS build")
     log += reroute_imports(d, m)
-    if m["ftype"] == 2: log += patch_pool_end(d, m) + patch_watchdog(d, m) + patch_pool_sizes(d, m) + patch_free_hook(d, m)      # MH_EXECUTE
+    if m["ftype"] == 2: log += patch_pool_end(d, m) + patch_watchdog(d, m) + patch_pool_sizes(d, m) + patch_free_hook(d, m) + patch_worldwidget_limit(d, m) + patch_baked_hooks(d, m)      # MH_EXECUTE
     log += dedupe_dylibs(d, m)          # it moves load commands, so m["cmds"] offsets are stale afterwards
     if GAME_FOLDER and m["ftype"] == 2: log += make_loadable(d, parse(d))
     if GAME_FOLDER:
@@ -417,6 +420,75 @@ def patch_free_hook(d, m):
     ldr = 0xf9400210 | (((slot & 0xfff) // 8) << 10)
     struct.pack_into("<3I", d, fo, adrp, ldr, 0xd61f0200)
     return ["free hook: engine Free %#x -> through slot %#x (shim quarantine)" % (FREE_ENTRY, slot)]
+
+WW_JOB_BODY = 0x1043181c8      # ArchiveXL InkWorldLayer_UpdateComponents row (macos/MacAddressResolver.cpp, RVA 0x43181C8): the parallel-for
+                               # job body the world widget update lambda is inlined into (2.5.0)
+WW_CMP, WW_BHI = 0xf10026df, 0x540004a8   # cmp x22,#9 ; b.hi +0x94   at job body +0x12C / +0x130
+
+def patch_worldwidget_limit(d, m):
+    """ArchiveXL's WorldWidgetLimitPatch lifts the engine's limit of 10 world-space widget components per layer by NOPing
+    the b.hi of  cmp x22,#9 ; b.hi over_limit  in the world widget job body. On macOS it writes the code at run time;
+    iOS forbids that, so the same instruction is NOPed here. Same search as the plugin (cmp xN,#9 + b.hi in the first
+    0x200 bytes of the job body, exactly one match), and the match must be the known words at the known place."""
+    text = None
+    for cmd, off, sz in m["cmds"]:
+        if cmd != LC_SEGMENT_64: continue
+        for i in range(struct.unpack_from("<I", d, off + 64)[0]):
+            so = off + 72 + 80 * i
+            if cstr(d[so:so + 16]) == "__text": text = struct.unpack_from("<QQI", d, so + 32)
+    if not text: return ["world widget limit: no __text section; NOT applied"]
+    addr, size, foff = text
+    if not (addr <= WW_JOB_BODY and WW_JOB_BODY + 0x200 <= addr + size): return ["world widget limit: job body outside __text; NOT applied"]
+    base = foff + WW_JOB_BODY - addr
+    w = struct.unpack_from("<128I", d, base)
+    hits = [i + 1 for i in range(len(w) - 1) if w[i] & 0xfffffc1f == 0xf100241f and w[i + 1] & 0xff00001f == 0x54000008]
+    if not hits:
+        k = 0x130 // 4
+        if w[k - 1] == WW_CMP and w[k] == ARM_NOP: return ["world widget limit: already patched at %#x" % (WW_JOB_BODY + 0x130)]
+    if len(hits) != 1: return ["world widget limit: expected 1 cmp #9/b.hi pair, found %d; NOT applied" % len(hits)]
+    k = hits[0]
+    if k * 4 != 0x130 or w[k - 1] != WW_CMP or w[k] != WW_BHI:
+        return ["world widget limit: unexpected code at %#x (%08x %08x); NOT applied" % (WW_JOB_BODY + 4 * k, w[k - 1], w[k])]
+    struct.pack_into("<I", d, base + 4 * k, ARM_NOP)
+    return ["world widget limit: b.hi -> nop at %#x (cmp x22,#9 limit of 10 world widgets lifted)" % (WW_JOB_BODY + 4 * k)]
+
+# Generic build-time ("baked") hooks, the iOS-safe way to detour game functions (no code is written at run time):
+# each entry's first three instructions become  adrp x16,slot ; ldr x16,[x16,#off] ; br x16  through an 8-byte slot
+# in the __DATA padding. The shim (MSInstallBakedHooks) fills every slot before the game runs, with its hook or with
+# a pass-through trampoline that replays the three original instructions and jumps to entry+12. Only sites whose
+# first three instructions are position independent are listed; each is checked against the expected words, so a
+# different game build is left untouched. Keep in sync with kMSBakedHooks in shim/MacShim.m (same order).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import baked_sites                                    # the site table (also generates shim/BakedSites.inc)
+BAKED_SLOTS_FROM_END = baked_sites.SLOTS_FROM_END
+
+def patch_baked_hooks(d, m):
+    segs = {}; text = None; last_end = 0
+    for cmd, off, sz in m["cmds"]:
+        if cmd != LC_SEGMENT_64: continue
+        name = cstr(d[off + 8:off + 24]); vmaddr, vmsize = struct.unpack_from("<QQ", d, off + 24)
+        segs[name] = (vmaddr, vmsize)
+        for i in range(struct.unpack_from("<I", d, off + 64)[0]):
+            so = off + 72 + 80 * i; sa, ss, sf = struct.unpack_from("<QQI", d, so + 32)
+            if cstr(d[so:so + 16]) == "__text": text = (sa, ss, sf)
+            if name == "__DATA": last_end = max(last_end, sa + ss)
+    if not text or "__DATA" not in segs: return ["baked hooks: segments missing; NOT applied"]
+    base = segs["__DATA"][0] + segs["__DATA"][1] - BAKED_SLOTS_FROM_END
+    try: sites = baked_sites.fill_words(GAME_SRC or baked_sites.GAME)
+    except SystemExit as e: return [str(e) + "; NOT applied"]
+    if base < last_end or len(sites) * 8 > BAKED_SLOTS_FROM_END - 0x100: return ["baked hooks: no room in the __DATA padding; NOT applied"]
+    addr, size, foff = text; log = []
+    for i, (name, entry, words, _desc) in enumerate(sites):
+        slot = base + 8 * i
+        if not (addr <= entry < addr + size): log.append("baked hook %s: entry outside __text; skipped" % name); continue
+        fo = foff + entry - addr
+        if struct.unpack_from("<3I", d, fo) != words: log.append("baked hook %s: other code at %#x (different game build); skipped" % (name, entry)); continue
+        imm = ((slot & ~0xfff) - (entry & ~0xfff)) >> 12
+        adrp = 0x90000010 | ((imm & 3) << 29) | (((imm >> 2) & 0x7ffff) << 5)
+        ldr = 0xf9400210 | (((slot & 0xfff) // 8) << 10)
+        struct.pack_into("<3I", d, fo, adrp, ldr, 0xd61f0200)
+        log.append("baked hook %s: %#x -> through slot %#x" % (name, entry, slot))
+    return log
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()

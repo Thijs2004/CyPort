@@ -1,0 +1,3 @@
+# Image-relative offsets Mod Settings hooks (mod_settings macos/hook-offsets.txt). One per line; # starts a comment.
+# Its other hook, ScriptBundle_dtor = ReleaseScriptData (0x111cc00), is already in codeware.txt: Mod Settings joins Codeware's hook chain.
+0x30a0d5c  # UserMapping_ApplyOverrides (Mod Settings: the body the ContextManager thunk 0x30815c4 jumps to, void(UserMapping*))

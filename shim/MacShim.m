@@ -63,6 +63,9 @@ static void MSTVRoute(void); static void MSTVObserve(void);
 static void MSLowLatencyWait(void); static void MSInputReport(void); static void MSPollBegin(void); static void MSFxReport(void); static void MSRumReport(void); static void MSHookControllerEffects(void);
 /* TV out: the phone shows the picture too (TVMirror = NO: phone stays black, saves a little power) */
 @class CAMetalLayer; static CAMetalLayer *g_mirrorLayer; static _Atomic BOOL g_mirrorOn;
+/* CET overlay (see "CET overlay" below): Cyber Engine Tweaks' ImGui layer, the "CET" touch button's handler, overlay open */
+static CAMetalLayer *g_overlayLayer; static void (*g_ovToggle)(void); static _Atomic BOOL g_ovCapture;
+static BOOL MSIsOverlayDrawable(id d);
 static BOOL MSMirrorFit(UIView *v, CGRect *r);
 @class NSWindow; static __weak NSWindow *g_gameWin;
 
@@ -332,7 +335,7 @@ static CGRect MSUIFromAK(CGRect r) { double k = MSAKScale(); return CGRectMake(r
 @property(nonatomic) CGPoint locationInWindow; @property(nonatomic) unsigned short keyCode;
 @property(nonatomic) CGFloat scrollingDeltaX, scrollingDeltaY, deltaX, deltaY; @property(nonatomic) BOOL hasPreciseScrollingDeltas, isARepeat;
 @property(nonatomic) NSTimeInterval timestamp; @property(nonatomic, copy) NSString *characters, *charactersIgnoringModifiers;
-@property(nonatomic, weak) id window;
+@property(nonatomic, weak) id window; @property(nonatomic) BOOL msTyped;   /* from the ⌨ keyboard: passes controller-only mode */
 + (CGPoint)mouseLocation;
 + (id)addLocalMonitorForEventsMatchingMask:(unsigned long long)mask handler:(NSEvent *(^)(NSEvent *))h;
 + (void)removeMonitor:(id)m;
@@ -671,6 +674,52 @@ static CGPoint MSTouchIn(UITouch *t, UIView *host) {
                                                fmin(fmax((p.y - r.origin.y) / r.size.height, 0), 1) * h.height);
     return CGPointMake(p.x / s.width * h.width, p.y / s.height * h.height);
 }
+/* ================================================================ CET overlay: begin
+ * Cyber Engine Tweaks (a RED4ext plugin, CyPort-red4ext/cet, branch ios-overlay) draws its ImGui overlay (console, mod
+ * windows) into a transparent CAMetalLayer of its own, over the game's picture. It finds these four functions with dlsym:
+ *   MSRegisterOverlayLayer(layer)   the shim puts CET's CAMetalLayer over the game view, keeps it the view's size, and
+ *                                   leaves it out of frame pacing, low latency, the frame counters and the TV mirror
+ *                                   (ms_nextDrawable and the present hooks). NULL takes it away again. Returns 1.
+ *   MSOverlaySetToggleHandler(fn)   the touch pad gets a "CET" button; a tap calls fn on the main thread (CET opens or
+ *                                   closes its overlay). With a controller or mouse connected (pad hidden) the button
+ *                                   stays on screen alone. NULL removes the button.
+ *   MSOverlaySetCapture(on)         overlay open: the touch pad hides (only "CET" and the keyboard button stay), so every
+ *                                   finger reaches the game view and becomes mouse events (tap = click, drag = scroll,
+ *                                   hold then drag = mouse drag, two-finger tap = right click); keyboard and mouse
+ *                                   events also pass controller-only mode. CET takes them in its NSEvent local monitor
+ *                                   and keeps them from the game.
+ *   MSOverlayShowKeyboard(show)     opens / closes the iPhone keyboard (the pad's keyboard button does the same).
+ * All four may be called from any thread. */
+static __weak UIView *g_ovKeyInput;                 /* the pad's MSKeyInput */
+static BOOL MSIsOverlayDrawable(id d) {
+    CAMetalLayer *l = g_overlayLayer;
+    return l && d && [d respondsToSelector:@selector(layer)] && [(id<CAMetalDrawable>)d layer] == l;
+}
+static void MSOverlayAttach(void) {                 /* main thread: over the game's layer, the size of the game view */
+    CAMetalLayer *l = g_overlayLayer; UIView *h = (UIView *)g_hostView; if (!l || !h) return;
+    [CATransaction begin]; [CATransaction setDisableActions:YES];
+    if (l.superlayer != h.layer) { [l removeFromSuperlayer]; [h.layer addSublayer:l]; MSLogf(@"CET overlay: layer on the game view (%.0fx%.0f pt)", h.bounds.size.width, h.bounds.size.height); }
+    l.zPosition = 1000; l.frame = h.bounds;
+    [CATransaction commit];
+}
+__attribute__((visibility("default"))) int MSRegisterOverlayLayer(void *layer) {
+    CAMetalLayer *l = (__bridge CAMetalLayer *)layer, *old = g_overlayLayer;
+    g_overlayLayer = l;                              /* exempt from pacing before its first nextDrawable */
+    dispatch_block_t b = ^{ if (old && old != l) [old removeFromSuperlayer]; MSOverlayAttach(); };
+    if (NSThread.isMainThread) b(); else MSMainAsync(b);
+    return 1;
+}
+__attribute__((visibility("default"))) void MSOverlaySetToggleHandler(void (*fn)(void)) {
+    g_ovToggle = fn; MSLogf(@"CET overlay: touch button %@", fn ? @"on" : @"off");
+}
+__attribute__((visibility("default"))) void MSOverlaySetCapture(int on) {
+    if (g_ovCapture == (on != 0)) return;
+    g_ovCapture = on != 0; MSLogf(@"CET overlay: %@", on ? @"open - touches, mouse and keys go to it" : @"closed");
+}
+__attribute__((visibility("default"))) void MSOverlayShowKeyboard(int show) {
+    MSMainAsync(^{ UIView *k = g_ovKeyInput; if (!k) return; if (show) [k becomeFirstResponder]; else [k resignFirstResponder]; });
+}
+/* ================================================================ CET overlay: end */
 @implementation MSHostView
 - (instancetype)initWithFrame:(CGRect)f {
     self = [super initWithFrame:f]; if (!self) return nil;
@@ -683,7 +732,7 @@ static CGPoint MSTouchIn(UITouch *t, UIView *host) {
     pan.allowedScrollTypesMask = UIScrollTypeMaskAll; pan.allowedTouchTypes = @[]; pan.minimumNumberOfTouches = 0; [self addGestureRecognizer:pan];
     return self;
 }
-- (void)layoutSubviews { [super layoutSubviews]; [self.owner msLayoutFromHost]; }
+- (void)layoutSubviews { [super layoutSubviews]; [self.owner msLayoutFromHost]; MSOverlayAttach(); /* CET overlay */ }
 - (UIPointerStyle *)pointerInteraction:(UIPointerInteraction *)i styleForRegion:(UIPointerRegion *)r { return g_cursorHidden ? [UIPointerStyle hiddenPointerStyle] : nil; }
 
 - (NSEvent *)msEvent:(NSUInteger)type at:(CGPoint)p {
@@ -764,13 +813,13 @@ static void MSLeftPress(int by, BOOL down) {
        keyboard + mouse - prompts changed and the pad seemed to stop working. Menus still take taps.
        TouchWithController = YES brings the old behaviour back. */
     static int touchPad = -1; if (touchPad < 0) touchPad = MSCfgD(@"TouchWithController", 0) != 0;
-    if (ph == 0 && g_realPad && g_pointerLocked && !touchPad) {
+    if (ph == 0 && g_realPad && g_pointerLocked && !touchPad && !g_ovCapture /* CET overlay */) {
         static int n; if (n++ < 3) MSLogf(@"touch: ignored in gameplay while a controller is connected");
         return;
     }
     if (ph == 0) {
         g_fBeganAt = CACurrentMediaTime();
-        MSOpenMouseGate();
+        if (!g_ovCapture /* CET overlay: the game's mouse state stays as it is */) MSOpenMouseGate();
         if (!g_fEntered) { g_fEntered = YES; MSDispatch([self msEvent:MSEnter at:p]); }     /* the game tracks "cursor in view" */
         if (g_fTouch) { if (g_fMode == 0) g_fFingers = 2; return; }                         /* second finger: right click on release */
         g_fTouch = t; g_fStart = g_fLast = p; g_fMode = 0; g_fFingers = 1; unsigned gen = ++g_fGen;
@@ -1331,13 +1380,94 @@ static void MSAnnounceEarlyPads(void);
 @end
 
 /* ---------------------------------------------------------------- keyboard -> NSEvent */
-static void MSKey(GCKeyCode code, BOOL pressed) {
+static void MSKeyEvent(GCKeyCode code, BOOL pressed, NSString *chars, BOOL typed) {
     NSNumber *mk = MSKeyMap()[@((NSInteger)code)]; if (!mk) return; unsigned short mac = mk.unsignedShortValue;
     NSUInteger f = MSFlagForMac(mac); NSEvent *e = [NSEvent new]; e.keyCode = mac; e.timestamp = CACurrentMediaTime(); e.locationInWindow = g_mouse;
+    if (chars) e.characters = e.charactersIgnoringModifiers = chars;
+    e.msTyped = typed;
     if (f) { if (pressed) g_modFlags |= f; else g_modFlags &= ~f; e.type = MSFlagsChanged; }
     else   { e.type = pressed ? MSKeyDown : MSKeyUp; }
     e.modifierFlags = g_modFlags; MSDispatch(e);
 }
+static void MSKey(GCKeyCode code, BOOL pressed) { MSKeyEvent(code, pressed, nil, NO); }
+static void MSKeyChars(GCKeyCode code, BOOL pressed, NSString *chars) { MSKeyEvent(code, pressed, chars, YES); }   /* ⌨ only */
+static void MSTypedKey(GCKeyCode code, BOOL pressed) { MSKeyEvent(code, pressed, nil, YES); }
+/* Codeware asks whether Shift is down when it turns a key into text (its WidgetInputService). */
+__attribute__((visibility("default"))) int MSKeyboardShiftDown(void) { return (g_modFlags & (1u << 17)) != 0; }   /* NSEventModifierFlagShift */
+/* The ⌨ touch button's iPhone keyboard: every typed character becomes the key press a US keyboard would make (Shift
+   held for capitals and shifted symbols), so the game's and the mods' text fields get it like a hardware keyboard. */
+static void MSTypeChar(unichar ch) {
+    static const char *plain = "abcdefghijklmnopqrstuvwxyz1234567890", *shiftSym = "!@#$%^&*()";
+    static const char sym[] = "-=[]\\;'`,./", symShift[] = "_+{}|:\"~<>?";   /* 11 keys each, HID 45..56 without 50 */
+    static const int symHid[] = { 45, 46, 47, 48, 49, 51, 52, 53, 54, 55, 56 };
+    NSInteger hid = 0; BOOL shift = NO;
+    /* the iPhone keyboard types typographic quotes and dashes even with smart punctuation off in some layouts:
+       code (CET console, Lua) needs the plain ones */
+    switch (ch) { case 0x2018: case 0x2019: case 0x201B: case 0x2032: ch = '\''; break;
+                  case 0x201C: case 0x201D: case 0x201F: case 0x2033: ch = '"'; break;
+                  case 0x2013: case 0x2014: ch = '-'; break; case 0x2026: MSTypeChar('.'); MSTypeChar('.'); ch = '.'; break;
+                  case 0x00A0: ch = ' '; break; default: break; }
+    if (ch >= 'A' && ch <= 'Z') { shift = YES; ch = ch - 'A' + 'a'; }
+    const char *q = ch < 128 ? strchr(plain, (int)ch) : NULL;
+    if (q && ch) { long i = q - plain; hid = i < 26 ? 4 + i : 30 + (i - 26); }
+    else if (ch < 128 && ch && (q = strchr(shiftSym, (int)ch))) { hid = 30 + (q - shiftSym); shift = YES; }
+    else if (ch == ' ') hid = 44;
+    else if (ch == '\n') hid = 40;
+    else if (ch == '\t') hid = 43;
+    else for (int i = 0; i < 11 && !hid; i++) { if (ch == (unichar)sym[i]) hid = symHid[i]; else if (ch == (unichar)symShift[i]) { hid = symHid[i]; shift = YES; } }
+    if (!hid) return;                                             /* not on a US keyboard (accents, emoji): skipped */
+    NSString *chars = ch == '\n' ? @"\r" : [NSString stringWithCharacters:&ch length:1];
+    if (shift) { MSTypedKey((GCKeyCode)225, YES); chars = chars.uppercaseString; }   /* Left Shift */
+    MSKeyChars((GCKeyCode)hid, YES, chars); MSKeyChars((GCKeyCode)hid, NO, chars);
+    if (shift) MSTypedKey((GCKeyCode)225, NO);
+}
+@interface MSKeyInput : UIView <UIKeyInput>
+@property(nonatomic) UITextAutocorrectionType autocorrectionType; @property(nonatomic) UITextAutocapitalizationType autocapitalizationType;
+@property(nonatomic) UITextSpellCheckingType spellCheckingType; @property(nonatomic) UIKeyboardType keyboardType;
+@property(nonatomic) UITextSmartQuotesType smartQuotesType; @property(nonatomic) UITextSmartDashesType smartDashesType;
+@end
+@implementation MSKeyInput
+- (instancetype)initWithFrame:(CGRect)f {
+    self = [super initWithFrame:f]; self.userInteractionEnabled = NO; self.alpha = 0.01;
+    _autocorrectionType = UITextAutocorrectionTypeNo; _autocapitalizationType = UITextAutocapitalizationTypeNone;
+    _spellCheckingType = UITextSpellCheckingTypeNo; _keyboardType = UIKeyboardTypeASCIICapable;
+    _smartQuotesType = UITextSmartQuotesTypeNo; _smartDashesType = UITextSmartDashesTypeNo;
+    return self;
+}
+- (BOOL)canBecomeFirstResponder { return YES; }
+/* a row above the iPhone keyboard with the keys it lacks: Esc, Tab, F1-F12 (mods' hotkeys, e.g. F2/F3) */
+- (UIView *)inputAccessoryView {
+    static UIScrollView *bar; if (bar) return bar;
+    bar = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 0, 320, 44)];
+    bar.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.95]; bar.showsHorizontalScrollIndicator = NO;
+    NSArray *keys = @[ @"Paste", @"Esc", @"Tab", @"F1", @"F2", @"F3", @"F4", @"F5", @"F6", @"F7", @"F8", @"F9", @"F10", @"F11", @"F12" ];
+    CGFloat x = 6;
+    for (NSUInteger i = 0; i < keys.count; i++) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+        [b setTitle:keys[i] forState:UIControlStateNormal]; b.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+        [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        b.backgroundColor = [UIColor colorWithWhite:1 alpha:0.15]; b.layer.cornerRadius = 6;
+        CGFloat w = i == 0 ? 64 : 50; b.frame = CGRectMake(x, 6, w, 32); x += w + 6;
+        b.tag = i == 0 ? -1 : i == 1 ? 41 : i == 2 ? 43 : 58 + (NSInteger)(i - 3);   /* Paste; HID: Escape, Tab, F1..F12 */
+        [b addTarget:self action:@selector(msAccessoryKey:) forControlEvents:UIControlEventTouchUpInside];
+        [bar addSubview:b];
+    }
+    bar.contentSize = CGSizeMake(x, 44);
+    return bar;
+}
+- (void)msAccessoryKey:(UIButton *)b {
+    if (b.tag == -1) {                                   /* Paste: types the iPhone clipboard's text (first 4000 characters) */
+        NSString *t = UIPasteboard.generalPasteboard.string ?: @"";
+        if (t.length > 4000) t = [t substringToIndex:4000];
+        MSLogf(@"touch pad: pasting %lu characters", (unsigned long)t.length);
+        [self insertText:t]; return;
+    }
+    MSTypedKey((GCKeyCode)b.tag, YES); MSTypedKey((GCKeyCode)b.tag, NO);
+}
+- (BOOL)hasText { return YES; }                                   /* so Backspace always reaches the game */
+- (void)insertText:(NSString *)t { for (NSUInteger i = 0; i < t.length; i++) MSTypeChar([t characterAtIndex:i]); }
+- (void)deleteBackward { MSKeyChars((GCKeyCode)42, YES, @"\b"); MSKeyChars((GCKeyCode)42, NO, @"\b"); }   /* Backspace */
+@end
 static void MSAttachKeyboard(GCKeyboard *kb) {
     kb.keyboardInput.keyChangedHandler = ^(GCKeyboardInput *k, GCControllerButtonInput *b, GCKeyCode code, BOOL pressed) { MSKey(code, pressed); };
 }
@@ -1348,7 +1478,7 @@ static void MSAttachKeyboard(GCKeyboard *kb) {
    connected, UIKit pointer events (iPad) are ignored so nothing arrives twice. */
 static os_unfair_lock g_gcmLock = OS_UNFAIR_LOCK_INIT;
 static CGPoint MSGCMouseAt(MSHostView *h) {
-    if (g_pointerLocked) return CGPointMake(h.bounds.size.width / 2, h.bounds.size.height / 2);
+    if (g_pointerLocked && !g_ovCapture /* CET overlay: the mouse points at its windows */) return CGPointMake(h.bounds.size.width / 2, h.bounds.size.height / 2);
     if (!g_gcmCursorSet) { g_gcmCursor = CGPointMake(h.bounds.size.width / 2, h.bounds.size.height / 2); g_gcmCursorSet = YES; }
     return g_gcmCursor;
 }
@@ -1463,7 +1593,7 @@ static _Atomic long long g_padOnlyDropped;
 static BOOL MSIsKBMEvent(NSUInteger t) { return (t >= MSLDown && t <= MSFlagsChanged) || t == MSScroll || (t >= MSODown && t <= MSODrag); }
 static void MSDispatch(NSEvent *e) {
     if (!MSOnGameThread()) { MSGameAsync(^{ MSDispatch(e); }); return; }    /* touch / mouse / keys come from the main thread */
-    if (MSIsKBMEvent(e.type) && MSPadOnly()) {
+    if (MSIsKBMEvent(e.type) && MSPadOnly() && !e.msTyped && !g_ovCapture /* CET overlay */) {
         if (g_padOnlyDropped++ < 3) MSLogf(@"controller only: event type %lu not sent to the game (a controller is connected)", (unsigned long)e.type);
         return;
     }
@@ -1570,7 +1700,7 @@ static NSString *MSGB(uint64_t b) { return [NSString stringWithFormat:@"%.1f GB"
     [_storeBtn setTitle:@"Download from Steam, GOG or Epic…" forState:UIControlStateNormal];
     [_storeBtn addTarget:self action:@selector(storeTapped) forControlEvents:UIControlEventTouchUpInside];
     _storeBtn.hidden = NSClassFromString(@"MSStoreUI") == nil;
-    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[ title, _info, _storeBtn, _importBtn, _bar, _status ]];   /* no "play from SSD": import only */
+    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[ title, _info, _storeBtn, _importBtn, _ssdBtn, _bar, _status ]];   /* "play from SSD" back (local build) */
     st.axis = UILayoutConstraintAxisVertical; st.spacing = 20; st.translatesAutoresizingMaskIntoConstraints = NO; [self.view addSubview:st];
     [NSLayoutConstraint activateConstraints:@[
         [st.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor], [st.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
@@ -1582,6 +1712,7 @@ static NSString *MSGB(uint64_t b) { return [NSString stringWithFormat:@"%.1f GB"
           @"It is copied to this iPhone (about 61 GB). Keep the app open while it copies.\n\n"
           @"You can also copy the \"Cyberpunk 2077\" folder yourself with the Files app into On My iPhone > this app.";
     [_importBtn setTitle:resume ? @"Continue import" : @"Import game…" forState:UIControlStateNormal];
+    _ssdBtn.hidden = resume;
 }
 - (void)importTapped {
     if (_copying) return;
@@ -3140,6 +3271,13 @@ static char *MSCaseFix(const char *path) {
         return res ? strdup(res.fileSystemRepresentation) : NULL;
     }
 }
+/* For plugins (ArchiveXL): the engine builds paths like archive/mac/mod, the folder is archive/Mac/mod, and iOS
+ * file names are case-sensitive. Writes the existing spelling of path to out (or path itself when nothing differs). */
+__attribute__((visibility("default"))) int MSResolvePathCase(const char *path, char *out, size_t cap) {
+    char *f = MSCaseFix(path); const char *r = f ? f : path;
+    size_t n = strlen(r); int ok = n < cap; if (ok) memcpy(out, r, n + 1);
+    free(f); return ok ? 0 : -1;
+}
 /* path-length audit: REDengine comes from Windows (260-char paths); iOS container paths are ~80 chars longer than
    macOS home paths. Logs every new longest path and anything over 200 chars (first 40). */
 static _Atomic size_t g_maxPath;
@@ -3778,7 +3916,7 @@ static void MSSmoothFrame(double tOut) {                 /* render thread, after
     if (step != was || (step >= cap) != (g_paceT <= 0)) MSPaceSet(step >= cap ? 0 : step, why ?: @"smooth pacing");
 }
 static id ms_nextDrawable(id self, SEL _cmd) {
-    if (self == g_mirrorLayer) return ((id (*)(id, SEL))g_origNextDrawable)(self, _cmd);
+    if (self == g_mirrorLayer || self == g_overlayLayer /* CET overlay */) return ((id (*)(id, SEL))g_origNextDrawable)(self, _cmd);
     MSPaceWait(); g_frames++;
     MSLowLatencyLayer(self);
     if (g_mirrorOn && [(CAMetalLayer *)self framebufferOnly]) [(CAMetalLayer *)self setFramebufferOnly:NO];  /* the mirror copies from it */
@@ -3886,8 +4024,19 @@ static NSString *ms_productCategory(GCController *self, SEL _cmd) {
     if (self == g_vpad) return GCProductCategoryXboxOne;
     NSString *c = ((NSString *(*)(id, SEL))g_origCategory)(self, _cmd);
     static int spoof = -1; if (spoof < 0) spoof = MSCfgD(@"RealPadCategory", 1) != 0;
-    if (!spoof || self.isSnapshot || !self.extendedGamepad || [c isEqualToString:GCProductCategoryXboxOne] ||
-        [c isEqualToString:GCProductCategoryDualShock4] || [c isEqualToString:GCProductCategoryDualSense]) return c;
+    if (!spoof || self.isSnapshot || !self.extendedGamepad || [c isEqualToString:GCProductCategoryXboxOne]) return c;
+    if ([c isEqualToString:GCProductCategoryDualShock4] || [c isEqualToString:GCProductCategoryDualSense]) {
+        /* Third-party pads that present themselves as a DualSense / DualShock 4 (GameSir X3 Pro: "GameSir-X3 Pro",
+         * DualSense) make the game send DualSense haptics - a stream of fine updates their plain rumble motors turn
+         * into constant erratic buzzing - and show PlayStation glyphs. Only a real Sony pad keeps its category.
+         * FakeSonyAsXbox = NO leaves such pads as they report themselves. */
+        static int fake = -1; if (fake < 0) fake = MSCfgD(@"FakeSonyAsXbox", 1) != 0;
+        NSString *v = self.vendorName ?: @"";
+        BOOL sony = !v.length || [v isEqualToString:@"Wireless Controller"];
+        for (NSString *k in @[@"DualSense", @"DUALSHOCK", @"Sony"])
+            if ([v rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) sony = YES;
+        if (!fake || sony) return c;
+    }
     static NSString *said; if (![said isEqualToString:c]) { said = c; MSLogf(@"controller: '%@' (%@) is shown to the game as an Xbox controller", self.vendorName, c); }
     return GCProductCategoryXboxOne;
 }
@@ -4409,7 +4558,7 @@ static void MSAnnounceEarlyPads(void) {
         MSLogf(@"controller: told the game about %@ at start (it was connected before the game started)", c.vendorName);
     }
 }
-typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* Edit: ✎ opens the layout editor; Tool: − + ↺ ✓ in it */
+typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool, MSCtlKeyboard, MSCtlOverlay /* "CET": opens CET's overlay */ } MSCtlKind;   /* Edit: ✎ opens the layout editor; Tool: − + ↺ ✓ in it */
 @interface MSCtl : NSObject
 @property MSCtlKind kind; @property CGPoint center; @property CGFloat r; @property(copy) NSString *label;
 @property(weak) GCControllerButtonInput *button; @property int dpadX, dpadY; @property NSInteger key; @property(strong) CAShapeLayer *shape; @property(strong) CATextLayer *text;
@@ -4419,7 +4568,7 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
 
 @interface MSPadView : UIView @end
 @implementation MSPadView {
-    NSMutableArray<MSCtl *> *_ctls; BOOL _hiddenByUser, _shown; CADisplayLink *_link; CGSize _laidOut;
+    NSMutableArray<MSCtl *> *_ctls; BOOL _hiddenByUser, _shown; CADisplayLink *_link; CGSize _laidOut; MSKeyInput *_keyInput;
     UITouch *_moveTouch, *_lookTouch; CGPoint _moveOrigin, _lookLast; CGVector _lookAccum; double _lookT, _lookMoved; float _lookX, _lookY;
     CAShapeLayer *_stickBase, *_stickKnob; float _lookSpeed;
     CGPoint _lHome, _rHome; UITouch *_rTouch; CAShapeLayer *_rBase, *_rKnob; int _wasd;
@@ -4427,6 +4576,15 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
     NSMapTable<UITouch *, MSCtl *> *_faceOf; CGPoint _faceC; CGFloat _faceGap, _faceR;   /* A/B/X/Y as one control */
     CGPoint _lookC; UIImpactFeedbackGenerator *_tap; BOOL _tapOn;
     BOOL _editing, _force, _selStick; MSCtl *_sel; UITouch *_dragT; CGPoint _dragOff;   /* touch layout editor */
+    BOOL _ovOnly; int _ovState;      /* CET overlay: only "CET" (and the keyboard button while it is open) on screen */
+}
+/* CET overlay: is this control off the screen? "CET" exists once CET asked for it (MSOverlaySetToggleHandler). While
+   the overlay is open, or the pad is hidden for a controller or mouse, only "CET" is left - plus the keyboard button
+   while the overlay is open. */
+- (BOOL)msCtlHidden:(MSCtl *)c {
+    if (c.kind == MSCtlOverlay && !g_ovToggle) return YES;
+    if (_ovOnly) return !(c.kind == MSCtlOverlay || (c.kind == MSCtlKeyboard && g_ovCapture));
+    return c.kind == MSCtlTool ? !_editing : (c.kind != MSCtlToggle && _hiddenByUser);
 }
 /* a short tap on each press, like DK Bananza's pad (start screen "Touch vibration", CyPortTouchHaptics) */
 - (void)msFeel { if (!_tapOn) return; [_tap impactOccurredWithIntensity:0.6]; [_tap prepare]; }
@@ -4486,6 +4644,9 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
     }
     MSCtl *t = [MSCtl new]; t.kind = MSCtlToggle; t.label = @"🎮"; [_ctls addObject:t];
     MSCtl *ed = [MSCtl new]; ed.kind = MSCtlEdit; ed.label = @"✎"; [_ctls addObject:ed];
+    MSCtl *kb = [MSCtl new]; kb.kind = MSCtlKeyboard; kb.label = @"⌨"; [_ctls addObject:kb];
+    _keyInput = [[MSKeyInput alloc] initWithFrame:CGRectMake(0, 0, 1, 1)]; [self addSubview:_keyInput];
+    { MSCtl *ov = [MSCtl new]; ov.kind = MSCtlOverlay; ov.label = @"CET"; [_ctls addObject:ov]; g_ovKeyInput = _keyInput; }   /* CET overlay */
     for (NSString *l in @[ @"−", @"+", @"↺", @"✓" ]) { MSCtl *x = [MSCtl new]; x.kind = MSCtlTool; x.label = l; [_ctls addObject:x]; }
     for (MSCtl *c in _ctls) {
         c.shape = [CAShapeLayer layer]; c.shape.lineWidth = 1.5; [self.layer addSublayer:c.shape];
@@ -4555,6 +4716,8 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
     {   /* the layout editor's own buttons, then the player's saved layout for this screen size (✎ editor) */
         NSMutableDictionary *m = [pos mutableCopy]; CGFloat top = MAX(self.safeAreaInsets.top, 8);
         m[@"✎"] = @[ @(S.width / 2), @(top + 58), @15 ];
+        m[@"⌨"] = @[ @(S.width / 2 + 45), @(top + 58), @15 ];
+        m[@"CET"] = @[ @(S.width / 2 - 45), @(top + 58), @15 ];          /* CET overlay */
         NSArray *tools = @[ @"−", @"+", @"↺", @"✓" ];
         for (NSUInteger i = 0; i < tools.count; i++) m[tools[i]] = @[ @(S.width / 2 - 105 + 70 * (double)i), @(S.height / 2), @24 ];
         NSDictionary *saved = [NSUserDefaults.standardUserDefaults dictionaryForKey:[self msLayoutKey]];
@@ -4649,11 +4812,11 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
 - (void)msDrawStick:(CAShapeLayer *)b knob:(CAShapeLayer *)k at:(CGPoint)p offset:(CGPoint)o r:(CGFloat)r {
     b.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(p.x - r, p.y - r, 2 * r, 2 * r)].CGPath;
     CGFloat kr = r * 0.4; k.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(p.x + o.x - kr, p.y + o.y - kr, 2 * kr, 2 * kr)].CGPath;
-    b.hidden = k.hidden = _hiddenByUser;
+    b.hidden = k.hidden = _hiddenByUser || _ovOnly;
 }
 - (BOOL)msNear:(CGPoint)p to:(CGPoint)c r:(CGFloat)r { CGFloat dx = p.x - c.x, dy = p.y - c.y; return dx * dx + dy * dy <= r * r; }
 - (void)msPaint:(MSCtl *)c {
-    BOOL on = c.touch != nil, hide = c.kind == MSCtlTool ? !_editing : (c.kind != MSCtlToggle && _hiddenByUser);
+    BOOL on = c.touch != nil, hide = [self msCtlHidden:c];
     c.shape.hidden = c.text.hidden = hide;
     c.shape.fillColor = [UIColor colorWithWhite:1 alpha:on ? 0.45 : c.kind == MSCtlTool ? 0.3 : 0.12].CGColor;
     c.shape.strokeColor = (c == _sel ? [UIColor colorWithRed:0.99 green:0.93 blue:0.04 alpha:1] : [UIColor colorWithWhite:1 alpha:_editing ? 0.8 : 0.4]).CGColor;
@@ -4662,7 +4825,8 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
 }
 - (MSCtl *)msCtlAt:(CGPoint)p {
     for (MSCtl *c in _ctls) {
-        if (_hiddenByUser && c.kind != MSCtlToggle) continue;
+        if ([self msCtlHidden:c]) continue;                         /* CET overlay */
+        if (_hiddenByUser && c.kind != MSCtlToggle && !_ovOnly) continue;
         if (c.kind == MSCtlTool && !_editing) continue;
         if (_editing && c.kind == MSCtlToggle) continue;             /* no hiding the pad while editing it */
         CGFloat dx = p.x - c.center.x, dy = p.y - c.center.y, r = c.r + 8;
@@ -4673,6 +4837,7 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
 /* empty screen: in gameplay it's ours (stick / camera); in menus it falls through to the game as a mouse click */
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
     if (self.hidden) return nil;
+    if (_ovOnly) return [self msCtlAt:p] ? self : nil;          /* CET overlay: everything else goes to the game view */
     if (_editing) return self;                                  /* the editor gets every touch; the game none */
     if ([self msCtlAt:p] || [self msInFace:p]) return self;
     if (_hiddenByUser) return nil;
@@ -4710,6 +4875,13 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
     for (UITouch *t in ts) {
         CGPoint p = [t locationInView:self]; MSCtl *c = [self msCtlAt:p];
         if (c.kind == MSCtlEdit) { [self msFeel]; [self msSetEditing:YES]; return; }
+        if (c.kind == MSCtlOverlay) { [self msFeel]; void (*fn)(void) = g_ovToggle; if (fn) fn(); continue; }   /* CET overlay */
+        if (c.kind == MSCtlKeyboard) {
+            [self msFeel];
+            if (_keyInput.isFirstResponder) [_keyInput resignFirstResponder]; else [_keyInput becomeFirstResponder];
+            MSLogf(@"touch pad: iPhone keyboard %@", _keyInput.isFirstResponder ? @"shown" : @"hidden");
+            continue;
+        }
         if (c && c.kind == MSCtlToggle) {
             _hiddenByUser = !_hiddenByUser; [CATransaction begin]; [CATransaction setDisableActions:YES];
             for (MSCtl *x in _ctls) [self msPaint:x];
@@ -4817,6 +4989,18 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
 - (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self touchesEnded:ts withEvent:e]; }
 - (void)msTick:(CADisplayLink *)l {
     BOOL want = g_frames > 60 && !(g_vpad ? g_realPad : MSRealControllerConnected()) && !g_gcmCount;
+    {   /* CET overlay: its button stays when the pad is hidden; the pad's controls go while the overlay is open */
+        BOOL only = g_ovToggle && (g_ovCapture || !want); int st = (g_ovToggle ? 1 : 0) | (only ? 2 : 0) | (g_ovCapture ? 4 : 0);
+        if (st != _ovState) {
+            if (only != _ovOnly) { if (_editing) [self msSetEditing:NO]; [self msReleaseAll]; }
+            _ovOnly = only; _ovState = st;
+            [CATransaction begin]; [CATransaction setDisableActions:YES];
+            for (MSCtl *x in _ctls) [self msPaint:x];
+            _stickBase.hidden = _stickKnob.hidden = _hiddenByUser || _ovOnly; if (_ovOnly) _rBase.hidden = _rKnob.hidden = YES;
+            [CATransaction commit];
+        }
+        want = want || only;
+    }
     if (want != _shown) { _shown = want; self.hidden = !want; if (want) MSLogf(@"touch controls shown"); else { if (_editing) [self msSetEditing:NO]; [self msReleaseAll]; } }
     if (!want) return;
     [self msLayout];
@@ -5459,6 +5643,7 @@ static void MSShownWatch(id<MTLDrawable> d) {
     }];
 }
 static void ms_cbPresentMin(id self, SEL c, id d, CFTimeInterval t) {   /* the game's VSync setting uses this one */
+    if (MSIsOverlayDrawable(d)) { ((void (*)(id, SEL, id, CFTimeInterval))g_oCBPresentMin)(self, c, d, t); return; }   /* CET overlay */
     g_gameMinDur = t; t = MSCapMargin(t); MSLowLatencyTrack(self);
     if (d) objc_setAssociatedObject(d, &g_capKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     MSShownWatch(d);
@@ -5467,6 +5652,7 @@ static void ms_cbPresentMin(id self, SEL c, id d, CFTimeInterval t) {   /* the g
     ((void (*)(id, SEL, id, CFTimeInterval))g_oCBPresentMin)(self, c, d, T > 0 ? MAX(t, T - 0.002) : t);
 }
 static void ms_drPresentMin(id self, SEL c, CFTimeInterval t) {
+    if (MSIsOverlayDrawable(self)) { ((void (*)(id, SEL, CFTimeInterval))g_oDrPresentMin)(self, c, t); return; }   /* CET overlay */
     if (objc_getAssociatedObject(self, &g_capKey)) { ((void (*)(id, SEL, CFTimeInterval))g_oDrPresentMin)(self, c, t); return; }
     g_gameMinDur = t; t = MSCapMargin(t); MSShownWatch(self);
     double T = g_paceT; ((void (*)(id, SEL, CFTimeInterval))g_oDrPresentMin)(self, c, T > 0 ? MAX(t, T - 0.002) : t);
@@ -5480,6 +5666,7 @@ static CFTimeInterval MSUncappedDur(void) {
     return dur;
 }
 static void ms_cbPresent(id self, SEL c, id d) {                /* -[MTLCommandBuffer presentDrawable:] */
+    if (MSIsOverlayDrawable(d)) { ((void (*)(id, SEL, id))g_oCBPresent)(self, c, d); return; }   /* CET overlay */
     g_gameMinDur = 0; MSLowLatencyTrack(self);
     if (d) objc_setAssociatedObject(d, &g_capKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     MSShownWatch(d);
@@ -5490,6 +5677,7 @@ static void ms_cbPresent(id self, SEL c, id d) {                /* -[MTLCommandB
     else ((void (*)(id, SEL, id))g_oCBPresent)(self, c, d);
 }
 static void ms_drPresent(id self, SEL c) {                      /* -[CAMetalDrawable present] */
+    if (MSIsOverlayDrawable(self)) { ((void (*)(id, SEL))g_oDrPresent)(self, c); return; }   /* CET overlay */
     if (objc_getAssociatedObject(self, &g_capKey)) { ((void (*)(id, SEL))g_oDrPresent)(self, c); return; }
     g_gameMinDur = 0; MSShownWatch(self);
     double T = g_paceT; static int said; if (!said++) MSLogf(@"frame pacing: game presents with [drawable present]");
@@ -6155,6 +6343,92 @@ static void MSInstallFreeHook(void) {
            g_qMode ? [NSString stringWithFormat:@"quarantine %.0f MB / %zu blocks, blocks up to %zu KB%@", g_qMaxBytes / 1048576.0, g_qCap, g_qMaxBlock >> 10, g_qMode == 2 ? @", pattern check ON" : @""] : @"pass-through");
 }
 
+/* ---------------------------------------------------------------- baked hooks (RED4ext groundwork)
+ * tools/ios_retarget.py (patch_baked_hooks) turns the first three instructions of each kMSBakedHooks entry into
+ * adrp/ldr/br through slot i at __DATA end - MS_BH_SLOTS_FROM_END + 8*i (sites: tools/baked_sites.py). Every patched slot MUST be filled before the game runs (an
+ * empty one jumps to 0): with the hook, or with ms_bh_orig_i, which replays the three original instructions and
+ * continues at entry+12. BakedHooks = NO in macshim.plist keeps them all pass-through. Same order as BAKED_HOOKS. */
+#include "BakedSites.inc"
+static _Atomic int g_bhCalls[MS_BH_COUNT];
+
+static BOOL MSInGameText(const void *p) { Dl_info di; return p && dladdr(p, &di) && di.dli_fbase == (void *)MSGameHeader(); }
+
+/* On the Mac build this entry is not RED4ext's LoadScripts(engine, CString path, ...): it takes (x0, kind) and picks
+ * the blob name itself (kind 0 master; else by ror(kind,1): 1 profiling, 8 final_noopts, otherwise final). Logged as seen, all argument
+ * registers passed through untouched (x8 is scratch at its entry, so there is no struct return to keep). */
+static uint64_t ms_bh_LoadScripts(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
+    int n = ++g_bhCalls[MS_BH_LOADSCRIPTS]; uint32_t k = (uint32_t)a1, r1 = (k >> 1) | (k << 31);
+    const char *blob = !k ? "master" : r1 == 8 ? "final_noopts" : r1 == 1 ? "profiling" : "final";
+    MSLogf(@"baked hook scripts #%d: kind %#x -> %s.redscripts", n, k, blob);
+    uint64_t r = ((uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t))ms_bh_orig_0)(a0, a1, a2, a3, a4, a5, a6, a7);
+    MSLogf(@"baked hook scripts #%d -> %#llx", n, (unsigned long long)r);
+    return r;
+}
+static bool ms_bh_AddState(void *app, void *state) {
+    int n = ++g_bhCalls[MS_BH_ADDSTATE];
+    const char *name = NULL; const void *const *vt = state ? *(const void *const *const *)state : NULL;
+    /* IGameState: virtual ~IGameState (two Itanium slots), GetName, GetType, ... -> GetName is vtable[2] */
+    if (vt && MSInGameText(vt[2])) name = ((const char *(*)(void *))vt[2])(state);
+    MSLogf(@"baked hook AddState #%d: state %s (vtable %#lx)", n, name ? name : "?", vt ? (unsigned long)((uintptr_t)vt - MSGameSlide()) : 0UL);
+    return ((bool (*)(void *, void *))ms_bh_orig_1)(app, state);
+}
+static const void *const kMSBakedHook[MS_BH_COUNT] = { [MS_BH_LOADSCRIPTS] = (const void *)ms_bh_LoadScripts, [MS_BH_ADDSTATE] = (const void *)ms_bh_AddState };
+static uintptr_t g_bhSlot[MS_BH_COUNT];                        /* slot address, 0 when the site is not baked */
+static void *g_bhPrev[MS_BH_COUNT][8], *g_bhDet[MS_BH_COUNT][8]; static int g_bhDepth[MS_BH_COUNT];
+static os_unfair_lock g_bhLock = OS_UNFAIR_LOCK_INIT;
+
+/* C API for RED4ext's iOS hook backend (Platform/BakedHook.cpp): hooking a baked site is a pointer write. The new
+ * detour goes in front; *original gets what was there (an earlier detour, or the pass-through trampoline). */
+__attribute__((visibility("default"))) int MSBakedHookAttach(void *target, void *detour, void **original) {
+    for (int i = 0; i < MS_BH_COUNT; i++) {
+        if (!g_bhSlot[i] || kMSBakedHooks[i].entry + MSGameSlide() != (uintptr_t)target) continue;
+        os_unfair_lock_lock(&g_bhLock);
+        int d = g_bhDepth[i]; void *prev = *(void *volatile *)g_bhSlot[i];
+        if (d < 8) { g_bhPrev[i][d] = prev; g_bhDet[i][d] = detour; g_bhDepth[i] = d + 1; *original = prev; *(void *volatile *)g_bhSlot[i] = detour; }
+        os_unfair_lock_unlock(&g_bhLock);
+        MSLogf(@"baked hook %s: detour %@ attached%@", kMSBakedHooks[i].name, MSCallerStr(detour), d < 8 ? @"" : @" FAILED (8 already)");
+        return d < 8 ? 0 : -1;
+    }
+    MSLogf(@"baked hook: %#lx is not a baked site (asked from %@)", (unsigned long)((uintptr_t)target - MSGameSlide()), MSCallerStr(__builtin_return_address(0)));
+    return -1;
+}
+__attribute__((visibility("default"))) int MSBakedHookDetach(void *target, void *detour) {
+    for (int i = 0; i < MS_BH_COUNT; i++) {
+        if (!g_bhSlot[i] || kMSBakedHooks[i].entry + MSGameSlide() != (uintptr_t)target) continue;
+        int rc = -1; os_unfair_lock_lock(&g_bhLock);
+        int d = g_bhDepth[i];
+        if (d && g_bhDet[i][d - 1] == detour) { *(void *volatile *)g_bhSlot[i] = g_bhPrev[i][d - 1]; g_bhDepth[i] = d - 1; rc = 0; }
+        os_unfair_lock_unlock(&g_bhLock);
+        if (rc) MSLogf(@"baked hook %s: detach of %@ refused (depth %d, newest %@)", kMSBakedHooks[i].name, MSCallerStr(detour), d,
+                       d ? MSCallerStr(g_bhDet[i][d - 1]) : @"none");
+        return rc;                                               /* only the newest detour can come off */
+    }
+    MSLogf(@"baked hook: detach at %#lx, not a baked site (asked from %@)", (unsigned long)((uintptr_t)target - MSGameSlide()), MSCallerStr(__builtin_return_address(0)));
+    return -1;
+}
+/* RED4ext asks where the game is (its root = 4 folders up from this). */
+__attribute__((visibility("default"))) int MSGameExecutablePath(char *buf, uint32_t *size) { return ms_NSGetExecutablePath(buf, size); }
+
+static void MSInstallBakedHooks(void) {
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)MSGameHeader(); intptr_t slide = MSGameSlide();
+    if (!mh) return;
+    uintptr_t base = 0; const struct load_command *lc = (const void *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const void *)((const char *)lc + lc->cmdsize))
+        if (lc->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)lc)->segname, "__DATA"))
+            base = ((const struct segment_command_64 *)lc)->vmaddr + ((const struct segment_command_64 *)lc)->vmsize - MS_BH_SLOTS_FROM_END + slide;
+    if (!base) return;
+    for (int k = 0; k < MS_BH_AUX_COUNT; k++) g_bhAux[k] = kMSBakedAuxUnslid[k] + slide;
+    BOOL on = MSConfig()[@"BakedHooks"] ? [MSConfig()[@"BakedHooks"] boolValue] : YES;
+    NSMutableArray *st = [NSMutableArray array];
+    for (int i = 0; i < MS_BH_COUNT; i++) {
+        uintptr_t entry = kMSBakedHooks[i].entry + slide; const uint32_t *w = (const uint32_t *)entry;
+        if (!MSInGameText(w) || (w[0] & 0x9f00001f) != 0x90000010 || w[2] != 0xd61f0200) { [st addObject:[NSString stringWithFormat:@"%s not baked", kMSBakedHooks[i].name]]; continue; }
+        g_bhCont[i] = entry + 12; g_bhSlot[i] = base + 8 * i;
+        *(volatile uintptr_t *)(base + 8 * i) = (uintptr_t)(on && kMSBakedHook[i] ? kMSBakedHook[i] : kMSBakedOrig[i]);
+        [st addObject:[NSString stringWithFormat:@"%s %@", kMSBakedHooks[i].name, on && kMSBakedHook[i] ? @"hooked" : @"pass-through"]]; }
+    MSLogf(@"baked hooks: %@", [st componentsJoinedByString:@", "]);
+}
+
 /* ---------------------------------------------------------------- output (drawable) resolution
  * GameWindowDelegate setLayerResolution:heigh:hdrMode: is how the engine sizes the CAMetalLayer it presents to; the
  * Resolution option only sets what it renders before upscaling. Logged with the caller to see where the engine's
@@ -6278,10 +6552,20 @@ static void MSInstallBackgroundFreeze(void) {
     }];
 }
 
+/* RED4ext (iOS build, Frameworks/RED4ext.dylib): loaded once the game folder is known and before the game's main(),
+ * like DYLD_INSERT_LIBRARIES on macOS. Its hooks go through the baked slots (MSBakedHookAttach). RED4ext = NO skips it. */
+static void MSLoadRED4ext(void) {
+    if (MSIsMultiGame() || (MSConfig()[@"RED4ext"] && ![MSConfig()[@"RED4ext"] boolValue])) return;
+    NSString *p = [NSBundle.mainBundle.privateFrameworksPath stringByAppendingPathComponent:@"RED4ext.dylib"];
+    if (![NSFileManager.defaultManager fileExistsAtPath:p]) return;
+    void *h = dlopen(p.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL);
+    MSLogf(@"RED4ext: %s", h ? "loaded" : dlerror());
+}
+
 __attribute__((constructor)) static void MSInit(void) {
     @autoreleasepool {
         MSOpenLog();
-        if (!MSIsMultiGame()) MSInstallFreeHook();            /* several versions: after MacShimMain loaded the game */
+        if (!MSIsMultiGame()) { MSInstallFreeHook(); MSInstallBakedHooks(); }   /* several versions: after MacShimMain loaded the game */
         MSInstallBackgroundFreeze();
         if (getenv("MACSHIM_PROBE_VA")) MSProbeVA();
         NSFileManager *fm = NSFileManager.defaultManager; NSString *internal = MSInternalRoot();
@@ -6296,6 +6580,7 @@ __attribute__((constructor)) static void MSInit(void) {
             if (!g_external) for (NSString *d in @[ @"r6/cache", @"r6/config" ]) [fm createDirectoryAtPath:[root stringByAppendingPathComponent:d] withIntermediateDirectories:YES attributes:nil error:nil];
             chdir(root.fileSystemRepresentation);
             MSLogf(@"game folder (%@): %@", g_external ? @"external" : @"internal", root);
+            MSLoadRED4ext();
         } else MSLogf(@"no game folder yet - setup screen will appear when the game starts");
         MSAddMacAPIs();
         MSHookGameWindow();
@@ -6619,7 +6904,7 @@ __attribute__((visibility("default"))) int MacShimMain(int argc, char **argv) {
         if (lc->cmd == LC_MAIN) g_gameMain = (char *)mh + ((const struct entry_point_command *)lc)->entryoff;
     if (!g_gameMain) { MSLogf(@"starter: the game program has no entry point"); abort(); }
     MSLogf(@"starter: game program %s loaded at %p (slide %#lx)", MSGame()->name, g_gameHeader, (long)MSGameSlide());
-    MSInstallFreeHook();
+    MSInstallFreeHook(); MSInstallBakedHooks();
     const char *apple[] = { NULL };
     return ((int (*)(int, char **, char **, const char **))g_gameMain)(argc, argv, environ, apple);
 }

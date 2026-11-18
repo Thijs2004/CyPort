@@ -7,3 +7,6 @@ Payload/
 .DS_Store
 *.bak*
 build-signed/
+tools/local.env
+build.log
+__pycache__/

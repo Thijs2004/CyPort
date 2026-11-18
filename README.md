@@ -216,6 +216,61 @@ Logs: *Files → On My iPhone → CyPort → `macshim.log`* (and `game_output.lo
 
 ---
 
+### Mods
+
+The start screen has a **Mods** button (code: `shim/ModManager.swift`, `shim/ModManagerUI.swift`, `shim/ModManagerCore.c`).
+
+- **Import mod…** picks a `.zip`, `.7z`, `.rar` or bare `.archive` in Files. The archive is unpacked into a scratch folder
+  (libarchive, `shim/third_party/libarchive`), sorted, and shown before anything is installed:
+  `.archive` / `.archive.xl` go to `archive/Mac/mod/`, `r6/tweaks` files to `r6/tweaks/`, `r6/input/*.xml` to `r6/input/`,
+  `r6/scripts/**.reds` to `r6/scripts/<Mod>/`, CET Lua mods to `bin/x64/plugins/cyber_engine_tweaks/mods/<Mod>/`.
+  Windows `.dll`/`.exe`/`.asi`, RED4ext plugin packages and CET itself are refused; nothing from an archive is run.
+- **REDmod packages** (`mods/<name>/info.json`; REDmod is off in the Mac game) are converted on import:
+  `archives/*.archive` to `archive/Mac/mod/zz_redmod_<name>_*` (the prefix keeps REDmod's place after the classic archives),
+  `scripts/**.reds` to `r6/scripts/<name>/`, `tweaks/**.tweak|.yaml` to `r6/tweaks/<name>/` (TweakXL reads RED `.tweak` files).
+  `scripts/**.script` (whole copies of game scripts that only `redMod.exe` can merge) and `customSounds` are left out, and
+  the preview says why.
+- **PC audio mods** are converted on import (`shim/ModManagerAudio.swift`). A PC audio replacer keeps its loose Wwise
+  media at `base\sound\soundbanks\<id>.wem`; the Mac game reads `base\sound\soundbanks\media\<id>.wem`, another path
+  and so another hash, and the mod is never asked for its sound. The copy that gets installed has the Mac hash of every
+  such sound in its file table (entries sorted again, index checksum recomputed; no sound is re-encoded, the file keeps its
+  size). A `.bnk` of a Wwise bank version other than 150 is left out of the table, because the game refuses it. The preview
+  says "Audio: N sounds converted for the Mac game". An archive that was copied into `archive/Mac/mod` by hand gets an
+  orange "PC audio" badge and a "Convert audio for the Mac game" button in its details. The media ids of the Mac build are
+  in `shim/CyPortMacMedia.txt`. `tools/test_mod_audio.sh` checks on the Mac that the result is byte-identical to the Mac
+  converter's (`convert.py`).
+- **Dependencies**: the frameworks a mod uses (ArchiveXL, TweakXL, Codeware, CET, Mod Settings, Input Loader, RedFileSystem,
+  RedData, RedHttpClient, Audioware) are read from its files (`.xl`, tweaks, input xml, `import` lines in `.reds`, CET Lua)
+  and from readme / json requirement lists in the archive. The preview, the details panel and a red badge on the row say
+  which ones are turned off or not on the phone; a plugin that is only turned off can be turned on from there.
+- **Conflicts**: two mods that are on and ship the same archive resource (compared by the RDAR index), replace the same
+  script method (`@replaceMethod`), or a mod that is off whose file name is taken, get an orange badge and an explanation
+  in the details. **Load order…** lists the mods with archives; Apply renames the archives to `001__name`, `002__name`, …
+  (the game reads `archive/Mac/mod` in name order, first one wins) and "Remove numbers" renames them back. An optional
+  setting also writes `modlist.txt` (the Mac binary has the code that reads it; never confirmed running, so off by default).
+- **Profiles** (`CyPort/profiles/<name>.json`): a saved set of which mods and plugins are on. Loading one switches them
+  and recompiles the scripts when needed; if they don't compile, every switch is undone.
+- **Save backups** (`CyPort/save-backups/<date>/`): before scripts are recompiled or a plugin is switched, the saves
+  folder (`Library/Application Support/CD Projekt Red/Cyberpunk 2077/saves`) is copied, unless nothing in it changed since
+  the newest backup. On by default; the setting, the number of backups kept, "Back up now" and restore are on the screen.
+- Search box, sort (name / size / newest / on first), filter (all / on / off / problems), totals, and "Changed since the
+  last Play" (a snapshot is written to `CyPort/last-play.json` when Play is pressed).
+  With `MAC_HASHES` in the build, each `.archive` is checked against the Mac game's resources (what it replaces or adds).
+- Every mod has a switch (off = its files move to `CyPort/disabled/<id>/`), a details panel and Delete. Files that were
+  already in the game folder show up under "Found in the game folder" and work the same way.
+- **Plugins**: one switch per folder in `red4ext/plugins/` (off = moved to `CyPort/disabled-plugins/`).
+- **Scripts** are compiled on the phone (`SCC_DYLIB`, redscript 0.5.32) whenever a script mod or a plugin with scripts
+  changes: `r6/scripts` plus `red4ext/plugins/<Name>/Scripts` of every plugin that is on, always against the game's
+  original blob, kept as `CyPort/final.redscripts.original`. The new blob replaces `r6/cache/final.redscripts` only when the
+  compile succeeds; otherwise the change is undone and the compiler's message is shown.
+- `CyPort/` is the folder next to the game folder (`Documents/CyPort` on the phone's own storage); manifests are in
+  `CyPort/mods/<id>.json`.
+- Controller: D-pad moves, A switches, X opens details, Y imports, B goes back. In the panels every button shows its
+  controller button; up / down step through the sections of the details and the import preview; in Load order, A picks a
+  mod up, up / down carry it, X applies.
+- Code: `shim/ModManager.swift` (install, on/off, compile), `shim/ModManagerMore.swift` (dependencies, conflicts, load
+  order, profiles, save backups), `shim/ModManagerAudio.swift` (PC audio conversion), `shim/ModManagerUI.swift` (the screen).
+
 ## How it works
 
 The Mac build is a normal arm64 Mach-O for Apple Silicon. iOS runs the same CPU instructions and has Metal, so the game code can

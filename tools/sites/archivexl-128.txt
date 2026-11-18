@@ -1,0 +1,4 @@
+# ArchiveXL 1.28.8 (archive-xl branch ios-128): hook targets that are new compared with the 1.27.4 lists (archivexl.txt, archivexl-ink.txt).
+# Game 2.5.0 (Steam Mac). Both belong to the InkSpawner extension, which installs its hooks only when Codeware 1.14+ is NOT loaded.
+0x435402C  # InkWidgetLibrary_SpawnFromLocal (the 2.5 entry the game calls: tests InkSpawner_ControllerInjectionEnabled, then the item lookup; 0x435413C is the copy without the test). Also in codeware.txt.
+0x4353EDC  # InkWidgetLibrary_FindExternalLibrary (new hook in 1.28.8: Handle<inkWidgetLibraryResource>(lib*, ResourcePath) through x8; callers 0x4353DA4 and 0x4354270)

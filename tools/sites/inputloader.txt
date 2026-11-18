@@ -1,0 +1,6 @@
+# Input Loader (jackhumbert/cyberpunk2077-input-loader v0.2.6, port: the input-loader fork, branch ios).
+# No baked sites: the plugin hooks no game function and uses no address from the game image. It only writes
+# r6/cache/inputContexts.xml, r6/cache/inputUserMappings.xml and engine/config/platform/mac/input_loader.ini, which the
+# game then reads by itself ([Player/Input] InputContextFile / InputMappingFile), and registers a BaseInitialization
+# state callback through RED4ext (gameStates->Add; RED4ext's own sites are in baked_sites.py).
+# This file is here so the next reader does not go looking for its hooks.

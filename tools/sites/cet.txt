@@ -1,0 +1,16 @@
+# Image-relative offsets Cyber Engine Tweaks hooks (CyPort-red4ext/cet, branch ios; names from its macos/CetSdkRows.inc and
+# macos/hook-offsets.txt). One per line; # starts a comment. Game 2.5.0 (Steam Mac, UUID 7D7382D0-EADD-36F0-BA1C-CEBEC1D5BEBC).
+# CET hooks two more functions that other lists already bake: 0x37ce05c TweakDB::LoadOptimized (archivexl.txt, onTweak) and
+# 0xfffcb8 PlayerSystem::OnPlayerMainObjectSpawned (codeware.txt, onInit). Its four game-state OnTick hooks (0x4d6ccac, 0x4d6cb1c,
+# 0x4d6b460, 0x4d6ce40) are not needed on iOS: the ticks come from RED4ext's game-state callbacks.
+# Needed for the Lua runtime:
+0x1098fc0  # CScript_RunPureScript (CBaseFunction::ExecuteScripted; Observe / ObserveAfter / Override)
+0x1113e44  # ScriptBinderLoad (script binder load with LoadOpcodes inlined; starts the Lua VM and loads the mods, onHook)
+0x4e39574  # CScript_TDBIDConstructorDerive (TweakDBID derive; names of TweakDBIDs made by scripts)
+# Optional (each one failing only turns its own feature off):
+0x37d2af8  # CScript_ToStringDEBUG (native handler of TDBID.ToStringDEBUG; TweakDBID names in script strings)
+0x11bae18  # CScript_Log (native handler; script Log calls go to CET's gamelog.log)
+0x11baef8  # CScript_LogError (native handler)
+0x11bafd8  # CScript_LogWarning (native handler)
+0x11bb358  # CScript_LogChannel (native handler; channel DEBUG also goes to scripting.log)
+0x11bb588  # CScript_LogChannelWarning (native handler)

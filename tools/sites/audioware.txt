@@ -1,0 +1,31 @@
+# Image-relative offsets Audioware hooks (audioware macos/hook-offsets.txt = the Audioware rows of RED4ext.SDK-macos Relocation-inl.hpp, game 2.5.0).
+# One per line; # starts a comment. Evidence per line:
+#   [name]  the game registers this function as the native of that script name: the adrp/add of the name string, the CName call, the
+#           guard branch, the thunk(class, name) and the CClassFunction constructor (0x109b8a4) that takes this address in x4.
+#   [calls] internal function: a function start whose calls fit (the event id helper 0x4126c10 or the switch/parameter helper 0x4126dbc,
+#           then one Wwise entry), body matched with its Windows twin in the SDK table. Not confirmed by a name in the binary.
+0x50f0d14  # AudioSystem_Play                           [name] "Play" @0x50eec48
+0x50f0edc  # AudioSystem_Stop                           [name] "Stop" @0x50eec78
+0x50f4380  # AudioSystem_Switch                         [name] "Switch" @0x50eecf0
+0x19acef8  # Entity_QueueEvent                          [name] "QueueEvent" @0x19a3594. Not Codeware's (it hooks no QueueEvent)
+0x51ea4f0  # SoundEngine_PostEvent                      [calls] 0x4126c10, 0xca5734, 0x51d916c
+0x51ea658  # SoundEngine_PostEvent_OneShot              [calls] 0x4126c10, 0xca5734
+0x51ea80c  # SoundEngine_ExternalEvent                  [calls] 0x4126c10, 0x51e7f48, 0xca5734
+0x51ea92c  # SoundEngine_SetParameter                   [calls] 0x4126dbc, 0xc9f2c0
+0x51ea99c  # SoundEngine_SetGlobalParameter             [calls] 0x4126dbc, 0xc9f2c0 (same Wwise entry as SetParameter)
+0x51eaa2c  # SoundEngine_SetSwitch                      [calls] 0x4126dbc twice, 0xca3478
+0x1665af4  # gameCameraComponent_Activate               [name] "Activate" @0x1662bc8
+0x1665c94  # gameCameraComponent_Deactivate             [name] "Deactivate" @0x1662bf8
+0x16f6c90  # TimeDilatable_SetIndividualTimeDilation    [name] "SetIndividualTimeDilation" @0x16f5fa8
+0x16f6f7c  # TimeDilatable_UnsetIndividualTimeDilation  [name] "UnsetIndividualTimeDilation" @0x16f5fd0
+0x4d3fa5c  # gameuiGameSystemUI_QueueEvent              [name] "QueueEvent" @0x4d38fa4
+0x1e48378  # SoundComponent_OnStopDialogLine            [calls] event handler, uses the "vo" name (0x74c5a9a); one reference, from 0x1e47d68
+0x252c96c  # TimeSystem_SetTimeDilation                 [name] "SetTimeDilation" @0x2527cf4
+0x252cc3c  # TimeSystem_UnsetTimeDilation               [name] "UnsetTimeDilation" @0x2527d24
+0x380f7cc  # AudioInternalEvent_ApplyAction             [calls] 0x4126c10 twice among 26 calls, 12 callers
+0x387b840  # audio_PlayDialogLine                       [calls] uses "vo_2d_V", "vo_matrix", "vo_2d_cyberspace", "vo_global_tv"; 2 callers
+0x41a7570  # inkIGameController_QueueEvent              [name] "QueueEvent" @0x41a144c
+0x41afca4  # inkLogicController_QueueEvent              [name] "QueueEvent" @0x41a937c
+0x432aff4  # inkMenuScenario_SwitchToScenario           [name] "SwitchToScenario" @0x432a5f8
+0x432b294  # inkMenuScenario_QueueEvent                 [name] "QueueEvent" @0x432a678
+0x432b348  # inkMenuScenario_QueueBroadcastEvent        [name] "QueueBroadcastEvent" @0x432a6a0

@@ -56,15 +56,20 @@ SWIFT_OBJ=""; SWIFT_LD=""
 if command -v swiftc >/dev/null 2>&1 || xcrun -f swiftc >/dev/null 2>&1; then
   SWIFTC="$(xcrun -f swiftc 2>/dev/null || command -v swiftc)"; TC="$(dirname "$(dirname "$SWIFTC")")"
   "$SWIFTC" -target arm64-apple-ios16.0 -sdk "$SDK" -O -parse-as-library -emit-object -module-name MacShimUI \
-    -wmo "$HERE/shim/Launcher.swift" "$HERE/shim/StoresCore.swift" "$HERE/shim/StoresUI.swift" "$HERE/shim/GameCloud.swift" -o "$APP/Frameworks/Launcher.o" && SWIFT_OBJ="$APP/Frameworks/Launcher.o" \
+    -wmo "$HERE/shim/Launcher.swift" "$HERE/shim/StoresCore.swift" "$HERE/shim/StoresUI.swift" "$HERE/shim/GameCloud.swift" \
+    "$HERE/shim/ModManager.swift" "$HERE/shim/ModManagerMore.swift" "$HERE/shim/ModManagerAudio.swift" "$HERE/shim/ModManagerUI.swift" -o "$APP/Frameworks/Launcher.o" && SWIFT_OBJ="$APP/Frameworks/Launcher.o" \
     && SWIFT_LD="-L$SDK/usr/lib/swift -L$TC/lib/swift/iphoneos -Xlinker -rpath -Xlinker /usr/lib/swift"
 fi
+# the mod manager (shim/ModManager*.swift, ModManagerCore.c) unpacks zip / 7z / rar with libarchive, linked in with hidden
+# symbols; the static libraries are in the repo (shim/third_party/libarchive/build-ios.sh rebuilds them)
+LA="$HERE/shim/third_party/libarchive"
 clang $LDFLAG -target arm64-apple-ios16.0 -isysroot "$SDK" -dynamiclib -fobjc-arc -O2 $SWIFT_LD \
   -install_name @rpath/libMacShim.dylib -compatibility_version 9999.0.0 -current_version 9999.0.0 \
   -framework Foundation -framework UIKit -framework GameController -framework QuartzCore \
   -framework Security -framework CoreGraphics -framework CoreFoundation -framework Metal -framework UniformTypeIdentifiers -framework WebKit -lz \
+  -lbz2 -liconv -Wl,-load_hidden,"$LA/ios/libarchive.a" -Wl,-load_hidden,"$LA/ios/liblzma.a" \
   -Wl,-reexport_framework,Foundation -Wl,-reexport_framework,CoreGraphics -Wl,-reexport_framework,Security -Wl,-reexport_framework,Metal \
-  "$HERE/shim/MacShim.m" "$HERE/shim/MacShimC.c" "$HERE/shim/PadLayout.c" "$HERE/shim/StoreCodecs.c" "$HERE/shim/third_party/lzma/LzmaDec.c" $SWIFT_OBJ \
+  "$HERE/shim/MacShim.m" "$HERE/shim/MacShimC.c" "$HERE/shim/PadLayout.c" "$HERE/shim/StoreCodecs.c" "$HERE/shim/ModManagerCore.c" "$HERE/shim/third_party/lzma/LzmaDec.c" $SWIFT_OBJ \
   -o "$APP/Frameworks/libMacShim.dylib"
 rm -f "$APP/Frameworks/Launcher.o"
 
@@ -130,6 +135,17 @@ for f in "$GAME_APP"/Contents/Frameworks/*.dylib; do
   python3 "$HERE/tools/ios_retarget.py" "$f" "$APP/Frameworks/$(basename "$f")" >/dev/null
 done
 fi
+# mod manager extras, both optional (the Mods screen says so when one is missing):
+#   SCC_DYLIB   the on-device redscript compiler (redscript-ios dist/ios/libscc_lib.dylib): script mods compile on the phone
+#   MAC_HASHES  sorted u64 list of the Mac game's resources (Mods Nexus/.cyport-mac-hashes.bin): import checks what an .archive replaces
+SCC_DYLIB="${SCC_DYLIB:-$(dirname "$HERE")/CyPort-red4ext/redscript-ios/dist/ios/libscc_lib.dylib}"
+MAC_HASHES="${MAC_HASHES:-}"
+if [ -f "$SCC_DYLIB" ]; then cp "$SCC_DYLIB" "$APP/Frameworks/libscc_lib.dylib"; echo "    + redscript compiler: $SCC_DYLIB"; else echo "    (no SCC_DYLIB: script mods can't be compiled on the phone)"; fi
+# the Wwise media ids of the Mac build: PC audio mods are converted on import (shim/ModManagerAudio.swift)
+cp "$HERE/shim/CyPortMacMedia.txt" "$APP/CyPortMacMedia.txt"
+if [ -f "$MAC_HASHES" ]; then cp "$MAC_HASHES" "$APP/CyPortMacHashes.bin"; echo "    + game resource list: $MAC_HASHES"; else echo "    (no MAC_HASHES: imported archives are not checked against the game)"; fi
+# RED4ext for iOS (CyPort-red4ext build): the shim loads Frameworks/RED4ext.dylib before the game starts
+if [ -n "${RED4EXT_DYLIB:-}" ]; then cp "$RED4EXT_DYLIB" "$APP/Frameworks/RED4ext.dylib"; echo "    + RED4ext: $RED4EXT_DYLIB"; fi
 sed "s/__BUNDLE_ID__/$BUNDLE_ID/" "$HERE/app/Info.plist" > "$APP/Info.plist"
 if [ "$OLD_SHIM" = 1 ]; then plutil -remove UIApplicationSceneManifest "$APP/Info.plist"; fi
 # the same SDK in the Info.plist keys Xcode writes (iOS reads both)

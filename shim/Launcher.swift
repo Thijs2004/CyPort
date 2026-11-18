@@ -1,12 +1,92 @@
 // Launcher.swift - the start screen (SwiftUI). Resolution + performance overlay + PLAY.
 // Everything else is set in the game's own Settings menu. The shim (MacShim.m) creates it through
 // MSSwiftLauncher.make(...) and gets the choices back in the onPlay callback.
+// Everything that can be tapped can also be reached with a controller, the same way as on the Mods screen (ModManagerUI.swift):
+//   D-pad / left stick  move      left / right  change a value      A  press / switch      B  back to PLAY      Menu  PLAY
+// The two questions (Restore defaults, game data doesn't match) are drawn by this screen itself, so A / B / Y answer them.
 import SwiftUI
 import UIKit
+import GameController
 
 private let cyberYellow = Color(red: 0.99, green: 0.93, blue: 0.04)
 
 private let cyberRed = Color(red: 1.0, green: 0.0, blue: 0.24)
+
+enum MSPadKey: Hashable { case up, down, left, right, a, b, x, y, menu }
+
+/// Reads the controllers 30 times a second (no handlers are set on them: those belong to the game and the shim) and turns
+/// button presses into keys; the directions repeat while held. Used by the start screen and the store screen; the Mods
+/// screen has the same loop of its own.
+final class MSPadPoller {
+    /// (key, repeat): repeat is true for the repeats of a held direction
+    var onKey: (MSPadKey, Bool) -> Void = { _, _ in }
+    var onConnected: (Bool) -> Void = { _ in }
+    /// true while another screen is on top: nothing is passed on, and what is held when it ends has to be let go first
+    var gate: () -> Bool = { false }
+    private var timer: Timer?
+    private var held: [MSPadKey: Date] = [:]
+    private var swallow = true
+    private var connected = false
+
+    func start() {
+        stop(); swallow = true             // a button still held from the screen before (A that opened this one) doesn't count
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.poll() }
+    }
+    func stop() { timer?.invalidate(); timer = nil; held.removeAll() }
+    deinit { timer?.invalidate() }
+
+    private func poll() {
+        var down = Set<MSPadKey>(), any = false
+        // not the shim's on-screen controller (a snapshot), and only standard gamepads: DualSense, Xbox, Switch Pro, GameSir, ...
+        for c in GCController.controllers() where !c.isSnapshot {
+            guard let g = c.extendedGamepad else { continue }
+            any = true
+            let x = g.leftThumbstick.xAxis.value, y = g.leftThumbstick.yAxis.value
+            let vertical = abs(y) >= abs(x)
+            if g.dpad.up.isPressed || (y > 0.6 && vertical) { down.insert(.up) }
+            if g.dpad.down.isPressed || (y < -0.6 && vertical) { down.insert(.down) }
+            if g.dpad.left.isPressed || (x < -0.6 && !vertical) { down.insert(.left) }
+            if g.dpad.right.isPressed || (x > 0.6 && !vertical) { down.insert(.right) }
+            if g.buttonA.isPressed { down.insert(.a) }
+            if g.buttonB.isPressed { down.insert(.b) }
+            if g.buttonX.isPressed { down.insert(.x) }
+            if g.buttonY.isPressed { down.insert(.y) }
+            if g.buttonMenu.isPressed { down.insert(.menu) }
+        }
+        if any != connected { connected = any; onConnected(any) }
+        let gated = gate()
+        if gated || swallow {
+            // one more round after the other screen closes: its B may reach this loop a moment after it reached that screen's
+            for b in down { held[b] = .distantFuture }
+            for b in Array(held.keys) where !down.contains(b) { held[b] = nil }
+            swallow = gated
+            return
+        }
+        let now = Date()
+        for b in down {
+            if let t = held[b] {
+                if b == .up || b == .down || b == .left || b == .right, now >= t { held[b] = now.addingTimeInterval(0.12); onKey(b, true) }
+            } else { held[b] = now.addingTimeInterval(0.4); onKey(b, false) }
+        }
+        for b in Array(held.keys) where !down.contains(b) { held[b] = nil }
+    }
+}
+
+/// what the controller can stand on, in the order it is on the screen
+private enum LFocus: Hashable {
+    case mods, resolution, overlay, smoothPacing, gameThread, lowLatency, frameGen, phoneRumble, vibration, triggers, kbm
+    case lookMode, touchHaptics, silentSound, mixAudio, sensitivity, restore, cloudStore, cloudAction, signOut, importSaves
+    case play, update
+}
+
+private extension View {
+    /// the controller's focus frame (the same yellow outline as on the Mods screen)
+    func padFocus(_ on: Bool, color: Color = cyberYellow, radius: CGFloat = 10, width: CGFloat = 2, dx: CGFloat = 0, dy: CGFloat = 0) -> some View {
+        overlay(RoundedRectangle(cornerRadius: radius).fill(on && (dx != 0 || dy != 0) ? color.opacity(0.12) : .clear)
+                    .overlay(RoundedRectangle(cornerRadius: radius).stroke(on ? color : .clear, lineWidth: width))
+                    .padding(.horizontal, -dx).padding(.vertical, -dy).allowsHitTesting(false))
+    }
+}
 
 private final class LauncherModel: ObservableObject {
     let resolutions: [String]
@@ -82,6 +162,108 @@ private final class LauncherModel: ObservableObject {
     }
     var dataNeedsUpdate: Bool { switch dataStatus { case .update, .windows, .missing: return true; default: return false } }
     let onPlay: (Int, Int) -> Void
+
+    /// the PLAY button (and the controller's Menu button)
+    func play() {
+        guard !starting, !syncing else { return }
+        if dataNeedsUpdate { askUpdate = true; return }
+        start(haptic: true)
+    }
+    func start(haptic: Bool) {
+        starting = true
+        stopPad()                                              // from here on the controller is the game's
+        GameCloud.startWatching()
+        ModStore.notePlay(gameRoot: MSSwiftLauncher.gameRoot)  // for the Mods screen's "since the last Play"
+        if haptic { UIImpactFeedbackGenerator(style: .medium).impactOccurred() }
+        onPlay(resolution, overlay)
+    }
+
+    // ---------------------------------------------------------------- controller
+    @Published var focus: LFocus?
+    @Published var padConnected = false
+    @Published var askRestore = false
+    @Published var showMods = false
+    /// set by the view: A / left / right on the rows whose values live in the view (@AppStorage), and "Restore defaults"
+    var act: (LFocus, MSPadKey, Bool) -> Void = { _, _, _ in }
+    var restore: () -> Void = {}
+    private let pad = MSPadPoller()
+
+    var rows: [LFocus] {
+        var r: [LFocus] = [.mods, .resolution, .overlay, .smoothPacing, .gameThread, .lowLatency, .frameGen, .phoneRumble, .vibration,
+                           .triggers, .kbm, .lookMode, .touchHaptics, .silentSound, .mixAudio, .sensitivity, .restore, .cloudStore, .cloudAction]
+        if cloudOn && !syncing { r.append(.signOut) }
+        return r + [.importSaves, .play, .update]
+    }
+    func startPad() {
+        guard !starting else { return }
+        // the Mods screen and the update screen read the controller themselves; the Files picker is the system's
+        pad.gate = { [weak self] in guard let s = self else { return true }; return s.showMods || s.updating || s.importing }
+        pad.onKey = { [weak self] k, rep in self?.key(k, rep) }
+        pad.onConnected = { [weak self] on in
+            guard let s = self else { return }
+            s.padConnected = on
+            if on, s.focus == nil { s.focus = .play }
+        }
+        pad.start()
+    }
+    func stopPad() { pad.stop() }
+    private func key(_ k: MSPadKey, _ rep: Bool) {
+        guard !starting else { return }
+        if signingIn { if k == .b { signedInNow() }; return }       // the sign-in sheet: B is its Cancel
+        if askRestore {
+            if k == .a { askRestore = false; restore() } else if k == .b { askRestore = false }
+            return
+        }
+        if askUpdate {
+            switch k {
+            case .a: askUpdate = false; updating = true
+            case .y: askUpdate = false; start(haptic: false)
+            case .b: askUpdate = false
+            default: break
+            }
+            return
+        }
+        let r = rows
+        switch k {
+        case .up, .down:
+            guard let f = focus, let i = r.firstIndex(of: f) else { focus = .play; return }
+            var n = i + (k == .down ? 1 : -1)
+            // past the end: around to the other end, but a held direction stops there
+            if n < 0 || n >= r.count { if rep { return }; n = (n + r.count) % r.count }
+            focus = r[n]
+        case .menu: play()
+        case .b: focus = .play
+        case .a, .left, .right:
+            guard let f = focus, r.contains(f) else { focus = .play; return }
+            activate(f, k, rep)
+        default: break
+        }
+    }
+    /// A steps to the next value and starts over after the last one; left / right stop at the ends
+    private func activate(_ f: LFocus, _ k: MSPadKey, _ rep: Bool) {
+        let d = k == .left ? -1 : 1
+        switch f {
+        case .play: if k == .a { play() }
+        case .update: if k == .a, gameRoot != nil { updating = true }
+        case .mods: if k == .a, gameRoot != nil { showMods = true }
+        case .resolution:
+            let n = resolutions.count
+            if n > 0 { resolution = k == .a ? (resolution + 1) % n : max(0, min(n - 1, resolution + d)) }
+        case .overlay: overlay = k == .a ? (overlay + 1) % 3 : max(0, min(2, overlay + d))
+        case .restore: if k == .a { askRestore = true }
+        case .cloudStore:
+            let all = CloudSource.allCases
+            guard !syncing, let i = all.firstIndex(of: source) else { return }
+            let n = k == .a ? (i + 1) % all.count : max(0, min(all.count - 1, i + d))
+            if n != i { setSource(all[n]) }
+        case .cloudAction:
+            guard k == .a else { return }
+            if !cloudOn { signingIn = true } else if !syncing { sync() }
+        case .signOut: if k == .a { signOut(); focus = .cloudAction }
+        case .importSaves: if k == .a, !syncing { importing = true }
+        default: act(f, k, rep)
+        }
+    }
     init(resolutions: [String], notes: [String], resolution: Int, overlay: Int, onPlay: @escaping (Int, Int) -> Void) {
         self.resolutions = resolutions; self.notes = notes; self.resolution = resolution; self.overlay = overlay; self.onPlay = onPlay
     }
@@ -115,7 +297,31 @@ private struct LauncherView: View {
     @AppStorage("CyPortAppleFrameGen") private var appleFrameGen = false
     /// read by the shim (MSPhoneRumbleOn): with touch controls the game's controller rumble plays on the phone
     @AppStorage("CyPortPhoneRumble") private var phoneRumble = true
-    @State private var askRestore = false
+
+    private func on(_ f: LFocus) -> Bool { model.padConnected && model.focus == f }
+    /// the controller on the rows whose values are stored here
+    private func padAct(_ f: LFocus, _ k: MSPadKey, _ rep: Bool) {
+        func flip(_ b: Binding<Bool>) { if k == .a { b.wrappedValue.toggle() } else { b.wrappedValue = k == .right } }
+        switch f {
+        case .smoothPacing: flip($smoothPacing)
+        case .gameThread: flip($gameThread)
+        case .lowLatency: flip($lowLatency)
+        case .frameGen: flip($appleFrameGen)
+        case .phoneRumble: flip($phoneRumble)
+        case .vibration: flip($vibration)
+        case .triggers: flip($adaptiveTriggers)
+        case .kbm: flip($kbmWithController)
+        case .touchHaptics: flip($touchHaptics)
+        case .silentSound: flip($silentModeSound)
+        case .mixAudio: flip($mixAudio)
+        case .lookMode: lookMode = k == .a ? (lookMode == 2 ? 1 : 2) : (k == .right ? 1 : 2)        // Stick (2) is on the left
+        case .sensitivity:
+            guard k != .a else { return }
+            let step = (rep ? 0.1 : 0.05) * (k == .right ? 1 : -1)
+            lookSensitivity = min(4, max(0.25, ((lookSensitivity + step) * 20).rounded() / 20))
+        default: break
+        }
+    }
 
     /// "Restore defaults": every start screen option back to what works best on most phones, the on-screen buttons back to
     /// their standard places, and at Play the game's graphics + display settings back to the phone defaults (MSResetGameGraphics).
@@ -134,7 +340,7 @@ private struct LauncherView: View {
         storeLog("start screen: options restored to defaults")
     }
     private var restoreButton: some View {
-        Button { askRestore = true } label: {
+        Button { model.askRestore = true } label: {
             Label("Restore defaults", systemImage: "arrow.counterclockwise")
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.white.opacity(0.85))
@@ -143,6 +349,7 @@ private struct LauncherView: View {
                 .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.15)))
         }
         .disabled(model.starting)
+        .padFocus(on(.restore)).id(LFocus.restore)
     }
 
     private var dataText: String? {
@@ -173,12 +380,14 @@ private struct LauncherView: View {
                         .overlay(RoundedRectangle(cornerRadius: 10).stroke(cyberYellow.opacity(0.6)))
                 }
                 .disabled(model.starting || model.gameRoot == nil)
+                .padFocus(on(.update), color: .white, width: 3)
             } else {
                 Button { model.updating = true } label: {
                     Label("Game files & version", systemImage: "checkmark.seal").font(.caption.weight(.semibold))
                         .foregroundStyle(.white.opacity(0.6))
                 }
                 .disabled(model.starting || model.gameRoot == nil)
+                .padFocus(on(.update), radius: 6, dx: 6, dy: 4)
             }
             if let t = dataText {
                 Text(t).font(.caption).foregroundStyle(model.dataNeedsUpdate ? cyberRed : .white.opacity(0.5))
@@ -190,10 +399,11 @@ private struct LauncherView: View {
                     .fixedSize(horizontal: false, vertical: true).frame(width: 300, alignment: .leading)
             }
         }
+        .id(LFocus.update)
     }
 
     /// a 300 pt wide boxed row like the Resolution button; the switch keeps its own size so it is never pushed off the edge
-    private func switchRow(_ title: String, icon: String, isOn: Binding<Bool>, note: String) -> some View {
+    private func switchRow(_ row: LFocus, _ title: String, icon: String, isOn: Binding<Bool>, note: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 Label(title, systemImage: icon)
@@ -207,11 +417,13 @@ private struct LauncherView: View {
             .frame(width: 300)
             .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
             .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.15)))
+            .padFocus(on(row))
             Text(note)
                 .font(.caption).foregroundStyle(.white.opacity(0.45))
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(width: 300, alignment: .leading)
         }
+        .id(row)
     }
 
     private var titleBlock: some View {
@@ -234,7 +446,37 @@ private struct LauncherView: View {
                         .foregroundStyle(.white.opacity(0.5))
                         .frame(maxWidth: 300, alignment: .leading)
     }
+    @ViewBuilder private var padHint: some View {
+        if model.padConnected {
+            Text("Controller:  D-pad move  ·  left / right change  ·  A select  ·  Menu play")
+                .font(.caption2).foregroundStyle(.white.opacity(0.35)).frame(maxWidth: 300, alignment: .leading)
+        }
+    }
+    /// the options list; it follows the controller's focus
+    private func scroller<C: View>(@ViewBuilder _ c: () -> C) -> some View {
+        let content = c()
+        return ScrollViewReader { proxy in
+            ScrollView(.vertical, showsIndicators: false) { content }
+                .onChange(of: model.focus) { f in if let f { withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(f, anchor: .center) } } }
+        }
+    }
     @ViewBuilder private var optionRows: some View {
+                    // the mod manager (shim/ModManagerUI.swift): list, on/off, delete, import from Files, plugin switches
+                    Button { model.showMods = true } label: {
+                        HStack {
+                            Label("Mods", systemImage: "puzzlepiece.extension").font(.subheadline.weight(.semibold))
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.caption.weight(.bold))
+                        }
+                        .foregroundStyle(.white.opacity(0.85))
+                        .padding(.horizontal, 14).frame(width: 300, height: 44)
+                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(cyberYellow.opacity(0.6)))
+                    }
+                    .disabled(model.starting || model.gameRoot == nil)
+                    .padFocus(on(.mods)).id(LFocus.mods)
+                    .fullScreenCover(isPresented: $model.showMods) { ModManagerView(gameRoot: MSSwiftLauncher.gameRoot) }
+
                     VStack(alignment: .leading, spacing: 8) {
                         Label("Resolution", systemImage: "rectangle.on.rectangle")
                             .font(.subheadline.weight(.semibold))
@@ -261,7 +503,9 @@ private struct LauncherView: View {
                             .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
                             .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.15)))
                         }
+                        .padFocus(on(.resolution))
                     }
+                    .id(LFocus.resolution)
 
                     VStack(alignment: .leading, spacing: 8) {
                         Label("Performance overlay", systemImage: "speedometer")
@@ -272,23 +516,25 @@ private struct LauncherView: View {
                         }
                         .pickerStyle(.segmented)
                         .frame(width: 300)
+                        .padFocus(on(.overlay), radius: 9)
                     }
+                    .id(LFocus.overlay)
 
-                    switchRow("Smooth frame pacing", icon: "waveform.path", isOn: $smoothPacing,
+                    switchRow(.smoothPacing, "Smooth frame pacing", icon: "waveform.path", isOn: $smoothPacing,
                               note: smoothPacing ? "Even frame times: holds 120, 60, 40 or 30 FPS, whatever the phone keeps up with." : (appleFrameGen ? "Off: best with frame generation (it turns off when frame generation goes on)." : "Off: the game's own frame cap only."))
-                    switchRow("Smooth controls", icon: "hand.tap", isOn: $gameThread,
+                    switchRow(.gameThread, "Smooth controls", icon: "hand.tap", isOn: $gameThread,
                               note: gameThread ? "The game runs on its own thread: touch and controller input don't wait for the game's frames." : "Off: the old way (controls follow the game's frame rate). Try this if the game won't start.")
-                    switchRow("Low-latency input", icon: "bolt.horizontal", isOn: $lowLatency,
+                    switchRow(.lowLatency, "Low-latency input", icon: "bolt.horizontal", isOn: $lowLatency,
                               note: lowLatency ? "Snappier controls. Costs a few FPS when the GPU is the limit." : "Off: best frame rate.")
-                    switchRow("Apple frame generation", icon: "sparkles.tv", isOn: $appleFrameGen,
+                    switchRow(.frameGen, "Apple frame generation", icon: "sparkles.tv", isOn: $appleFrameGen,
                               note: appleFrameGen ? "Apple's MetalFX frame generation is on in the game. Turning it off in the game turns this off too." : "Off: no Apple frame generation.")
-                    switchRow("Phone vibration", icon: "iphone.radiowaves.left.and.right", isOn: $phoneRumble,
+                    switchRow(.phoneRumble, "Phone vibration", icon: "iphone.radiowaves.left.and.right", isOn: $phoneRumble,
                               note: phoneRumble ? "With touch controls the phone rumbles like a controller would (explosions, gunfire, crashes). Off while a controller is connected." : "Off: the phone doesn't rumble.")
-                    switchRow("Controller vibration", icon: "gamecontroller", isOn: $vibration,
+                    switchRow(.vibration, "Controller vibration", icon: "gamecontroller", isOn: $vibration,
                               note: vibration ? "Rumble on controllers that have it." : "Off: no rumble.")
-                    switchRow("Adaptive triggers", icon: "l2.button.roundedtop.horizontal", isOn: $adaptiveTriggers,
+                    switchRow(.triggers, "Adaptive triggers", icon: "l2.button.roundedtop.horizontal", isOn: $adaptiveTriggers,
                               note: adaptiveTriggers ? "PS5 controller trigger resistance." : "Off: PS5 triggers stay loose.")
-                    switchRow("Touch + mouse with controller", icon: "computermouse", isOn: $kbmWithController,
+                    switchRow(.kbm, "Touch + mouse with controller", icon: "computermouse", isOn: $kbmWithController,
                               note: kbmWithController ? "Screen, mouse and keyboard still reach the game while a controller is connected." : "Off: with a controller connected, only the controller controls the game.")
 
                     VStack(alignment: .leading, spacing: 8) {
@@ -301,14 +547,16 @@ private struct LauncherView: View {
                         }
                         .pickerStyle(.segmented)
                         .frame(width: 300)
+                        .padFocus(on(.lookMode), radius: 9)
                         Text(lookMode == 2 ? "Right side is a floating stick: hold to keep turning. Same feel at any frame rate." : "Swipe the right side: the camera follows your finger's speed.")
                             .font(.caption).foregroundStyle(.white.opacity(0.5)).frame(width: 300, alignment: .leading)
                     }
-                    switchRow("Touch vibration", icon: "hand.tap", isOn: $touchHaptics,
+                    .id(LFocus.lookMode)
+                    switchRow(.touchHaptics, "Touch vibration", icon: "hand.tap", isOn: $touchHaptics,
                               note: touchHaptics ? "A short tap on each on-screen button press." : "Off: on-screen buttons are silent.")
-                    switchRow("Sound in silent mode", icon: "speaker.wave.2", isOn: $silentModeSound,
+                    switchRow(.silentSound, "Sound in silent mode", icon: "speaker.wave.2", isOn: $silentModeSound,
                               note: silentModeSound ? "Game sound plays even with the silent switch on." : "Off: the silent switch mutes the game.")
-                    switchRow("Mix with other audio", icon: "music.note", isOn: $mixAudio,
+                    switchRow(.mixAudio, "Mix with other audio", icon: "music.note", isOn: $mixAudio,
                               note: mixAudio ? "Music from other apps keeps playing under the game." : "Off: the game stops other apps' audio.")
 
                     VStack(alignment: .leading, spacing: 8) {
@@ -323,6 +571,7 @@ private struct LauncherView: View {
                         Slider(value: $lookSensitivity, in: 0.25...4, step: 0.05)
                             .tint(cyberYellow).frame(width: 300)
                     }
+                    .padFocus(on(.sensitivity), dx: 1, dy: 5).id(LFocus.sensitivity)
                     restoreButton
 
                     VStack(alignment: .leading, spacing: 8) {
@@ -333,6 +582,7 @@ private struct LauncherView: View {
                             ForEach(CloudSource.allCases) { Text($0.rawValue).tag($0) }
                         }
                         .pickerStyle(.segmented).frame(width: 300).disabled(model.syncing)
+                        .padFocus(on(.cloudStore), radius: 9).id(LFocus.cloudStore)
                         HStack {
                             if model.syncing { ProgressView().controlSize(.small) }
                             Text(model.cloudStatus ?? (model.cloudOn ? "Signed in\(model.source.account.map { " as \($0)" } ?? "")"
@@ -342,20 +592,23 @@ private struct LauncherView: View {
                             if model.cloudOn {
                                 Button("Sync now") { model.sync() }
                                     .font(.caption.weight(.semibold)).foregroundStyle(cyberYellow).disabled(model.syncing)
+                                    .padFocus(on(.cloudAction), radius: 6, dx: 1, dy: 4)
                             } else {
                                 Button("Sign in…") { model.signingIn = true }
                                     .font(.caption.weight(.semibold)).foregroundStyle(cyberYellow)
+                                    .padFocus(on(.cloudAction), radius: 6, dx: 1, dy: 4)
                             }
                         }
-                        .frame(width: 300)
+                        .frame(width: 300).id(LFocus.cloudAction)
                         if model.cloudOn && !model.syncing {
                             HStack {
                                 Text("Syncs both ways with \(model.source.rawValue) - your PC and Mac get your phone saves")
                                     .font(.caption2).foregroundStyle(.white.opacity(0.45))
                                 Spacer()
                                 Button("Sign out") { model.signOut() }.font(.caption2).foregroundStyle(.white.opacity(0.5))
+                                    .padFocus(on(.signOut), radius: 6, dx: 1, dy: 4)
                             }
-                            .frame(width: 300)
+                            .frame(width: 300).id(LFocus.signOut)
                         }
                         HStack(alignment: .top) {
                             Text(model.importStatus ?? "Have saves from a Mac or PC? Copy the save folders to Files, then import them.")
@@ -364,20 +617,14 @@ private struct LauncherView: View {
                             Spacer()
                             Button("Import saves…") { model.importing = true }
                                 .font(.caption.weight(.semibold)).foregroundStyle(cyberYellow).disabled(model.syncing || model.starting)
+                                .padFocus(on(.importSaves), radius: 6, dx: 1, dy: 4)
                         }
-                        .frame(width: 300)
+                        .frame(width: 300).id(LFocus.importSaves)
                     }
 
     }
     private var playButton: some View {
-        Button {
-                        guard !model.starting, !model.syncing else { return }
-                        if model.dataNeedsUpdate { model.askUpdate = true; return }
-                        model.starting = true
-                        GameCloud.startWatching()
-                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                        model.onPlay(model.resolution, model.overlay)
-                    } label: {
+        Button { model.play() } label: {
                         HStack(spacing: 10) {
                             if model.starting { ProgressView().tint(.black) } else { Image(systemName: "play.fill") }
                             Text(model.starting ? "STARTING…" : "PLAY").font(.title3.weight(.black)).tracking(2)
@@ -388,6 +635,52 @@ private struct LauncherView: View {
                         .shadow(color: cyberYellow.opacity(0.35), radius: 12)
                     }
                     .disabled(model.starting || model.syncing)
+                    .padFocus(on(.play), color: .white, radius: 12, width: 3).id(LFocus.play)
+    }
+
+    // ---------------------------------------------------------------- questions (drawn here so the controller can answer; same look as the Mods screen's)
+    private func bigButton(_ t: String, pad: String, style: Int, _ action: @escaping () -> Void) -> some View {
+        // style 0 = plain, 1 = yellow, 2 = red
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Text(t).font(.subheadline.weight(.heavy)).lineLimit(1)
+                Text(pad).font(.caption2.weight(.bold)).padding(.horizontal, 5).padding(.vertical, 1).overlay(Capsule().stroke(lineWidth: 1)).opacity(0.6)
+            }
+            .foregroundStyle(style == 1 ? Color.black : .white).padding(.horizontal, 16).frame(minWidth: 110, minHeight: 44)
+            .background(style == 1 ? cyberYellow : (style == 2 ? cyberRed.opacity(0.85) : Color.white.opacity(0.12)), in: RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+    }
+    private func questionPanel<B: View, S: View>(_ title: String, _ message: String, @ViewBuilder wide: () -> B, @ViewBuilder stacked: () -> S) -> some View {
+        ZStack {
+            Color.black.opacity(0.72).ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 10) {
+                Text(title).font(.title3.weight(.heavy)).foregroundStyle(.white)
+                let text = Text(message).font(.caption).foregroundStyle(.white.opacity(0.85))
+                    .fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
+                ViewThatFits(in: .vertical) { text; ScrollView { text } }
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 10) { wide() }
+                    VStack(alignment: .leading, spacing: 8) { stacked() }       // upright (iPhone Duo): one under the other
+                }
+            }
+            .padding(18).frame(maxWidth: 640)
+            .background(Color(red: 0.09, green: 0.07, blue: 0.09), in: RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(cyberYellow.opacity(0.5)))
+            .padding(.horizontal, 20).padding(.vertical, 14)
+        }
+    }
+    private var restorePanel: some View {
+        let yes = bigButton("Restore", pad: "A", style: 2) { model.askRestore = false; restoreDefaults() }
+        let no = bigButton("Cancel", pad: "B", style: 0) { model.askRestore = false }
+        return questionPanel("Restore defaults?", "All options on this screen go back to the recommended settings, the on-screen buttons back to their standard places, and the game's graphics settings back to the phone defaults when you press Play. Your saves, cloud sign-in, game files and the game's audio, controls and gameplay settings stay as they are.",
+                             wide: { yes; Spacer(); no }, stacked: { yes; no })
+    }
+    private var updatePanel: some View {
+        let update = bigButton("Update Cyberpunk", pad: "A", style: 1) { model.askUpdate = false; model.updating = true }
+        let play = bigButton("Play anyway", pad: "Y", style: 2) { model.askUpdate = false; model.start(haptic: false) }
+        let no = bigButton("Cancel", pad: "B", style: 0) { model.askUpdate = false }
+        return questionPanel("Game data doesn't match", dataText ?? "", wide: { update; play; Spacer(); no }, stacked: { update; play; no })
     }
 
     var body: some View {
@@ -403,11 +696,12 @@ private struct LauncherView: View {
                     // upright (iPhone Duo): title on top, the options under it, PLAY at the bottom under the thumbs
                     VStack(alignment: .leading, spacing: 12) {
                         titleBlock
-                        ScrollView(.vertical, showsIndicators: false) {
+                        scroller {
                             VStack(alignment: .leading, spacing: 14) { optionRows }
                                 .padding(.vertical, 8).padding(.horizontal, 2)
                         }
                         noteText
+                        padHint
                         playButton
                         updateSection
                     }
@@ -419,8 +713,9 @@ private struct LauncherView: View {
                         VStack(alignment: .leading, spacing: 6) {
                             titleBlock
                             noteText.padding(.top, 14)
+                            padHint
                         }
-                        ScrollView(.vertical, showsIndicators: false) {
+                        scroller {
                         VStack(alignment: .leading, spacing: 14) {
                             optionRows
                             playButton.padding(.top, 4)
@@ -434,9 +729,17 @@ private struct LauncherView: View {
                     .frame(width: geo.size.width, height: geo.size.height)
                 }
             }
+            .accessibilityHidden(model.askRestore || model.askUpdate)
+            if model.askRestore { restorePanel }
+            if model.askUpdate { updatePanel }
         }
         .preferredColorScheme(.dark)
-        .onAppear { model.sync(); model.checkData() }
+        .onAppear {
+            model.sync(); model.checkData()
+            model.act = { f, k, rep in padAct(f, k, rep) }
+            model.restore = { restoreDefaults() }
+            model.startPad()
+        }
         .onChange(of: appleFrameGen) { on in
             // frame generation on: smooth pacing would see the made-up frames and drop to 30 - off once, can be turned on again
             guard on, smoothPacing else { return }
@@ -446,21 +749,6 @@ private struct LauncherView: View {
         .fullScreenCover(isPresented: $model.updating, onDismiss: { GameData.reset(); model.checkData() }) {
             let r = model.gameRoot ?? URL(fileURLWithPath: NSTemporaryDirectory())
             StoreView(model: StoreModel(downloadRoot: r, internalRoot: r, bookmarkKey: "", updateRoot: r))
-        }
-        .alert("Game data doesn't match", isPresented: $model.askUpdate) {
-            Button("Update Cyberpunk") { model.updating = true }
-            Button("Play anyway", role: .destructive) {
-                model.starting = true; GameCloud.startWatching(); model.onPlay(model.resolution, model.overlay)
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text(dataText ?? "")
-        }
-        .alert("Restore defaults?", isPresented: $askRestore) {
-            Button("Restore", role: .destructive) { restoreDefaults() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("All options on this screen go back to the recommended settings, the on-screen buttons back to their standard places, and the game's graphics settings back to the phone defaults when you press Play. Your saves, cloud sign-in, game files and the game's audio, controls and gameplay settings stay as they are.")
         }
         .fileImporter(isPresented: $model.importing, allowedContentTypes: [.folder], allowsMultipleSelection: true) { model.importSaves($0) }
         .sheet(isPresented: $model.signingIn) {
