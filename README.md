@@ -8,6 +8,9 @@ No emulation, no streaming: the Apple Silicon Mac build runs directly on iOS / i
 > The app is built on your Mac from that copy. CyPort is an independent fan project and is **not affiliated with or endorsed by
 > CD PROJEKT RED**. *Cyberpunk 2077* is a trademark of CD PROJEKT S.A.
 
+<p align="center"><a href="https://ko-fi.com/thijs2004"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support me on Ko-fi"></a><br>
+<sub>CyPort is free. If you enjoy it and want to say thanks, you can leave a tip on Ko-fi – completely optional.</sub></p>
+
 ---
 
 ## Status
