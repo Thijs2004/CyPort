@@ -507,7 +507,7 @@ actor SteamCM {
     enum EMsg: UInt32 {
         case multi = 1, serviceMethodResponse = 147, serviceMethodCallFromClient = 151, clientHeartBeat = 703, clientLogOnResponse = 751,
              clientLoggedOff = 757, clientGetDepotDecryptionKey = 5438, clientGetDepotDecryptionKeyResponse = 5439, clientLogon = 5514,
-             picsProductInfoRequest = 8903, picsProductInfoResponse = 8904, picsAccessTokenRequest = 8905, picsAccessTokenResponse = 8906, clientUFSGetFileListForApp = 5914,
+             picsProductInfoRequest = 8903, picsProductInfoResponse = 8904, picsAccessTokenRequest = 8905, picsAccessTokenResponse = 8906,
              serviceMethodCallFromClientNonAuthed = 9804, clientHello = 9805
     }
     struct Packet { let emsg: UInt32; let header: PBMessage; let body: Data }
