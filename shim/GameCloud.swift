@@ -511,10 +511,11 @@ enum SteamCloud {
     static func list() async throws -> [CloudFile] {
         try await SteamStore.shared.logOn()
         let cm = SteamStore.shared.cm
-        var q = PBWriter(); q.u(1, UInt64(Game.steamApp)); q.b(2, true)
-        let p = try await cm.call(.clientUFSGetFileListForApp, q)
-        let m = try PBMessage(p.body)
-        let prefixes = m.all(2).map { String(decoding: $0, as: UTF8.self) }
+        var q = PBWriter(); q.u(1, UInt64(Game.steamApp))
+        // Omit the last synced change number to request a full file list.
+        let m = try await cm.service("Cloud.GetAppFileChangelist#1", q, authed: true)
+        guard (m.u(3) ?? 0) == 0 else { throw StoreError("Steam Cloud returned a partial file list") }
+        let prefixes = m.all(4).map { String(decoding: $0, as: UTF8.self) }
         var out: [CloudFile] = []
         for raw in m.all(2) {
             let f = try PBMessage(raw)
