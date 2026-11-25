@@ -478,12 +478,12 @@ final class ModStore: @unchecked Sendable {
                 if let i = lp.firstIndex(of: "red4ext") {
                     let pname = (i + 2 < parts.count - 1 && lp[i + 1] == "plugins") ? parts[i + 2] : parts[parts.count - 1]
                     no(have.contains(ModStore.norm(pname)) ? "RED4ext plugin '\(pname)' (Windows .dll): its iOS build is already on the phone, this package is not needed"
-                                                           : "RED4ext plugin '\(pname)' (Windows .dll): needs an iOS build first", rel)
+                                                           : "RED4ext plugin '\(pname)' (Windows .dll): framework plugins are not supported in CyPort yet", rel)
                 } else { no("Windows native code (.dll): cannot run on iOS", rel) }
             } else if lp.contains("red4ext"), let i = lp.firstIndex(of: "plugins") {
                 let pname = i + 1 < parts.count - 1 ? parts[i + 1] : "?"
                 no(have.contains(ModStore.norm(pname)) ? "Files of RED4ext plugin '\(pname)': already on the phone with its iOS build"
-                                                       : "Files of RED4ext plugin '\(pname)': need the plugin's iOS build first", rel)
+                                                       : "Files of RED4ext plugin '\(pname)': framework plugins are not supported in CyPort yet", rel)
             } else if lp[0] == "bin", lp.contains("x64") {
                 no("bin/x64 files (Windows loaders): not supported", rel)
             } else if native {

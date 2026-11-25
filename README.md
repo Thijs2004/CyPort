@@ -223,33 +223,25 @@ Mod support was built by **Lucas Prado ([@LucasPrado97](https://github.com/Lucas
 **For players, in short:** download a mod from Nexus on the phone, tap **Mods → Import mod…**, pick the file, tap **Play**.
 No Mac and no signing are needed for mods.
 
-| | GOG 2.3.1 / 2.5 | Steam 2.5.0 (app built with `MODS=`) |
-|---|---|---|
-| `.archive` mods (outfits, textures, cars, replacers) | yes | yes |
-| `.reds` script mods without framework requirements (compiled on the phone in about a second) | yes | yes |
-| Mods that need RED4ext, Cyber Engine Tweaks, TweakXL, ArchiveXL, Codeware, Mod Settings, Input Loader, RedFileSystem, RedData or RedHttpClient | no | yes (plugins are in the app, all off until you turn them on) |
-| Mods that need Audioware | no | no (Audioware has no licence yet, so it is not bundled) |
+**What works (GOG 2.3.1, GOG 2.5 and Steam 2.5.0 game files):**
+- `.archive` mods: outfits, textures, cars, weapon skins, replacers
+- `.reds` script mods without framework requirements, compiled on the phone in about a second (a script that doesn't
+  compile is undone, and the game keeps its scripts)
+- import `.zip` / `.7z` / `.rar` / `.archive`, mods on/off, delete, profiles, load order, conflict and dependency checks,
+  automatic save backups
 
-Rule of thumb: if a mod's **Requirements** tab on Nexus is empty, it works on every version.
+Rule of thumb: if a mod's **Requirements** tab on Nexus is empty, it works.
 
-**Framework plugins (Steam Mac 2.5.0 only).** iOS does not let an app change game code while it runs, so the plugins'
-hooks are written into the game program when the app is built. The hook addresses were found for the **Steam Mac 2.5.0**
-executable (UUID `7D7382D0-EADD-36F0-BA1C-CEBEC1D5BEBC`). GOG 2.5 is a different build and does not match, and GOG 2.3.1
-has no addresses at all. To build an app with the plugins inside (they are signed with the app, so any sideloader works):
+**Not yet:** mods that need RED4ext, Cyber Engine Tweaks, TweakXL, ArchiveXL, Codeware, Mod Settings, Input Loader,
+RedFileSystem, RedData, RedHttpClient or Audioware. iOS doesn't let an app change game code while it runs, so these
+frameworks need their hook points built into the game program, and the addresses for that are only known for one game
+build so far. Framework mods are planned for a later update. (For developers: the iOS ports and an experimental
+`MODS=` build for Steam Mac 2.5.0 are described in `docs/MOD-SUPPORT-HANDOFF.md`; untested inside the app.)
 
-```bash
-tools/make-mod-pack.sh /path/to/modpack            # needs the plugin forks built (docs/MOD-SUPPORT-HANDOFF.md)
-MODS=/path/to/modpack GAME_APP="/path/to/Steam/Cyberpunk2077.app" ./build.sh
-```
-
-`build.sh` only bundles the pack when the game program is Steam Mac 2.5.0 and the app is built for that one version. At
-start the shim copies the plugins' data into the game folder and puts every plugin in `CyPort/disabled-plugins/`: they
-stay off until you turn one on in **Mods → Plugins** (importing a mod that needs one offers to turn it on).
-
-Credits for the frameworks (CyPort only ships iOS builds of their work): wopss (RED4ext), psiberx (TweakXL, ArchiveXL,
-Codeware), yamashi and the Cyber Engine Tweaks team, jackhumbert (Mod Settings, Input Loader), rayshader (RedFileSystem,
-RedData, RedHttpClient), jac3km4 (redscript, red4ext-rs), cyb3rpsych0s1s (Audioware), and codeman101 (the Mac ports).
-Licence texts travel with the app in `ModSupport/licenses/`; see `NOTICE`.
+Credits: mod support by Lucas Prado. The framework ports build on the work of wopss (RED4ext), psiberx (TweakXL,
+ArchiveXL, Codeware), yamashi and the Cyber Engine Tweaks team, jackhumbert (Mod Settings, Input Loader), rayshader
+(RedFileSystem, RedData, RedHttpClient), jac3km4 (redscript, red4ext-rs), cyb3rpsych0s1s (Audioware) and codeman101
+(the Mac ports). The on-phone script compiler is redscript by jac3km4. See `NOTICE`.
 
 #### How the Mods screen works
 

@@ -811,8 +811,11 @@ struct ModManagerView: View {
                         else { actionRow(.changes, "Changed since the last Play", "clock.badge.exclamationmark", c.prefix(2).joined(separator: " · ") + (c.count > 2 ? " · and \(c.count - 2) more" : "")) }
                     }
                     modSections
-                    header("FRAMEWORK PLUGINS", pluginsNote)
-                    ForEach(ModCatalog.all) { catalogRow($0) }
+                    // framework plugins only show in an app that carries them and can run them (MODS= build for Steam 2.5.0)
+                    if ModCatalog.state == "ok" {
+                        header("FRAMEWORK PLUGINS", pluginsNote)
+                        ForEach(ModCatalog.all) { catalogRow($0) }
+                    }
                     let others = model.list.plugins.filter { !ModCatalog.folders.contains($0.name) }
                     if !others.isEmpty {
                         header("OTHER PLUGINS (RED4EXT)", "Plugin folders you put in red4ext/plugins yourself.")
