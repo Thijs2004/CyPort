@@ -149,7 +149,9 @@ private enum MMPad { case up, down, a, b, x, y }
     var rows: [MMRow] {
         var r: [MMRow] = [.search, .sort, .filter, .importMod]
         if let c = list.changes, !c.isEmpty { r.append(.changes) }
-        r += shown(list.mods).map { .mod($0.id) } + shown(list.unmanaged).map { .mod($0.id) } + list.plugins.map { .plugin($0.name) }
+        r += shown(list.mods).map { .mod($0.id) } + shown(list.unmanaged).map { .mod($0.id) }
+        r += ModCatalog.all.compactMap { c in list.plugins.first { $0.name == c.folder }.map { .plugin($0.name) } }
+        r += list.plugins.filter { !ModCatalog.folders.contains($0.name) }.map { .plugin($0.name) }
         if !archiveMods.isEmpty { r += [.order, .modlist] }
         r += [.saveProfile] + list.profiles.map { .profile($0.id) }
         r += [.recompile, .restore, .original, .backupToggle, .backupKeep, .backupNow] + list.backups.map { .backup($0.id) }
@@ -238,7 +240,10 @@ private enum MMPad { case up, down, a, b, x, y }
         if compile { msg += "\n\nIts scripts are part of the game's compiled scripts, so the scripts are recompiled now (a few seconds)." }
         let w = compile ? store.compileWarnings().filter { !$0.hasPrefix(p.name + " is on") } : []
         if !w.isEmpty { msg += "\n\n" + w.joined(separator: "\n\n") }
-        question = MMQuestion(title: "Turn \(p.name) \(on ? "on" : "off")?", message: msg, yes: on ? "Turn on" : "Turn off", destructive: !on, backupOffer: true) {
+        let cat = ModCatalog.all.first { $0.folder == p.name }
+        if let cat { msg = (on ? "\(cat.title) is already in the app: installing puts it in the game, and it loads the next time you press Play." : "\(cat.title) is taken out of the game (it stays in the app, you can install it again). Mods that need it stop working" + (p.usedBy.isEmpty ? "." : ": " + p.usedBy.joined(separator: ", ") + ".")) + msg.drop { $0 != "\n" } }
+        question = MMQuestion(title: cat.map { "\(on ? "Install" : "Remove") \($0.title)?" } ?? "Turn \(p.name) \(on ? "on" : "off")?", message: msg,
+                              yes: cat != nil ? (on ? "Install" : "Remove") : (on ? "Turn on" : "Turn off"), destructive: !on, backupOffer: true) {
             self.run(compile ? "Moving \(p.name) and compiling scripts…" : "Moving \(p.name)…") { s in
                 let note = s.backupSaves()
                 try s.setPluginEnabled(p.name, on)
@@ -647,6 +652,37 @@ struct ModManagerView: View {
         }
         .buttonStyle(.plain).background(box(focused)).id(MMRow.plugin(p.name))
     }
+    /// a framework plugin: Install / Installed when this app carries it and the game can run it, greyed out otherwise
+    private func catalogRow(_ c: ModCatalogEntry) -> some View {
+        let p = model.list.plugins.first { $0.name == c.folder }
+        let usable = p != nil && ModCatalog.state == "ok", on = p?.enabled ?? false
+        let focused = p.map { model.focus == .plugin($0.name) } ?? false
+        let status = !usable ? (ModCatalog.state == "nohooks" || p == nil ? "Needs Cyberpunk 2.5.0 from Steam" : "Not available")
+                             : on ? "Installed" + ((p?.usedBy.isEmpty ?? true) ? "" : " · used by \(mmCount(p!.usedBy.count, "mod"))") : "Not installed"
+        return Button { if let p, usable { model.focus = nil; model.togglePlugin(p) } } label: {
+            HStack(spacing: 12) {
+                Image(systemName: on ? "checkmark.seal.fill" : "puzzlepiece.extension").font(.title3)
+                    .foregroundStyle(on ? mmYellow : .white.opacity(usable ? 0.55 : 0.25)).frame(width: 30)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(c.title).font(.headline).foregroundStyle(.white.opacity(usable ? 1 : 0.45)).lineLimit(1)
+                    Text(c.what).font(.caption).foregroundStyle(.white.opacity(usable ? 0.7 : 0.35)).fixedSize(horizontal: false, vertical: true).multilineTextAlignment(.leading)
+                    Text("by \(c.by) · \(String(format: c.mb < 1 ? "%.1f" : "%.0f", c.mb)) MB · \(status)").font(.caption2)
+                        .foregroundStyle(on ? mmYellow.opacity(0.9) : .white.opacity(usable ? 0.5 : 0.3)).lineLimit(2)
+                }
+                Spacer(minLength: 8)
+                if usable {
+                    Text(on ? "Remove" : "Install").font(.subheadline.weight(.heavy))
+                        .foregroundStyle(on ? Color.white : Color.black)
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .background(Capsule().fill(on ? Color.white.opacity(0.15) : mmYellow))
+                } else {
+                    Image(systemName: "lock.fill").font(.subheadline).foregroundStyle(.white.opacity(0.3))
+                }
+            }
+            .padding(.horizontal, 14).padding(.vertical, 10).frame(minHeight: 70).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain).disabled(!usable).background(box(focused)).id(MMRow.plugin(c.folder))
+    }
     /// a row that does something (chevron), shows a value, or is a switch
     private func actionRow(_ row: MMRow, _ title: String, _ icon: String, _ note: String, strong: Bool = false, value: String? = nil, on: Bool? = nil) -> some View {
         let focused = model.focus == row
@@ -775,8 +811,13 @@ struct ModManagerView: View {
                         else { actionRow(.changes, "Changed since the last Play", "clock.badge.exclamationmark", c.prefix(2).joined(separator: " · ") + (c.count > 2 ? " · and \(c.count - 2) more" : "")) }
                     }
                     modSections
-                    header("PLUGINS (RED4EXT)", pluginsNote)
-                    ForEach(model.list.plugins) { pluginRow($0) }
+                    header("FRAMEWORK PLUGINS", pluginsNote)
+                    ForEach(ModCatalog.all) { catalogRow($0) }
+                    let others = model.list.plugins.filter { !ModCatalog.folders.contains($0.name) }
+                    if !others.isEmpty {
+                        header("OTHER PLUGINS (RED4EXT)", "Plugin folders you put in red4ext/plugins yourself.")
+                        ForEach(others) { pluginRow($0) }
+                    }
                     orderSection
                     profileSection
                     header("SCRIPTS", model.hasPristine ? "Script mods (.reds) and plugin scripts are compiled on the phone, always starting from the game's original scripts."
@@ -1164,8 +1205,11 @@ extension ModManagerView {
     /// the bundled plugins (ModSupport/) need the Steam 2.5.0 game program; the shim says at start whether they can load
     var pluginsNote: String {
         if UserDefaults.standard.string(forKey: "CyPortModPlugins") == "nohooks" {
-            return "RED4ext, Cyber Engine Tweaks, TweakXL, ArchiveXL, Codeware and the other plugins are in this app, but they only run with Cyberpunk 2.5.0 from Steam (an app built for that one version). Plain .archive and script mods work without them."
+            return "These run only with Cyberpunk 2.5.0 from Steam, in a CyPort built for that version: the game's code has to be prepared for them when the app is built. Plain .archive mods and script mods without requirements work without them."
         }
-        return model.list.plugins.isEmpty ? "No plugin folders in red4ext/plugins." : "All plugins start off. Turn on the ones your mods need (importing a mod offers it); turning one off moves its folder out of the game and mods that need it stop working."
+        if ModCatalog.state == "ok" {
+            return "Already in the app, nothing to download. Install the ones your mods need (importing a mod offers it). Remove takes one out of the game; mods that need it stop working."
+        }
+        return "Not in this build of CyPort. They run only with Cyberpunk 2.5.0 from Steam, in a CyPort built for that version. Plain .archive mods and script mods without requirements work without them."
     }
 }

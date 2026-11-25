@@ -86,6 +86,29 @@ struct ModPlugin: Identifiable, Hashable {
     var id: String { name }
 }
 
+/// the framework plugins CyPort can ship inside the app (tools/make-mod-pack.sh): shown on the Mods screen even when this
+/// build has none of them, so players see what exists and why it is off
+struct ModCatalogEntry: Identifiable {
+    let folder: String, title: String, what: String, by: String, mb: Double
+    var id: String { folder }
+}
+enum ModCatalog {
+    static let all: [ModCatalogEntry] = [
+        .init(folder: "cyber_engine_tweaks", title: "Cyber Engine Tweaks", what: "Console, overlay menu and Lua mods (Appearance Menu Mod, trainers, many tools)", by: "yamashi and the CET team", mb: 12),
+        .init(folder: "Codeware", title: "Codeware", what: "Script library that many script mods need", by: "psiberx", mb: 5.4),
+        .init(folder: "ArchiveXL", title: "ArchiveXL", what: "New outfits, cars, hair and items added next to the game's own", by: "psiberx", mb: 5.3),
+        .init(folder: "TweakXL", title: "TweakXL", what: "Mods that change items, stats, weapons, vehicles and loot", by: "psiberx", mb: 3.3),
+        .init(folder: "mod_settings", title: "Mod Settings", what: "In-game menu where mods have their own options", by: "jackhumbert", mb: 1.1),
+        .init(folder: "input_loader", title: "Input Loader", what: "Lets mods add their own keys and buttons", by: "jackhumbert", mb: 0.6),
+        .init(folder: "RedData", title: "RedData", what: "JSON helper used by some mods", by: "rayshader", mb: 1.3),
+        .init(folder: "RedFileSystem", title: "RedFileSystem", what: "Lets mods save their own files", by: "rayshader", mb: 0.6),
+        .init(folder: "RedHttpClient", title: "RedHttpClient", what: "Lets mods talk to the internet", by: "rayshader", mb: 0.6),
+    ]
+    static let folders = Set(all.map(\.folder))
+    /// "ok": the bundled plugins can load; "nohooks": bundled or not, this game program can't run them (set by the shim at start)
+    static var state: String? { UserDefaults.standard.string(forKey: "CyPortModPlugins") }
+}
+
 struct ModList {
     var mods: [ModManifest] = []          // installed by CyPort
     var unmanaged: [ModManifest] = []     // found in the game folder
