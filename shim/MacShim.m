@@ -1691,7 +1691,7 @@ static NSString *MSGB(uint64_t b) { return [NSString stringWithFormat:@"%.1f GB"
     _info = [UILabel new]; _info.numberOfLines = 0; _info.textColor = [UIColor colorWithWhite:0.8 alpha:1]; _info.font = [UIFont systemFontOfSize:17];
     _importBtn = [UIButton buttonWithType:UIButtonTypeSystem]; _importBtn.titleLabel.font = [UIFont boldSystemFontOfSize:20];
     [_importBtn addTarget:self action:@selector(importTapped) forControlEvents:UIControlEventTouchUpInside];
-    _ssdBtn = [UIButton buttonWithType:UIButtonTypeSystem]; [_ssdBtn setTitle:@"Play from the SSD instead (no copy)…" forState:UIControlStateNormal];
+    _ssdBtn = [UIButton buttonWithType:UIButtonTypeSystem]; [_ssdBtn setTitle:@"Play from the SSD instead (no copy, experimental)…" forState:UIControlStateNormal];
     _ssdBtn.titleLabel.font = [UIFont systemFontOfSize:15]; [_ssdBtn addTarget:self action:@selector(ssdTapped) forControlEvents:UIControlEventTouchUpInside];
     _bar = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault]; _bar.hidden = YES;
     _status = [UILabel new]; _status.numberOfLines = 0; _status.textColor = UIColor.systemOrangeColor; _status.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightRegular];
@@ -1700,7 +1700,7 @@ static NSString *MSGB(uint64_t b) { return [NSString stringWithFormat:@"%.1f GB"
     [_storeBtn setTitle:@"Download from Steam, GOG or Epic…" forState:UIControlStateNormal];
     [_storeBtn addTarget:self action:@selector(storeTapped) forControlEvents:UIControlEventTouchUpInside];
     _storeBtn.hidden = NSClassFromString(@"MSStoreUI") == nil;
-    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[ title, _info, _storeBtn, _importBtn, _ssdBtn, _bar, _status ]];   /* "play from SSD" back (local build) */
+    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[ title, _info, _storeBtn, _importBtn, _ssdBtn, _bar, _status ]];   /* "play from SSD" is back (tester #23: fine on 2.5); reads from it stay throttled */
     st.axis = UILayoutConstraintAxisVertical; st.spacing = 20; st.translatesAutoresizingMaskIntoConstraints = NO; [self.view addSubview:st];
     [NSLayoutConstraint activateConstraints:@[
         [st.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor], [st.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
@@ -2674,6 +2674,11 @@ static void MSLogInstallInfo(void) {
 extern size_t os_proc_available_memory(void);
 static unsigned long long g_realMemBytes;                    /* the phone's real RAM (physicalMemory before the swizzle) */
 static double g_memLimitGB;                                   /* iOS's per-app limit, measured at the first ask */
+/* "Memory headroom" (start screen, CyPortMemoryHeadroom, default off) / plist MemoryHeadroom: the game is told 6 GB of RAM
+   and at most 5 GB for the GPU - the values testers on 12 GB phones (8 GB per-app limit, or 6 GB inside LiveContainer)
+   played long sessions with (#10, #16, #19): Metal recommends 8 GB there, more than iOS lets the app use. MemSizeGB /
+   GPUBudgetGB in the plist still win. */
+static BOOL MSHeadroomOn(void) { id v = MSConfig()[@"MemoryHeadroom"]; return [v respondsToSelector:@selector(boolValue)] ? [v boolValue] : MSPref(@"CyPortMemoryHeadroom", 0) != 0; }
 static double MSFitMemSizeGB(void) {
     static double fit = -1;
     if (fit >= 0) return fit;
@@ -2686,7 +2691,7 @@ static double MSFitMemSizeGB(void) {
     task_vm_info_data_t v; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&v, &n) != KERN_SUCCESS) return 0;
     g_memLimitGB = (avail + v.phys_footprint) / 1073741824.0;
-    double gb = fmin(fmin(g_memLimitGB + 1.0, MSCfgD(@"MemoryFitMaxGB", 7)), real / 1073741824.0);
+    double gb = fmin(fmin(g_memLimitGB + 1.0, MSCfgD(@"MemoryFitMaxGB", MSHeadroomOn() ? 6 : 7)), real / 1073741824.0);
     gb = fmax(floor(gb * 4) / 4, 4);
     fit = gb;
     MSLogf(@"memory: iOS lets this app use ~%.2f GB of the phone's %.1f GB; the game is told %.2f GB", g_memLimitGB, real / 1073741824.0, gb);
@@ -3314,7 +3319,9 @@ FILE *ms_fopen(const char *path, const char *mode) { MS_CASE_RETRY(k_fopen(path,
  * fails block the IO thread, wait for the volume to come back, open the file again and send that fd's reads and seeks
  * to the new file from then on (the engine keeps its own fd number; dup2 onto it left it EBADF on device). Game-file
  * reads are also throttled to keep the drive's power draw down (macshim.plist: MaxParallelReads, default 1;
- * ReadChunkKB, default 1024; MaxReadMBps, default 120, 0 = no cap). */
+ * ReadChunkKB, default 1024; MaxReadMBps, default 120, 0 = no cap). Every drop seen so far came during the fastest
+ * reading (60-75 MB/s while loading), so after a drop the cap goes down for the rest of the session: DropReadMBps
+ * (default 40, 0 = leave it), then a quarter lower on every further drop, never under 20 MB/s. */
 #define MS_MAXFD 4096
 static char *g_fdPath[MS_MAXFD];                 /* absolute path of game files opened with open(), by fd */
 static off_t g_fdPos[MS_MAXFD];                  /* their file offset, kept by read()/lseek() so it survives a dead fd */
@@ -3322,6 +3329,7 @@ static int g_fdAlt[MS_MAXFD];                    /* replacement fd + 1 after a r
 static os_unfair_lock g_fdLock = OS_UNFAIR_LOCK_INIT;
 static pthread_mutex_t g_driveLock = PTHREAD_MUTEX_INITIALIZER;
 static dispatch_semaphore_t g_readSlots;
+static _Atomic double g_readRate;                /* game-file read cap in bytes per second, 0 = none (set in ms_read) */
 static UILabel *g_driveBanner;
 static int (*k_close)(int);
 static off_t (*k_lseek)(int, off_t, int);
@@ -3365,6 +3373,7 @@ static char *MSFdPath(int fd) {                  /* malloc'd copy or NULL */
     if (fd < 0 || fd >= MS_MAXFD) return NULL;
     os_unfair_lock_lock(&g_fdLock); char *p = g_fdPath[fd] ? strdup(g_fdPath[fd]) : NULL; os_unfair_lock_unlock(&g_fdLock); return p;
 }
+/* small pill at the top of the screen while the SSD is away: never takes touches, never covers the game */
 static void MSBanner(NSString *text) {
     MSMainAsync(^{
         static UIWindow *w;
@@ -3374,49 +3383,107 @@ static void MSBanner(NSString *text) {
             if (!sc) return;
             w = [[UIWindow alloc] initWithWindowScene:sc]; w.windowLevel = UIWindowLevelAlert + 10; w.userInteractionEnabled = NO;
             w.backgroundColor = UIColor.clearColor; w.rootViewController = [UIViewController new];
+            w.rootViewController.view.userInteractionEnabled = NO; w.rootViewController.view.backgroundColor = UIColor.clearColor;
         }
         w.hidden = NO;
         if (!g_driveBanner) {
-            g_driveBanner = [UILabel new]; g_driveBanner.numberOfLines = 0; g_driveBanner.textAlignment = NSTextAlignmentCenter;
-            g_driveBanner.textColor = UIColor.whiteColor; g_driveBanner.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75];
-            g_driveBanner.font = [UIFont boldSystemFontOfSize:18]; g_driveBanner.frame = w.bounds;
-            g_driveBanner.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            g_driveBanner = [UILabel new]; g_driveBanner.numberOfLines = 2; g_driveBanner.textAlignment = NSTextAlignmentCenter;
+            g_driveBanner.textColor = UIColor.whiteColor; g_driveBanner.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
+            g_driveBanner.font = [UIFont boldSystemFontOfSize:13]; g_driveBanner.layer.cornerRadius = 12; g_driveBanner.clipsToBounds = YES;
+            g_driveBanner.userInteractionEnabled = NO;
         }
-        g_driveBanner.text = text; [w addSubview:g_driveBanner];
+        g_driveBanner.text = text;
+        CGSize sz = [g_driveBanner sizeThatFits:CGSizeMake(w.bounds.size.width * 0.6, 60)];
+        CGFloat bw = MIN(sz.width + 28, w.bounds.size.width - 32), bh = sz.height + 12;
+        g_driveBanner.frame = CGRectMake((w.bounds.size.width - bw) / 2, 8, bw, bh);
+        g_driveBanner.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
+        [w addSubview:g_driveBanner];
     });
 }
-/* Blocks until the game folder is reachable again (YES) or gives up after ~3 minutes (NO). One thread waits, the rest
- * queue on the lock and return at once when the drive is back. */
-static BOOL MSWaitForDrive(const char *why) {
-    if (!g_external) return NO;
-    pthread_mutex_lock(&g_driveLock);
-    BOOL up = MSDriveUp();
-    if (!up) {
-        static int drops; MSLogf(@"SSD unreachable (%s) - drop #%d, waiting for it to come back", why, ++drops);
-        MSBanner(@"Lost connection to the SSD.\nUnplug it and plug it back in - the game continues when it's back.");
-        double t0 = CACurrentMediaTime();
-        for (int i = 0; !up && CACurrentMediaTime() - t0 < 180; i++) {
-            usleep(250000);
-            if (i % 8 == 7) @autoreleasepool {              /* every 2 s: the volume may remount under a new path */
-                NSURL *u = MSResolveBookmark();
-                if (u && ![u.path isEqualToString:g_root]) {
-                    MSLogf(@"game folder moved: %@ -> %@", g_root, u.path);
-                    NSString *old = g_root; g_scopedURL = u; g_root = u.path; chdir(u.path.fileSystemRepresentation);
-                    os_unfair_lock_lock(&g_fdLock);
-                    size_t ol = strlen(old.fileSystemRepresentation);
-                    for (int fd = 0; fd < MS_MAXFD; fd++) if (g_fdPath[fd] && !strncmp(g_fdPath[fd], old.fileSystemRepresentation, ol)) {
-                        char *np = NULL; asprintf(&np, "%s%s", u.path.fileSystemRepresentation, g_fdPath[fd] + ol); free(g_fdPath[fd]); g_fdPath[fd] = np;
-                    }
-                    os_unfair_lock_unlock(&g_fdLock);
-                }
-            }
-            up = MSDriveUp();
+/* Is the game folder reachable? Asked on a helper thread with a time limit: while a half-mounted SSD hangs, stat and
+ * bookmark calls can block in userfsd for good, which used to freeze the waiter (and keep the banner up forever).
+ * `resolve` also re-resolves the bookmark, since a replugged SSD can mount under a new path and needs fresh access.
+ * Only one check runs at a time; a stuck one counts as "not back". */
+static _Atomic int g_driveCheckBusy;
+static __thread int t_driveCheck;                                /* set on the check helper: its own IO must never wait */
+static BOOL MSDriveUpTimed(BOOL resolve, double timeout) {
+    if (g_driveCheckBusy) return NO;
+    g_driveCheckBusy = 1;
+    __block _Atomic int up = 0; __block NSURL *found = nil; dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        t_driveCheck = 1;
+        @autoreleasepool {
+            NSURL *u = resolve ? MSResolveBookmark() : nil;
+            if (u) found = u;
+            up = MSDriveUp() || (u && MSLooksLikeGameFolder(u.path));
         }
-        MSLogf(up ? @"SSD back after %.1f s" : @"SSD still gone after %.0f s - giving up", CACurrentMediaTime() - t0);
-        MSBanner(nil);
-    }
-    pthread_mutex_unlock(&g_driveLock);
+        t_driveCheck = 0; g_driveCheckBusy = 0; dispatch_semaphore_signal(done);
+    });
+    if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC))) != 0) return NO;
+    NSURL *u = found;
+    if (u && ![u.path isEqualToString:g_root]) {                /* remounted under a new path: move every tracked fd over */
+        MSLogf(@"game folder moved: %@ -> %@", g_root, u.path);
+        NSString *old = g_root; g_scopedURL = u; g_root = u.path; chdir(u.path.fileSystemRepresentation);
+        os_unfair_lock_lock(&g_fdLock);
+        size_t ol = strlen(old.fileSystemRepresentation);
+        for (int fd = 0; fd < MS_MAXFD; fd++) if (g_fdPath[fd] && !strncmp(g_fdPath[fd], old.fileSystemRepresentation, ol)) {
+            char *np = NULL; asprintf(&np, "%s%s", u.path.fileSystemRepresentation, g_fdPath[fd] + ol); free(g_fdPath[fd]); g_fdPath[fd] = np;
+        }
+        os_unfair_lock_unlock(&g_fdLock);
+        up = MSDriveUp();
+    } else if (u) g_scopedURL = u;                               /* same path, fresh sandbox access after a replug */
     return up;
+}
+/* Blocks until the game folder is reachable again. The polling runs on its own user-initiated thread: the engine's
+ * streaming IO threads ask for background QoS, which a hot phone throttles so hard that a wait loop on them once went
+ * 95 s without a single check (no "still away", no "back", banner stuck). Game threads that hit the drop just sleep on
+ * g_driveCond until the watcher says the drive is back. No time limit: the engine treats a failed read as fatal, and the
+ * game keeps running on what it already loaded meanwhile, so waiting is always better than giving up. */
+static pthread_cond_t g_driveCond = PTHREAD_COND_INITIALIZER;
+static int g_driveAway; static unsigned g_driveBackGen;          /* both under g_driveLock */
+static void *MSDriveWatcher(void *arg) {
+    pthread_setname_np("CyPort SSD watcher");
+    double t0 = CACurrentMediaTime(), lastLog = t0; BOOL up = NO;
+    for (int i = 0; !up; i++) {
+        usleep(500000);
+        up = MSDriveUpTimed(i % 4 == 3, 3);                      /* every 2 s also re-resolve the bookmark */
+        if (!up && CACurrentMediaTime() - lastLog >= 15) {
+            lastLog = CACurrentMediaTime();
+            MSLogf(@"SSD still away after %.0f s%s", lastLog - t0, g_driveCheckBusy ? " (the drive isn't answering at all)" : "");
+        }
+    }
+    MSLogf(@"SSD back after %.1f s", CACurrentMediaTime() - t0);
+    MSBanner(@"SSD reconnected");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if ([g_driveBanner.text isEqualToString:@"SSD reconnected"]) MSBanner(nil);
+    });
+    pthread_mutex_lock(&g_driveLock); g_driveAway = 0; g_driveBackGen++; pthread_cond_broadcast(&g_driveCond); pthread_mutex_unlock(&g_driveLock);
+    return NULL;
+}
+static BOOL MSWaitForDrive(const char *why) {
+    if (!g_external || t_driveCheck) return NO;
+    pthread_mutex_lock(&g_driveLock);
+    if (!g_driveAway) {
+        if (MSDriveUpTimed(NO, 3)) { pthread_mutex_unlock(&g_driveLock); return YES; }
+        static int drops; MSLogf(@"SSD unreachable (%s) - drop #%d, waiting for it to come back", why, ++drops);
+        { double d = MSCfgD(@"DropReadMBps", 40) * 1048576.0, cur = g_readRate, nr = cur;
+          if (d > 0) nr = drops == 1 ? (cur > 0 ? MIN(cur, d) : d) : MAX(20 * 1048576.0, (cur > 0 ? cur : d) * 0.75);
+          if (d > 0 && nr != cur) { g_readRate = nr; MSLogf(@"SSD reads slowed to %.0f MB/s for this session (was %@)", nr / 1048576.0,
+                                                    cur > 0 ? [NSString stringWithFormat:@"%.0f MB/s", cur / 1048576.0] : @"no cap"); } }
+        MSBanner(@"SSD disconnected - reconnecting…\nIf it stays, unplug it and plug it back in.");
+        g_driveAway = 1;
+        pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        pthread_attr_set_qos_class_np(&a, QOS_CLASS_USER_INITIATED, 0);
+        pthread_t t; int e = pthread_create(&t, &a, MSDriveWatcher, NULL); pthread_attr_destroy(&a);
+        if (e) {                                                 /* no thread: watch from here (it takes the lock itself) */
+            MSLogf(@"SSD watcher thread failed (%s) - waiting on this thread", strerror(e));
+            pthread_mutex_unlock(&g_driveLock); MSDriveWatcher(NULL); return YES;
+        }
+    }
+    unsigned gen = g_driveBackGen;
+    while (g_driveBackGen == gen) pthread_cond_wait(&g_driveCond, &g_driveLock);
+    pthread_mutex_unlock(&g_driveLock);
+    return YES;
 }
 /* open a tracked game file again at `off` and route the fd's IO to it */
 static BOOL MSReopenFd(int fd, off_t off) {
@@ -4055,6 +4122,7 @@ static id ms_extendedGamepad(GCController *self, SEL _cmd) {
  * them (unless GameController already did within 30 ms). */
 static NSMapTable *g_padHandlers, *g_padFired;           /* element -> game's handler, element -> last time it ran */
 static BOOL g_realHandlerSeen;                            /* the game has hooked up a real controller (set a handler on it) */
+static _Atomic long long g_vbGameRan;                     /* the game's handlers on on-screen buttons ran (pressed) */
 static BOOL MSIsPadObject(id o) {
     if (!g_pad || !o) return NO;
     if (o == g_pad) return YES;
@@ -4119,6 +4187,25 @@ static long long g_coIn, g_coOut, g_coPolled;
 static _Atomic long long g_gcSent[3], g_gcArrived;     /* g_gcArrived: any thread, before the hop to the game thread */                        /* reports GameController delivered: buttons, triggers, sticks */
 static NSHashTable<MSCoSlot *> *g_coAll;                     /* every analog slot of a real controller (weak) */
 static BOOL MSCoalesceOn(void) { static int on = -1; if (on < 0) on = MSCfgD(@"PadCoalesce", 1) != 0; return on; }
+/* Pads in Switch mode (Switch Pro Controller / Joy-Con; GameSir X5 Lite "_S", tester #21) never delivered a stick report
+   while coalescing was on - buttons fine, sticks dead - and work with PadCoalesce = NO. A connected Switch-category pad
+   gets its handlers as they are (like PadCoalesce = NO); other pads keep coalescing. Setting PadCoalesce in the plist
+   (YES or NO) decides for every pad. */
+static BOOL MSCoalesceForRealPad(void) {
+    if (!MSCoalesceOn()) return NO;
+    if (MSConfig()[@"PadCoalesce"]) return YES;
+    NSArray *all = g_origControllers ? ((NSArray *(*)(id, SEL))g_origControllers)(GCController.class, @selector(controllers)) : GCController.controllers;
+    for (GCController *c in all) {
+        if (c == g_vpad || c.isSnapshot) continue;
+        NSString *cat = g_origCategory ? ((NSString *(*)(id, SEL))g_origCategory)(c, @selector(productCategory)) : c.productCategory;
+        if ([cat rangeOfString:@"Switch" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [cat rangeOfString:@"Joy-Con" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            static int said; if (!said++) MSLogf(@"controller: '%@' (%@) is a Switch-mode pad - its sticks go to the game without coalescing", c.vendorName, cat);
+            return NO;
+        }
+    }
+    return YES;
+}
 static void MSCoRun(MSCoSlot *s) {
     id e = s->el; if (!e) return;
     g_coOut++;
@@ -4248,14 +4335,14 @@ static void ms_setValueChangedHandler(id self, SEL _cmd, id handler) {
         @synchronized (g_padHandlers) { [g_padHandlers setObject:real forKey:self]; }
         __weak id weakSelf = self;
         if ([self isKindOfClass:GCControllerButtonInput.class])
-            h = ^(GCControllerButtonInput *b, float v, BOOL p) { @synchronized (g_padHandlers) { [g_padFired setObject:@(CACurrentMediaTime()) forKey:weakSelf]; } ((void (^)(id, float, BOOL))real)(b, v, p); };
+            h = ^(GCControllerButtonInput *b, float v, BOOL p) { if (p) g_vbGameRan++; @synchronized (g_padHandlers) { [g_padFired setObject:@(CACurrentMediaTime()) forKey:weakSelf]; } ((void (^)(id, float, BOOL))real)(b, v, p); };
         else if ([self isKindOfClass:GCControllerDirectionPad.class])
             h = ^(GCControllerDirectionPad *d, float x, float y) { @synchronized (g_padHandlers) { [g_padFired setObject:@(CACurrentMediaTime()) forKey:weakSelf]; } ((void (^)(id, float, float))real)(d, x, y); };
         else if ([self isKindOfClass:GCControllerAxisInput.class])
             h = ^(GCControllerAxisInput *a, float v) { @synchronized (g_padHandlers) { [g_padFired setObject:@(CACurrentMediaTime()) forKey:weakSelf]; } ((void (^)(id, float))real)(a, v); };
         else
             h = ^(id g, GCControllerElement *el) { @synchronized (g_padHandlers) { [g_padFired setObject:@(CACurrentMediaTime()) forKey:weakSelf]; } ((void (^)(id, id))real)(g, el); };
-    } else if (handler && MSCoalesceOn()) {                       /* a real controller: newest stick value once per frame */
+    } else if (handler && MSCoalesceForRealPad()) {              /* a real controller: newest stick value once per frame */
         h = MSCoWrap(self, handler, MSCfgD(@"PadTiming", 0) != 0);
         NSArray *all = g_origControllers ? ((NSArray *(*)(id, SEL))g_origControllers)(GCController.class, @selector(controllers)) : GCController.controllers;
         for (GCController *c in all) MSPadNoGestureDelay(c);       /* the game hooks up a controller: ~21 calls, cheap */
@@ -4322,6 +4409,7 @@ static void MSPadFlushVpad(void) {
     for (GCControllerElement *el in d) MSPadNotify(el);
 }
 static void MSPadMirrorGeneric(void); static void MSFIReport(void);
+static _Atomic long long g_vbNil, g_vbPress, g_vbNoHandler;
 static void MSPadFlushCoalesced(void) {
     MSPadMirrorGeneric(); MSFIReport();
     MSPadFlushVpad(); MSPadFlushReal();
@@ -4331,12 +4419,26 @@ static void MSPadFlushCoalesced(void) {
     if (rep > 0 && (g_coIn || g_coOut || gb || gt || gs || ga))
         MSLogf(@"controller: in 30 s %lld callbacks from GameController; on the game thread %lld button, %lld trigger, %lld stick reports; %lld stick/trigger reports reached the game thread, %lld values handed to the game (%lld found by the per-frame read), %lu analog inputs watched",
                ga, gb, gt, gs, g_coIn, g_coOut, g_coPolled, (unsigned long)g_coAll.count);
+    if (rep > 0 && (g_vbPress || g_vbNil || g_vbGameRan))
+        MSLogf(@"touch pad: in 30 s %lld on-screen button presses handed to the game (%lld with no game handler), %lld touches on a button with no element; GameController ran the game's button handlers %lld times (pressed)",
+               (long long)g_vbPress, (long long)g_vbNoHandler, (long long)g_vbNil, (long long)g_vbGameRan);
+    g_vbPress = g_vbNoHandler = g_vbNil = 0; g_vbGameRan = 0;
     rep = now; g_coIn = g_coOut = g_coPolled = 0; g_gcSent[0] = g_gcSent[1] = g_gcSent[2] = 0; g_gcArrived = 0;
 }
 static NSMapTable *g_vbPressPoll;                           /* on-screen button -> poll it was pressed in */
+/* on-screen buttons, counted for the 30 s controller line (tester: sticks fine, buttons did nothing) */
+static void MSPadButtonTrace(GCControllerButtonInput *b, float v) {          /* game thread */
+    if (v > 0) g_vbPress++;
+    id h, gh; @synchronized (g_padHandlers) { h = [g_padHandlers objectForKey:b]; gh = [g_padHandlers objectForKey:g_pad]; }
+    if (v > 0 && !h && !gh) g_vbNoHandler++;
+    static int n; if (v > 0 && n++ < 12)
+        MSLogf(@"touch pad: on-screen %@ pressed - game handler on it %@, on the gamepad %@, value now %.2f (was %.2f), poll %lld",
+               b.localizedName ?: NSStringFromClass([b class]), h ? @"yes" : @"NO", gh ? @"yes" : @"NO", v, b.value, g_pollNo);
+}
 static void MSPadSetButton(GCControllerButtonInput *b, float v) {
-    if (!b) return;
+    if (!b) { if (v > 0) g_vbNil++; return; }
     if (!MSOnGameThread()) { MSGameAsync(^{ MSPadSetButton(b, v); }); return; }    /* touches: main thread -> the game's */
+    MSPadButtonTrace(b, v);
     if (!g_vbPressPoll) g_vbPressPoll = [NSMapTable weakToStrongObjectsMapTable];
     if (v == 0 && [[g_vbPressPoll objectForKey:b] longLongValue] == g_pollNo && g_pollNo) {   /* a tap within one frame */
         MSPadHoldRelease(^{ if (b.value != 0 && [[g_vbPressPoll objectForKey:b] longLongValue] < g_pollNo) { [b setValue:0]; MSPadFlushVpad(); MSPadNotify(b); } });
@@ -4874,6 +4976,9 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool, MSCtlKeyboard, MS
     [self msDropGoneTouches];
     for (UITouch *t in ts) {
         CGPoint p = [t locationInView:self]; MSCtl *c = [self msCtlAt:p];
+        static int tn; if (tn++ < 25) MSLogf(@"touch pad: finger down at %.0f,%.0f -> %@%@", p.x, p.y,
+            c ? c.label : [self msInFace:p] ? @"A/B/X/Y area" : p.x < self.bounds.size.width * 0.45 ? @"move stick" : @"camera",
+            c && c.kind == MSCtlButton && !c.button && !c.dpadX && !c.dpadY && !c.key ? @" (button has NO element)" : @"");
         if (c.kind == MSCtlEdit) { [self msFeel]; [self msSetEditing:YES]; return; }
         if (c.kind == MSCtlOverlay) { [self msFeel]; void (*fn)(void) = g_ovToggle; if (fn) fn(); continue; }   /* CET overlay */
         if (c.kind == MSCtlKeyboard) {
@@ -5934,14 +6039,14 @@ ssize_t ms_read(int fd, void *buf, size_t n) {
         if (r > 0 && fd > 2) { g_readBytes += r; g_readCalls++; g_lastReadAt = CACurrentMediaTime(); }
         return r;
     }
-    static size_t chunk; static double rate;               /* bytes per piece, bytes per second (0 = no cap) */
+    static size_t chunk;                                  /* bytes per piece; the speed cap is g_readRate */
     static dispatch_once_t o;
     dispatch_once(&o, ^{
         NSDictionary *c = MSConfig();
         long k = [c[@"MaxParallelReads"] longValue]; if (k <= 0) k = 1;
         long kb = [c[@"ReadChunkKB"] longValue]; if (kb <= 0) kb = 1024;
         id mb = c[@"MaxReadMBps"]; double m = mb ? [mb doubleValue] : 120;
-        chunk = (size_t)kb << 10; rate = m > 0 ? m * 1048576.0 : 0;
+        chunk = (size_t)kb << 10; g_readRate = m > 0 ? m * 1048576.0 : 0;
         g_readSlots = dispatch_semaphore_create(k);
         MSStartReadProgress();
         MSLogf(@"game file reads: at most %ld in flight, %ld KB pieces, %@", k, kb, m > 0 ? [NSString stringWithFormat:@"max %.0f MB/s", m] : @"no speed cap");
@@ -5952,6 +6057,7 @@ ssize_t ms_read(int fd, void *buf, size_t n) {
         dispatch_semaphore_wait(g_readSlots, DISPATCH_TIME_FOREVER);
         double t0 = CACurrentMediaTime();
         r = MSReadRobust(fd, (char *)buf + done, want);
+        double rate = g_readRate;
         if (rate > 0 && r > 0) { double wait = (double)r / rate - (CACurrentMediaTime() - t0); if (wait > 0) usleep((useconds_t)(wait * 1e6)); }
         dispatch_semaphore_signal(g_readSlots);
         if (r <= 0) break;
@@ -6174,6 +6280,7 @@ static uint64_t ms_workingSet(id self, SEL c) {
     double gb = MSCfgD(@"GPUBudgetGB", 0); NSString *why = @"Metal's value";
     uint64_t r = real;
     if (gb > 0.5) { r = (uint64_t)fmin(real, gb * 1073741824.0); why = @"GPUBudgetGB"; }
+    else if (MSHeadroomOn()) { r = (uint64_t)fmin(real, 5.0 * 1073741824.0); why = @"Memory headroom"; }
     else if ([MSConfig()[@"GPUBudgetFit"] boolValue]) {            /* opt-in only: a smaller budget can make the game's
                                                                     own GPU heaps run full and crash it before iOS would */
         if (!g_memLimitGB) MSFitMemSizeGB();
@@ -6183,11 +6290,36 @@ static uint64_t ms_workingSet(id self, SEL c) {
     static int said; if (!said++) MSLogf(@"gpu budget: Metal recommends %.2f GB for the GPU, the game is told %.2f GB (%@)", real / 1073741824.0, r / 1073741824.0, why);
     return r;
 }
+/* Shader hitches: the game keeps compiled pipelines in Metal binary archives (load + serializeToURL). Only logged, to
+   learn whether its archives load and save on iOS - nothing is changed. ArchiveLog = NO leaves both methods alone. */
+static IMP g_oNewArchive, g_oSerialize;
+static int g_archiveSaid;
+static BOOL ms_archiveSerialize(id self, SEL c, NSURL *url, NSError **err) {
+    NSError *e = nil; BOOL ok = ((BOOL (*)(id, SEL, NSURL *, NSError **))g_oSerialize)(self, c, url, &e);
+    if (err) *err = e;
+    if (g_archiveSaid++ < 40) MSLogf(@"shader archive: game saved %@ -> %@", url.path.lastPathComponent ?: @"(no url)", ok ? @"ok" : (e.localizedDescription ?: @"failed"));
+    return ok;
+}
+typedef id (*MSNewArchiveFn)(id, SEL, id, NSError **) NS_RETURNS_RETAINED;
+static id ms_newArchive(id self, SEL c, MTLBinaryArchiveDescriptor *d, NSError **err) NS_RETURNS_RETAINED;
+static id ms_newArchive(id self, SEL c, MTLBinaryArchiveDescriptor *d, NSError **err) {
+    NSError *e = nil; id r = ((MSNewArchiveFn)g_oNewArchive)(self, c, d, &e);
+    if (err) *err = e;
+    static dispatch_once_t once;
+    if (r) dispatch_once(&once, ^{ Method m = class_getInstanceMethod(object_getClass(r), @selector(serializeToURL:error:));
+                                   IMP old = m ? method_getImplementation(m) : NULL;
+                                   if (old && old != (IMP)ms_archiveSerialize) { g_oSerialize = old; method_setImplementation(m, (IMP)ms_archiveSerialize); } });
+    if (g_archiveSaid++ < 40) MSLogf(@"shader archive: game opened %@ -> %@", d.url ? d.url.path.lastPathComponent : @"(new, empty)",
+                                     r ? @"ok" : (e.localizedDescription ?: @"failed"));
+    return r;
+}
 static void MSAddMacAPIs(void) {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice(); if (!dev) { MSLogf(@"no Metal device!"); return; }
     Class D = object_getClass(dev);
     { Method m = class_getInstanceMethod(D, @selector(recommendedMaxWorkingSetSize));
       if (m) g_oWorkingSet = method_setImplementation(m, (IMP)ms_workingSet); }
+    if (MSCfgD(@"ArchiveLog", 1) != 0) { Method m = class_getInstanceMethod(D, @selector(newBinaryArchiveWithDescriptor:error:));
+      if (m) g_oNewArchive = method_setImplementation(m, (IMP)ms_newArchive); }
     { Class fi = NSClassFromString(@"MTLFXFrameInterpolatorDescriptor"); SEL sd = NSSelectorFromString(@"supportsDevice:"), s4 = NSSelectorFromString(@"supportsMetal4FX:");
       BOOL ok = fi && [fi respondsToSelector:sd] && ((BOOL (*)(id, SEL, id))objc_msgSend)(fi, sd, dev);
       BOOL ok4 = fi && [fi respondsToSelector:s4] && ((BOOL (*)(id, SEL, id))objc_msgSend)(fi, s4, dev);

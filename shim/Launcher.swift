@@ -74,7 +74,7 @@ final class MSPadPoller {
 
 /// what the controller can stand on, in the order it is on the screen
 private enum LFocus: Hashable {
-    case mods, resolution, overlay, smoothPacing, gameThread, lowLatency, frameGen, phoneRumble, vibration, triggers, kbm
+    case mods, resolution, overlay, smoothPacing, gameThread, lowLatency, frameGen, memoryHeadroom, phoneRumble, vibration, triggers, kbm
     case lookMode, touchHaptics, silentSound, mixAudio, sensitivity, restore, cloudStore, cloudAction, signOut, importSaves
     case play, update
 }
@@ -189,8 +189,8 @@ private final class LauncherModel: ObservableObject {
     private let pad = MSPadPoller()
 
     var rows: [LFocus] {
-        var r: [LFocus] = [.mods, .resolution, .overlay, .smoothPacing, .gameThread, .lowLatency, .frameGen, .phoneRumble, .vibration,
-                           .triggers, .kbm, .lookMode, .touchHaptics, .silentSound, .mixAudio, .sensitivity, .restore, .cloudStore, .cloudAction]
+        var r: [LFocus] = [.mods, .resolution, .overlay, .smoothPacing, .gameThread, .lowLatency, .frameGen, .memoryHeadroom, .phoneRumble,
+                           .vibration,                           .triggers, .kbm, .lookMode, .touchHaptics, .silentSound, .mixAudio, .sensitivity, .restore, .cloudStore, .cloudAction]
         if cloudOn && !syncing { r.append(.signOut) }
         return r + [.importSaves, .play, .update]
     }
@@ -297,6 +297,8 @@ private struct LauncherView: View {
     @AppStorage("CyPortAppleFrameGen") private var appleFrameGen = false
     /// read by the shim (MSPhoneRumbleOn): with touch controls the game's controller rumble plays on the phone
     @AppStorage("CyPortPhoneRumble") private var phoneRumble = true
+    /// read by the shim (MSHeadroomOn): the game is told 6 GB of RAM and at most 5 GB for the GPU (long sessions on 12 GB phones)
+    @AppStorage("CyPortMemoryHeadroom") private var memoryHeadroom = false
 
     private func on(_ f: LFocus) -> Bool { model.padConnected && model.focus == f }
     /// the controller on the rows whose values are stored here
@@ -307,6 +309,7 @@ private struct LauncherView: View {
         case .gameThread: flip($gameThread)
         case .lowLatency: flip($lowLatency)
         case .frameGen: flip($appleFrameGen)
+        case .memoryHeadroom: flip($memoryHeadroom)
         case .phoneRumble: flip($phoneRumble)
         case .vibration: flip($vibration)
         case .triggers: flip($adaptiveTriggers)
@@ -330,7 +333,7 @@ private struct LauncherView: View {
         if let i = model.notes.firstIndex(of: "recommended") { model.resolution = i }
         model.overlay = 1
         smoothPacing = true; gameThread = true; lowLatency = false; appleFrameGen = false
-        vibration = true; adaptiveTriggers = true; kbmWithController = false; phoneRumble = true
+        vibration = true; adaptiveTriggers = true; kbmWithController = false; phoneRumble = true; memoryHeadroom = false
         lookMode = 2; touchHaptics = true; lookSensitivity = 1.5
         silentModeSound = true; mixAudio = false
         let d = UserDefaults.standard
@@ -528,6 +531,8 @@ private struct LauncherView: View {
                               note: lowLatency ? "Snappier controls. Costs a few FPS when the GPU is the limit." : "Off: best frame rate.")
                     switchRow(.frameGen, "Apple frame generation", icon: "sparkles.tv", isOn: $appleFrameGen,
                               note: appleFrameGen ? "Apple's MetalFX frame generation is on in the game. Turning it off in the game turns this off too." : "Off: no Apple frame generation.")
+                    switchRow(.memoryHeadroom, "Memory headroom", icon: "memorychip", isOn: $memoryHeadroom,
+                              note: memoryHeadroom ? "The game plans with less memory, so iOS is less likely to close it in long sessions. Takes full effect the next time you open the app." : "Off: the game uses what Metal recommends. Turn on if the game closes by itself after a while.")
                     switchRow(.phoneRumble, "Phone vibration", icon: "iphone.radiowaves.left.and.right", isOn: $phoneRumble,
                               note: phoneRumble ? "With touch controls the phone rumbles like a controller would (explosions, gunfire, crashes). Off while a controller is connected." : "Off: the phone doesn't rumble.")
                     switchRow(.vibration, "Controller vibration", icon: "gamecontroller", isOn: $vibration,
