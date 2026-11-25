@@ -127,7 +127,14 @@ clang -target arm64-apple-ios16.0 -isysroot "$SDK_DIR" -O2 "$HERE/app/starter.c"
 echo "    starter stamped with iOS SDK $SDK_VER"
 else
 echo "==> 2/4 retarget game binary + libraries (macOS -> iOS load commands only, iOS SDK $SDK_VER)"
-python3 "$HERE/tools/ios_retarget.py" --sdk "$SDK_VER" "$GAME_APP/Contents/MacOS/Cyberpunk2077" "$APP/Cyberpunk2077" >/dev/null
+# hook sites for the plugins only when the plugin pack goes in (MODS=, Steam Mac 2.5.0): see the MODS block below
+MODS_OK=0
+if [ -n "${MODS:-}" ] && [ "${MODS}" != "0" ] && [ -f "$MODS/ModSupport/manifest.json" ]; then
+  WANT_UUID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["gameUUID"])' "$MODS/ModSupport/manifest.json")
+  HAVE_UUID=$(dwarfdump --uuid "$GAME_APP/Contents/MacOS/Cyberpunk2077" 2>/dev/null | awk '{print $2}' | head -1)
+  [ "$HAVE_UUID" = "$WANT_UUID" ] && MODS_OK=1
+fi
+CYPORT_MODS=$MODS_OK python3 "$HERE/tools/ios_retarget.py" --sdk "$SDK_VER" "$GAME_APP/Contents/MacOS/Cyberpunk2077" "$APP/Cyberpunk2077" >/dev/null
 chmod +x "$APP/Cyberpunk2077"
 for f in "$GAME_APP"/Contents/Frameworks/*.dylib; do
   # the libraries keep SDK 18.0: stamped newer, dyld checks them more strictly and refuses libBink2MacArm64.dylib

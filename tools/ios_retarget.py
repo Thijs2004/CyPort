@@ -153,7 +153,11 @@ def retarget(src, dst, minos, sdk):
                 log.append("%s -> %s" % (old, new))
     if not seen: raise SystemExit("no LC_BUILD_VERSION: not a modern macOS build")
     log += reroute_imports(d, m)
-    if m["ftype"] == 2: log += patch_pool_end(d, m) + patch_watchdog(d, m) + patch_pool_sizes(d, m) + patch_free_hook(d, m) + patch_worldwidget_limit(d, m) + patch_baked_hooks(d, m)      # MH_EXECUTE
+    if m["ftype"] == 2:                 # MH_EXECUTE
+        log += patch_pool_end(d, m) + patch_watchdog(d, m) + patch_pool_sizes(d, m) + patch_free_hook(d, m)
+        # the mod support patches only when build.sh bundles the plugin pack (MODS=): a game without plugins runs unchanged
+        if os.environ.get("CYPORT_MODS") == "1": log += patch_worldwidget_limit(d, m) + patch_baked_hooks(d, m)
+        else: log.append("baked hooks + world widget limit: skipped (no plugin pack, MODS= not set)")
     log += dedupe_dylibs(d, m)          # it moves load commands, so m["cmds"] offsets are stale afterwards
     if GAME_FOLDER and m["ftype"] == 2: log += make_loadable(d, parse(d))
     if GAME_FOLDER:
