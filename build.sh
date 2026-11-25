@@ -138,7 +138,7 @@ fi
 # mod manager extras, both optional (the Mods screen says so when one is missing):
 #   SCC_DYLIB   the on-device redscript compiler (redscript-ios dist/ios/libscc_lib.dylib): script mods compile on the phone
 #   MAC_HASHES  sorted u64 list of the Mac game's resources (Mods Nexus/.cyport-mac-hashes.bin): import checks what an .archive replaces
-SCC_DYLIB="${SCC_DYLIB:-$(dirname "$HERE")/CyPort-red4ext/redscript-ios/dist/ios/libscc_lib.dylib}"
+SCC_DYLIB="${SCC_DYLIB:-$HERE/prebuilt/libscc_lib.dylib}"    # prebuilt: redscript 0.5.32 (MIT), github.com/LucasPrado97/redscript branch ios
 MAC_HASHES="${MAC_HASHES:-}"
 if [ -f "$SCC_DYLIB" ]; then cp "$SCC_DYLIB" "$APP/Frameworks/libscc_lib.dylib"; echo "    + redscript compiler: $SCC_DYLIB"; else echo "    (no SCC_DYLIB: script mods can't be compiled on the phone)"; fi
 # the Wwise media ids of the Mac build: PC audio mods are converted on import (shim/ModManagerAudio.swift)
@@ -146,6 +146,20 @@ cp "$HERE/shim/CyPortMacMedia.txt" "$APP/CyPortMacMedia.txt"
 if [ -f "$MAC_HASHES" ]; then cp "$MAC_HASHES" "$APP/CyPortMacHashes.bin"; echo "    + game resource list: $MAC_HASHES"; else echo "    (no MAC_HASHES: imported archives are not checked against the game)"; fi
 # RED4ext for iOS (CyPort-red4ext build): the shim loads Frameworks/RED4ext.dylib before the game starts
 if [ -n "${RED4EXT_DYLIB:-}" ]; then cp "$RED4EXT_DYLIB" "$APP/Frameworks/RED4ext.dylib"; echo "    + RED4ext: $RED4EXT_DYLIB"; fi
+# MODS=<folder>: the plugin pack from tools/make-mod-pack.sh (RED4ext, TweakXL, ArchiveXL, Codeware, CET, ...): its dylibs
+# go to Frameworks/ (signed with the app), its data to ModSupport/. Only for the game program the hook sites are made for
+# (Steam Mac 2.5.0) in a one-version app: anything else would carry 35 MB of plugins that can never load.
+if [ -n "${MODS:-}" ] && [ "${MODS}" != "0" ]; then
+  [ -f "$MODS/ModSupport/manifest.json" ] || { echo "MODS=$MODS: no ModSupport/manifest.json (run tools/make-mod-pack.sh)"; exit 1; }
+  WANT_UUID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["gameUUID"])' "$MODS/ModSupport/manifest.json")
+  HAVE_UUID=$(dwarfdump --uuid "$GAME_APP/Contents/MacOS/Cyberpunk2077" 2>/dev/null | awk '{print $2}' | head -1)
+  if [ -n "$GAME_APPS" ]; then echo "    (MODS: not bundled - framework mods need an app built for one game version, GAME_APP=)"
+  elif [ "$HAVE_UUID" != "$WANT_UUID" ]; then echo "    (MODS: not bundled - the plugins are for Steam Mac 2.5.0 ($WANT_UUID), this game program is ${HAVE_UUID:-unknown})"
+  else
+    cp "$MODS/Frameworks/"*.dylib "$APP/Frameworks/"; rm -rf "$APP/ModSupport"; cp -R "$MODS/ModSupport" "$APP/ModSupport"
+    echo "    + mod support pack $(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m["pack"], "-", ", ".join(p["name"] for p in m["plugins"]))' "$MODS/ModSupport/manifest.json")"
+  fi
+fi
 sed "s/__BUNDLE_ID__/$BUNDLE_ID/" "$HERE/app/Info.plist" > "$APP/Info.plist"
 if [ "$OLD_SHIM" = 1 ]; then plutil -remove UIApplicationSceneManifest "$APP/Info.plist"; fi
 # the same SDK in the Info.plist keys Xcode writes (iOS reads both)

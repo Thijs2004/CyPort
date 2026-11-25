@@ -1445,17 +1445,39 @@ enum GameData {
     static func saveCache(_ root: URL, _ c: [String: String]) {
         if let d = try? JSONSerialization.data(withJSONObject: c) { try? d.write(to: cacheURL(root), options: .atomic) }
     }
+    /// the mod manager's folder next to the game folder (or Documents/CyPort when that one can't be written)
+    static func modFolders(_ root: URL) -> [URL] {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        return [root.deletingLastPathComponent().appendingPathComponent("CyPort")] + (docs.map { [$0.appendingPathComponent("CyPort")] } ?? [])
+    }
+    /// a game file as the version checks see it: once the mod manager compiled script mods, r6/cache/final.redscripts is
+    /// its output, so the game's own blob it keeps (CyPort/final.redscripts.original) stands in for it
+    static func fileURL(_ root: URL, _ p: String) -> URL {
+        let u = root.appendingPathComponent(p)
+        guard p == "r6/cache/final.redscripts" else { return u }
+        for d in modFolders(root) where FileManager.default.fileExists(atPath: d.appendingPathComponent("compiled-here").path) {
+            let o = d.appendingPathComponent("final.redscripts.original")
+            if FileManager.default.fileExists(atPath: o.path) { return o }
+        }
+        return u
+    }
     static func stamp(_ root: URL, _ p: String) -> String {
-        let u = root.appendingPathComponent(p); return "\(size(u) ?? -1):\(mtime(u)):\(expected?.version ?? "")"
+        let u = fileURL(root, p); return "\(size(u) ?? -1):\(mtime(u)):\(expected?.version ?? "")"
     }
     /// after an update: the files just written are known to match
     static func markVerified(_ root: URL, _ paths: [String]) {
+        if paths.contains("r6/cache/final.redscripts") {      // new game scripts: script mods compile against these from now on
+            for d in modFolders(root) {
+                try? FileManager.default.removeItem(at: d.appendingPathComponent("compiled-here"))
+                try? FileManager.default.removeItem(at: d.appendingPathComponent("final.redscripts.original"))
+            }
+        }
         var c = loadCache(root); for p in paths { c[p] = stamp(root, p) }; saveCache(root, c)
     }
 
     /// does a file's content match? Store checksums (GOG md5 / Steam sha1 per chunk) or the app's own list (GOG md5)
     static func matches(_ root: URL, _ p: String, checks: [DLCheck]) -> Bool {
-        guard !checks.isEmpty, let h = try? FileHandle(forReadingFrom: root.appendingPathComponent(p)) else { return false }
+        guard !checks.isEmpty, let h = try? FileHandle(forReadingFrom: fileURL(root, p)) else { return false }
         defer { try? h.close() }
         for c in checks.sorted(by: { $0.offset < $1.offset }) {
             guard (try? h.seek(toOffset: UInt64(c.offset))) != nil, let d = try? h.read(upToCount: c.size), d.count == c.size,
@@ -1478,7 +1500,7 @@ enum GameData {
         guard exists(root, "archive") else { return .missing }
         let w = wanted(root); var cache = loadCache(root)
         var n = 0, bytes: Int64 = 0
-        for (p, f) in w where cache[p] != stamp(root, p) && size(root.appendingPathComponent(p)) != f.size { n += 1; bytes += f.size }
+        for (p, f) in w where cache[p] != stamp(root, p) && size(fileURL(root, p)) != f.size { n += 1; bytes += f.size }
         if n == 0 {
             for p in versionFiles {
                 guard let f = w[p], cache[p] != stamp(root, p) else { continue }
@@ -1498,7 +1520,7 @@ enum GameData {
         for p in w.keys {
             guard let f = byPath[p] else { continue }                       // not offered (a language this store left out)
             let st = stamp(root, p)
-            if size(root.appendingPathComponent(p)) != f.size { need.insert(p) }
+            if size(fileURL(root, p)) != f.size { need.insert(p) }
             else if cache[p] != st { toHash.append((p, f.checks.isEmpty ? checks(w[p]!) : f.checks)) }
         }
         let total = toHash.reduce(Int64(0)) { $0 + (byPath[$1.0]?.size ?? 0) }

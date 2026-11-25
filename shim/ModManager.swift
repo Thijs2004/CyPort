@@ -153,7 +153,7 @@ final class ModStore: @unchecked Sendable {
     static let archiveArea = "archive/Mac/mod", tweakArea = "r6/tweaks", inputArea = "r6/input", scriptArea = "r6/scripts"
     static let cetArea = "bin/x64/plugins/cyber_engine_tweaks/mods", pluginArea = "red4ext/plugins"
     /// RED4ext plugins with no iOS build (their script natives would be missing on the phone)
-    static let notPorted: Set<String> = ["redfilesystem", "reddata", "redhttpclient", "audioware", "modsettingsmodule",
+    static let notPorted: Set<String> = ["audioware", "modsettingsmodule",
                                          "cyberpunkmp", "radioext", "musicapi"]
     /// plugins whose scripts must be part of every compile while the plugin is on
     static let scriptPlugins: Set<String> = ["tweakxl", "archivexl", "codeware", "modsettings"]
@@ -732,7 +732,7 @@ final class ModStore: @unchecked Sendable {
                 }
                 if text.isEmpty { text = "The compiler gave no reason (no log written)." }
                 text = text.replacingOccurrences(of: game + "/", with: "").replacingOccurrences(of: game.replacingOccurrences(of: "/private/", with: "/") + "/", with: "")
-                modLog("compile FAILED: \(text.prefix(300))")
+                modLog("compile FAILED: \(text.prefix(4000))")
                 return ModCompileResult(ok: false, message: "Scripts did not compile. The game keeps the scripts it had.", detail: text)
             }
             if fm.fileExists(atPath: final) {

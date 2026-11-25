@@ -775,7 +775,7 @@ struct ModManagerView: View {
                         else { actionRow(.changes, "Changed since the last Play", "clock.badge.exclamationmark", c.prefix(2).joined(separator: " · ") + (c.count > 2 ? " · and \(c.count - 2) more" : "")) }
                     }
                     modSections
-                    header("PLUGINS (RED4EXT)", model.list.plugins.isEmpty ? "No plugin folders in red4ext/plugins." : "Turning one off moves its folder out of the game; mods that need it stop working.")
+                    header("PLUGINS (RED4EXT)", pluginsNote)
                     ForEach(model.list.plugins) { pluginRow($0) }
                     orderSection
                     profileSection
@@ -1157,5 +1157,15 @@ struct ModManagerView: View {
         .fileImporter(isPresented: $model.picking, allowedContentTypes: [.item], allowsMultipleSelection: false) { model.picked($0) }
         .persistentSystemOverlays(.hidden)
         .statusBarHidden(true)
+    }
+}
+
+extension ModManagerView {
+    /// the bundled plugins (ModSupport/) need the Steam 2.5.0 game program; the shim says at start whether they can load
+    var pluginsNote: String {
+        if UserDefaults.standard.string(forKey: "CyPortModPlugins") == "nohooks" {
+            return "RED4ext, Cyber Engine Tweaks, TweakXL, ArchiveXL, Codeware and the other plugins are in this app, but they only run with Cyberpunk 2.5.0 from Steam (an app built for that one version). Plain .archive and script mods work without them."
+        }
+        return model.list.plugins.isEmpty ? "No plugin folders in red4ext/plugins." : "All plugins start off. Turn on the ones your mods need (importing a mod offers it); turning one off moves its folder out of the game and mods that need it stop working."
     }
 }

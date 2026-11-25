@@ -5,3 +5,17 @@ affiliated with or endorsed by CD PROJEKT RED.
 Third-party code linked into the app (shim/third_party):
 - libarchive 3.8.1 (BSD 2-clause, shim/third_party/libarchive/COPYING.libarchive) - unpacks mod archives
 - liblzma from XZ Utils 5.8.1 (0BSD, shim/third_party/libarchive/COPYING.xz) - 7z / xz decoding for libarchive
+
+The on-phone script compiler (prebuilt/libscc_lib.dylib, Frameworks/libscc_lib.dylib):
+- redscript 0.5.32 by jac3km4 (MIT), iOS build from github.com/LucasPrado97/redscript branch ios
+
+Framework plugins, bundled only in apps built with MODS= (Frameworks/*.dylib + ModSupport/; licence texts in
+ModSupport/licenses/, source commits in ModSupport/manifest.json). iOS ports by Lucas Prado (github.com/LucasPrado97),
+on top of the Mac ports by codeman101:
+- RED4ext by wopss (MIT)
+- TweakXL, ArchiveXL (+ its Bundle), Codeware by psiberx (MIT)
+- Cyber Engine Tweaks by yamashi and the CET team (GPL-3.0 upstream; the exact source of the bundled build is the
+  commit listed in ModSupport/manifest.json at github.com/LucasPrado97/CyberEngineTweaks)
+- Mod Settings, Input Loader by jackhumbert (MIT)
+- RedFileSystem, RedData, RedHttpClient by rayshader (MIT)
+Audioware (cyb3rpsych0s1s) is not bundled: it has no licence upstream.

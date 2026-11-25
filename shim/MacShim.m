@@ -4429,11 +4429,9 @@ static NSMapTable *g_vbPressPoll;                           /* on-screen button 
 /* on-screen buttons, counted for the 30 s controller line (tester: sticks fine, buttons did nothing) */
 static void MSPadButtonTrace(GCControllerButtonInput *b, float v) {          /* game thread */
     if (v > 0) g_vbPress++;
+    if (v <= 0) return;
     id h, gh; @synchronized (g_padHandlers) { h = [g_padHandlers objectForKey:b]; gh = [g_padHandlers objectForKey:g_pad]; }
-    if (v > 0 && !h && !gh) g_vbNoHandler++;
-    static int n; if (v > 0 && n++ < 12)
-        MSLogf(@"touch pad: on-screen %@ pressed - game handler on it %@, on the gamepad %@, value now %.2f (was %.2f), poll %lld",
-               b.localizedName ?: NSStringFromClass([b class]), h ? @"yes" : @"NO", gh ? @"yes" : @"NO", v, b.value, g_pollNo);
+    if (!h && !gh) g_vbNoHandler++;
 }
 static void MSPadSetButton(GCControllerButtonInput *b, float v) {
     if (!b) { if (v > 0) g_vbNil++; return; }
@@ -4976,9 +4974,6 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool, MSCtlKeyboard, MS
     [self msDropGoneTouches];
     for (UITouch *t in ts) {
         CGPoint p = [t locationInView:self]; MSCtl *c = [self msCtlAt:p];
-        static int tn; if (tn++ < 25) MSLogf(@"touch pad: finger down at %.0f,%.0f -> %@%@", p.x, p.y,
-            c ? c.label : [self msInFace:p] ? @"A/B/X/Y area" : p.x < self.bounds.size.width * 0.45 ? @"move stick" : @"camera",
-            c && c.kind == MSCtlButton && !c.button && !c.dpadX && !c.dpadY && !c.key ? @" (button has NO element)" : @"");
         if (c.kind == MSCtlEdit) { [self msFeel]; [self msSetEditing:YES]; return; }
         if (c.kind == MSCtlOverlay) { [self msFeel]; void (*fn)(void) = g_ovToggle; if (fn) fn(); continue; }   /* CET overlay */
         if (c.kind == MSCtlKeyboard) {
@@ -6684,12 +6679,133 @@ static void MSInstallBackgroundFreeze(void) {
     }];
 }
 
+/* ---------------------------------------------------------------- bundled plugins (ModSupport/)
+ * The plugin dylibs ship in Frameworks/ (signed with the app by Xcode, build.sh or any sideloader); their data ships in
+ * ModSupport/game/, a mirror of the game folder. At start: the data is copied into the game folder when the pack is new
+ * (a plugin seen for the first time goes to CyPort/disabled-plugins: off until the Mods screen turns it on), and every
+ * plugin folder gets a link <Name>/<dylib> -> the bundle's copy, so RED4ext's loader and the Mods screen work as with a
+ * plugin in Documents. The plugins find their data next to their own dylib (dladdr / _dyld_get_image_name): for the
+ * bundled images both answer with the link's path. */
+static NSDictionary<NSString *, NSString *> *g_plBundleToLink;            /* realpath of Frameworks/<dylib> -> link path */
+static os_unfair_lock g_plLock = OS_UNFAIR_LOCK_INIT;
+static int (*g_realDladdr)(const void *, Dl_info *);
+static const char *(*g_realImageName)(uint32_t);
+static const char *MSPluginLinkFor(const char *path) {
+    if (!path) return NULL;
+    os_unfair_lock_lock(&g_plLock); NSString *l = g_plBundleToLink[@(path)]; os_unfair_lock_unlock(&g_plLock);
+    return l.fileSystemRepresentation;                     /* the string lives as long as the dictionary (never replaced) */
+}
+static int ms_pl_dladdr(const void *a, Dl_info *i) {
+    int r = g_realDladdr(a, i); const char *l; if (r && (l = MSPluginLinkFor(i->dli_fname))) i->dli_fname = l; return r;
+}
+static const char *ms_pl_imageName(uint32_t k) { const char *n = g_realImageName(k), *l = MSPluginLinkFor(n); return l ?: n; }
+static void MSPluginPatchImports(const struct mach_header_64 *mh, const char *name) {
+    const struct load_command *lc = (const void *)(mh + 1); intptr_t slide = 0; int n = 0;
+    for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const void *)((const char *)lc + lc->cmdsize)) {
+        if (lc->cmd != LC_SEGMENT_64) continue; const struct segment_command_64 *sg = (const void *)lc;
+        if (!strcmp(sg->segname, "__TEXT")) slide = (intptr_t)mh - (intptr_t)sg->vmaddr;
+        const struct section_64 *s = (const void *)(sg + 1);
+        for (uint32_t j = 0; j < sg->nsects; j++, s++) {
+            uint32_t t = s->flags & SECTION_TYPE; if (t != S_NON_LAZY_SYMBOL_POINTERS && t != S_LAZY_SYMBOL_POINTERS) continue;
+            void **p = (void **)(s->addr + slide);
+            for (size_t k = 0; k < s->size / sizeof(void *); k++) {
+                void *v = p[k], *w = v == (void *)g_realDladdr ? (void *)ms_pl_dladdr : v == (void *)g_realImageName ? (void *)ms_pl_imageName : NULL;
+                if (!w) continue;
+                vm_protect(mach_task_self(), (vm_address_t)&p[k], sizeof(void *), 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                p[k] = w; n++;
+            }
+        }
+    }
+    MSLogf(@"mod support: %s finds its folder through the link (%d imports)", strrchr(name, '/') ? strrchr(name, '/') + 1 : name, n);
+}
+static void MSPluginImageAdded(const struct mach_header *mh, intptr_t slide) {
+    Dl_info i; if (!g_realDladdr(mh, &i) || !MSPluginLinkFor(i.dli_fname)) return;
+    MSPluginPatchImports((const struct mach_header_64 *)mh, i.dli_fname);
+}
+/* the Mods screen's folder (shim/ModManager.swift ModStore.init): next to the game folder, else Documents/CyPort */
+static NSString *MSModFolder(NSString *root) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *c = [root.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"CyPort"], *probe = [c stringByAppendingPathComponent:@".probe"];
+    if ([fm createDirectoryAtPath:c withIntermediateDirectories:YES attributes:nil error:nil] && [fm createFileAtPath:probe contents:[NSData data] attributes:nil]) {
+        [fm removeItemAtPath:probe error:nil]; return c;
+    }
+    return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"CyPort"];
+}
+static BOOL MSHookSitesBaked(void) { return g_bhSlot[MS_BH_WINMAIN] && g_bhSlot[MS_BH_ADDSTATE]; }
+/* YES when RED4ext may load (the bundled plugins are set up, or the app has no plugin pack) */
+static BOOL MSModSupportPrepare(NSString *root) {
+    NSString *ms = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"ModSupport"], *fw = NSBundle.mainBundle.privateFrameworksPath;
+    NSData *md = [NSData dataWithContentsOfFile:[ms stringByAppendingPathComponent:@"manifest.json"]];
+    NSDictionary *man = md ? [NSJSONSerialization JSONObjectWithData:md options:0 error:nil] : nil;
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    if (![man isKindOfClass:NSDictionary.class]) { [ud removeObjectForKey:@"CyPortModPlugins"]; return YES; }   /* no pack: Documents plugins as before */
+    if (MSIsMultiGame() || !MSHookSitesBaked()) {
+        [ud setObject:@"nohooks" forKey:@"CyPortModPlugins"];
+        MSLogf(@"mod support: the plugins are in the app, but this game program has no hook sites (they need Cyberpunk 2.5.0 from Steam, in an app built for that one version) - plugins stay off");
+        return NO;
+    }
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *cy = MSModFolder(root), *off = [cy stringByAppendingPathComponent:@"disabled-plugins"], *live = [root stringByAppendingPathComponent:@"red4ext/plugins"];
+    [fm createDirectoryAtPath:off withIntermediateDirectories:YES attributes:nil error:nil];
+    [fm createDirectoryAtPath:live withIntermediateDirectories:YES attributes:nil error:nil];
+    NSMutableDictionary<NSString *, NSString *> *dylibOf = [NSMutableDictionary dictionary];
+    for (NSDictionary *p in man[@"plugins"]) if ([p isKindOfClass:NSDictionary.class] && [p[@"name"] length] && [p[@"dylib"] length]) dylibOf[p[@"name"]] = p[@"dylib"];
+    /* a plugin's folder: where it is now (on or off); one seen for the first time starts off */
+    NSString *(^home)(NSString *) = ^NSString *(NSString *name) {
+        NSString *l = [live stringByAppendingPathComponent:name];
+        return [fm fileExistsAtPath:l] ? l : [off stringByAppendingPathComponent:name];
+    };
+    /* 1. data, when the pack changed (user files such as CET's config, mods and logs are not in the mirror) */
+    NSString *stampPath = [cy stringByAppendingPathComponent:@"modsupport.json"];
+    NSData *sd = [NSData dataWithContentsOfFile:stampPath];
+    NSDictionary *stamp = sd ? [NSJSONSerialization JSONObjectWithData:sd options:0 error:nil] : nil;
+    NSString *pack = [man[@"pack"] description] ?: @"?";
+    if (![stamp isKindOfClass:NSDictionary.class] || ![[stamp[@"pack"] description] isEqual:pack]) {
+        NSString *src = [ms stringByAppendingPathComponent:@"game"]; int files = 0, fails = 0;
+        NSDirectoryEnumerator *en = [fm enumeratorAtPath:src];
+        for (NSString *rel in en) {
+            if (![en.fileAttributes[NSFileType] isEqual:NSFileTypeRegular]) continue;
+            NSArray *c = rel.pathComponents; NSString *dst;
+            if (c.count > 3 && [c[0] isEqual:@"red4ext"] && [c[1] isEqual:@"plugins"])
+                dst = [home(c[2]) stringByAppendingPathComponent:[NSString pathWithComponents:[c subarrayWithRange:NSMakeRange(3, c.count - 3)]]];
+            else dst = [root stringByAppendingPathComponent:rel];
+            [fm createDirectoryAtPath:dst.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
+            [fm removeItemAtPath:dst error:nil];
+            if ([fm copyItemAtPath:[src stringByAppendingPathComponent:rel] toPath:dst error:nil]) files++; else fails++;
+        }
+        [[NSJSONSerialization dataWithJSONObject:@{ @"pack": pack } options:0 error:nil] writeToFile:stampPath atomically:YES];
+        MSLogf(@"mod support: plugin pack %@ unpacked (%d files%@)", pack, files, fails ? [NSString stringWithFormat:@", %d FAILED", fails] : @"");
+    }
+    /* 2. links to the bundle's dylibs (the bundle path changes with every app update) */
+    NSMutableDictionary *map = [NSMutableDictionary dictionary]; NSMutableArray *on = [NSMutableArray array];
+    for (NSString *name in dylibOf) {
+        NSString *dir = home(name), *link = [dir stringByAppendingPathComponent:dylibOf[name]], *target = [fw stringByAppendingPathComponent:dylibOf[name]];
+        if (![fm fileExistsAtPath:target]) { MSLogf(@"mod support: %@ missing from the app", dylibOf[name]); continue; }
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        [fm removeItemAtPath:link error:nil];
+        if (![fm createSymbolicLinkAtPath:link withDestinationPath:target error:nil]) { MSLogf(@"mod support: link for %@ FAILED", name); continue; }
+        char rp[PATH_MAX]; if (realpath(target.fileSystemRepresentation, rp))
+            map[@(rp)] = [[live stringByAppendingPathComponent:name] stringByAppendingPathComponent:dylibOf[name]];
+        if ([dir hasPrefix:live]) [on addObject:name];
+    }
+    os_unfair_lock_lock(&g_plLock); g_plBundleToLink = [map copy]; os_unfair_lock_unlock(&g_plLock);
+    g_realDladdr = dlsym(RTLD_DEFAULT, "dladdr"); g_realImageName = dlsym(RTLD_DEFAULT, "_dyld_get_image_name");
+    if (g_realDladdr && g_realImageName) _dyld_register_func_for_add_image(MSPluginImageAdded);
+    [ud setObject:@"ok" forKey:@"CyPortModPlugins"];
+    MSLogf(@"mod support: %lu bundled plugins, on: %@", (unsigned long)dylibOf.count, on.count ? [on componentsJoinedByString:@", "] : @"none");
+    return YES;
+}
+
 /* RED4ext (iOS build, Frameworks/RED4ext.dylib): loaded once the game folder is known and before the game's main(),
  * like DYLD_INSERT_LIBRARIES on macOS. Its hooks go through the baked slots (MSBakedHookAttach). RED4ext = NO skips it. */
 static void MSLoadRED4ext(void) {
-    if (MSIsMultiGame() || (MSConfig()[@"RED4ext"] && ![MSConfig()[@"RED4ext"] boolValue])) return;
+    if (MSIsMultiGame()) { MSModSupportPrepare(nil); return; }      /* only tells the Mods screen why the plugins are off */
+    if (MSConfig()[@"RED4ext"] && ![MSConfig()[@"RED4ext"] boolValue]) return;
     NSString *p = [NSBundle.mainBundle.privateFrameworksPath stringByAppendingPathComponent:@"RED4ext.dylib"];
     if (![NSFileManager.defaultManager fileExistsAtPath:p]) return;
+    if (!MSHookSitesBaked()) { MSLogf(@"RED4ext: not loaded, this game program has no hook sites (Steam Mac 2.5.0 only)"); MSModSupportPrepare(nil); return; }
+    NSString *root = MSDataRoot();
+    if (root && !MSModSupportPrepare(root)) return;
     void *h = dlopen(p.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL);
     MSLogf(@"RED4ext: %s", h ? "loaded" : dlerror());
 }
@@ -7012,7 +7128,15 @@ __attribute__((visibility("default"))) int MacShimMain(int argc, char **argv) {
     }];
     NSDictionary *pick = nil; NSString *why = nil;
     NSString *root = MSDataRoot();
-    NSNumber *rs = root ? [NSFileManager.defaultManager attributesOfItemAtPath:[root stringByAppendingPathComponent:@"r6/cache/final.redscripts"] error:nil][NSFileSize] : nil;
+    NSString *rsPath = root ? [root stringByAppendingPathComponent:@"r6/cache/final.redscripts"] : nil;
+    if (root) {      /* script mods compiled by the mod manager: its copy of the game's own blob tells the version */
+        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        for (NSString *d in @[ [root.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"CyPort"], [docs stringByAppendingPathComponent:@"CyPort"] ]) {
+            NSString *o = [d stringByAppendingPathComponent:@"final.redscripts.original"];
+            if ([NSFileManager.defaultManager fileExistsAtPath:[d stringByAppendingPathComponent:@"compiled-here"]] && [NSFileManager.defaultManager fileExistsAtPath:o]) { rsPath = o; break; }
+        }
+    }
+    NSNumber *rs = rsPath ? [NSFileManager.defaultManager attributesOfItemAtPath:rsPath error:nil][NSFileSize] : nil;
     if (rs) for (NSDictionary *v in vers) if ([v[@"plist"][@"redscriptsSize"] isEqual:rs]) { pick = v; why = @"matches the game data"; break; }
     if (!pick) {
         NSString *want = [NSUserDefaults.standardUserDefaults stringForKey:@"CyPortGameVersion"];

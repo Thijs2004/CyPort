@@ -190,7 +190,7 @@ private final class LauncherModel: ObservableObject {
 
     var rows: [LFocus] {
         var r: [LFocus] = [.mods, .resolution, .overlay, .smoothPacing, .gameThread, .lowLatency, .frameGen, .memoryHeadroom, .phoneRumble,
-                           .vibration,                           .triggers, .kbm, .lookMode, .touchHaptics, .silentSound, .mixAudio, .sensitivity, .restore, .cloudStore, .cloudAction]
+                           .vibration, .triggers, .kbm, .lookMode, .touchHaptics, .silentSound, .mixAudio, .sensitivity, .restore, .cloudStore, .cloudAction]
         if cloudOn && !syncing { r.append(.signOut) }
         return r + [.importSaves, .play, .update]
     }
