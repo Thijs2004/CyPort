@@ -97,6 +97,16 @@ if ! grep -q MSSceneDelegate "$APP/Frameworks/libMacShim.dylib"; then
   OLD_SHIM=1; SDK_VER="18.0"; SDK_NAME=""; SDK_BUILD=""
   echo "    this MacShim predates scene support: stamping iOS SDK 18.0 (REBUILD_SHIM=1 for an iPhone Duo's real screen sizes)"
 fi
+# iPhone Duo: an app stamped with the iOS 27.0 SDK gets a letterboxed window there (on the outer screen 386 of 466 pt
+# beside a black bar); 27.1 is the first SDK that gives an app the whole of both screens. Xcode 27.0 builds are stamped
+# 27.1 so the IPA fits the Duo whoever builds it (IOS_SDK_VERSION still wins; old shims stay at 18.0).
+if [ "$OLD_SHIM" = 0 ] && [ -z "${IOS_SDK_VERSION:-}" ]; then
+  SV_MAJ="${SDK_VER%%.*}"; SV_MIN="${SDK_VER#*.}"; SV_MIN="${SV_MIN%%.*}"
+  if [ "$SV_MAJ" -lt 27 ] || { [ "$SV_MAJ" -eq 27 ] && [ "${SV_MIN:-0}" -lt 1 ]; }; then
+    echo "    Xcode's iOS SDK is $SDK_VER: stamping 27.1 instead (the first SDK an iPhone Duo shows full screen)"
+    SDK_VER="27.1"; SDK_NAME="iphoneos27.1"; SDK_BUILD=""
+  fi
+fi
 if [ -n "$GAME_APPS" ]; then
 echo "==> 2/4 game versions -> Games/<version>/ (one app, the starter picks the version that fits the game data)"
 for ga in "${GAME_LIST[@]}"; do
