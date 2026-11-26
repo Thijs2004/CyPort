@@ -1995,7 +1995,7 @@ static double MSPaceNow(void) {                      /* the frame time CyPort ho
 static void MSPaceWait(void) {                      /* nextDrawable, on the game's render thread */
     double T = MSPaceNow(); static __thread uint64_t next;
     static int menu = -1, said; int nowMenu = T > 0 && T != g_paceT;
-    if (nowMenu != menu) { if (menu >= 0 && said++ < 30) MSLogf(@"frame pacing: %@", nowMenu ? [NSString stringWithFormat:@"menu - at most %.0f FPS", 1 / T] : @"gameplay - menu cap off"); menu = nowMenu; }
+    if (nowMenu != menu) { if (menu >= 0 && said++ < 30) MSLogf(@"frame pacing: %@", nowMenu ? [NSString stringWithFormat:@"menu - at most %.0f FPS", 1 / T] : (g_pointerLocked ? @"gameplay - menu cap off" : @"menu cap not needed (the game's own cap is lower)")); menu = nowMenu; }
     if (T <= 0) { next = 0; return; }
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
     uint64_t per = (uint64_t)(T * 1e9 * tb.denom / tb.numer), early = (uint64_t)(0.0007 * 1e9 * tb.denom / tb.numer);
@@ -5955,11 +5955,15 @@ static void MSStartReadProgress(void) {
             double mem = MSFootprintMB();
             /* close to iOS's per-app limit: hand malloc's cached free pages back before iOS ends the game */
             size_t avail = os_proc_available_memory();
-            static double lastRelief; static int reliefN;
-            if (avail && avail < ((size_t)640 << 20) && now - lastRelief > 3) {
-                lastRelief = now; size_t got = malloc_zone_pressure_relief(NULL, 0);
-                if (reliefN++ < 20) MSLogf(@"memory: only %.0f MB left before iOS's limit (footprint %.0f MB) - released %.0f MB of free malloc pages",
-                                           avail / 1048576.0, mem, got / 1048576.0);
+            /* malloc_zone_pressure_relief locks malloc's zones while it walks them (the game allocates from many
+               threads); in long sessions it ran every 3 s for minutes and freed 0 MB every time. Wait longer after
+               each try that gets (almost) nothing: 3 s, 6, 12 ... up to 60 s; a try that frees 16 MB+ resets it. */
+            static double lastRelief, reliefGap = 3; static int reliefN;
+            if (avail && avail < ((size_t)640 << 20) && now - lastRelief > reliefGap) {
+                lastRelief = now; double r0 = CACurrentMediaTime(); size_t got = malloc_zone_pressure_relief(NULL, 0); double took = CACurrentMediaTime() - r0;
+                reliefGap = got >= ((size_t)16 << 20) ? 3 : fmin(reliefGap * 2, 60);
+                if (reliefN++ < 20) MSLogf(@"memory: only %.0f MB left before iOS's limit (footprint %.0f MB) - released %.0f MB of free malloc pages in %.1f ms, next try in %.0f s",
+                                           avail / 1048576.0, mem, got / 1048576.0, took * 1000, reliefGap);
             }
             if (tick % 2 == 1) { fps = (fr - frLast) / (now - frT); frLast = fr; frT = now; }
             if (tick % 10 == 9) {
@@ -6665,8 +6669,18 @@ static void MSAudioSessionSetup(const char *why) {
     NSUInteger opts = silentOK && mix ? 1 /* MixWithOthers */ : 0;
     NSError *e = nil;
     BOOL ok = ((BOOL (*)(id, SEL, id, id, NSUInteger, NSError **))objc_msgSend)(s, NSSelectorFromString(@"setCategory:mode:options:error:"), cat, @"AVAudioSessionModeDefault", opts, &e);
+    /* Bigger audio hardware buffer: iOS's default (~5 ms, 256 frames at 48 kHz) wakes the audio IO thread ~190 times a
+       second while the game's Wwise mixer makes 1024-frame (21 ms) blocks anyway; the IO thread used 10-13 % of a core
+       in gameplay. 20 ms means a quarter of the wake-ups, a little more audio latency, fewer dropouts when the phone is
+       busy. AudioBufferMs (macshim.plist, default 20, 0 = iOS's default). */
+    double bufMs = MSCfgD(@"AudioBufferMs", 20);
+    if (bufMs > 0) { NSError *eb = nil;
+        ((BOOL (*)(id, SEL, double, NSError **))objc_msgSend)(s, NSSelectorFromString(@"setPreferredIOBufferDuration:error:"), bufMs / 1000.0, &eb); }
     NSError *e2 = nil;
     BOOL act = ((BOOL (*)(id, SEL, BOOL, NSError **))objc_msgSend)(s, NSSelectorFromString(@"setActive:error:"), YES, &e2);
+    static int bsaid; if (bsaid++ < 3) MSLogf(@"audio: hardware buffer %.1f ms at %.0f Hz (asked %.0f ms)",
+        ((double (*)(id, SEL))objc_msgSend)(s, NSSelectorFromString(@"IOBufferDuration")) * 1000,
+        ((double (*)(id, SEL))objc_msgSend)(s, NSSelectorFromString(@"sampleRate")), bufMs);
     MSLogf(@"audio (%s): %@%@ - %@%@%@", why, [cat substringFromIndex:22], opts ? @" + mix" : @"", silentOK ? @"plays in silent mode" : @"silent switch mutes the game",
            ok ? @"" : [NSString stringWithFormat:@", category failed: %@", e.localizedDescription], act ? @"" : [NSString stringWithFormat:@", activate failed: %@", e2.localizedDescription]);
 }
