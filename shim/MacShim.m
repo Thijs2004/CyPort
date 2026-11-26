@@ -5873,7 +5873,9 @@ static void MSInstallPacing(void) {
     if (cm && !g_oCBCommit && (g_gpuSamplerOn || MSCfgD(@"TVMirror", 1) != 0)) g_oCBCommit = method_setImplementation(cm, (IMP)ms_cbCommit);
     Method re = cb ? class_getInstanceMethod(object_getClass(cb), @selector(renderCommandEncoderWithDescriptor:)) : NULL;
     if (re && g_gpuSamplerOn && !g_oCBRenderEnc && MSCfgD(@"GPUBreakdown", 1) != 0) g_oCBRenderEnc = method_setImplementation(re, (IMP)ms_cbRenderEnc);
-    MSPassMergeInstall(dev, MSCfgD(@"PassMerge", 1) != 0);
+    /* opt-in (PassMerge = YES): on Cyberpunk's frames it never applies - passes are split by compute work and
+       ping-pong between images (measured: 0 of ~130k passes per 30 s joinable); it stays for other games */
+    MSPassMergeInstall(dev, MSCfgD(@"PassMerge", 0) != 0);
     Method pm = cb ? class_getInstanceMethod(object_getClass(cb), @selector(presentDrawable:afterMinimumDuration:)) : NULL;
     if (p && pm && !g_oCBPresent) { g_oCBPresent = method_setImplementation(p, (IMP)ms_cbPresent); g_oCBPresentMin = method_setImplementation(pm, (IMP)ms_cbPresentMin); }
     Class D = NSClassFromString(@"CAMetalDrawable"); Method dp = D ? class_getInstanceMethod(D, @selector(present)) : NULL;
