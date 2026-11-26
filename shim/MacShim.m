@@ -5663,6 +5663,51 @@ static void MSMirrorFrame(id<MTLCommandBuffer> cb, id<CAMetalDrawable> d) {
         g_mirrorOn = NO;
     }
 }
+/* GPU breakdown (read only, only during the GPU sampler's 1 s every 30 s): render passes per frame and how many
+   attachments they load from / store to memory. On the phone's tile-based GPU every load/store of a whole image is
+   memory traffic; a Mac build doesn't care. Command buffer labels (when the engine sets them) get their GPU time.
+   Appended to the "gpu: busy" line. GPUBreakdown = NO turns it off. */
+static IMP g_oCBRenderEnc; static _Atomic long long g_rpPasses, g_rpLoads, g_rpStores, g_rpAtt, g_rpBytes, g_rpMSAA;
+static NSMutableDictionary<NSString *, NSNumber *> *g_rpSizes, *g_cbLabels;   /* under g_gpuLock */
+static int MSBytesPerPixel(MTLPixelFormat f) {
+    switch (f) {
+        case MTLPixelFormatR8Unorm: case MTLPixelFormatA8Unorm: case MTLPixelFormatStencil8: return 1;
+        case MTLPixelFormatR16Float: case MTLPixelFormatR16Unorm: case MTLPixelFormatRG8Unorm: case MTLPixelFormatDepth16Unorm: return 2;
+        case MTLPixelFormatRGBA16Float: case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRG32Float: return 8;
+        case MTLPixelFormatRGBA32Float: return 16;
+        case MTLPixelFormatDepth32Float_Stencil8: return 5;
+        default: return 4;
+    }
+}
+static void MSRPAtt(MTLRenderPassAttachmentDescriptor *a, NSMutableString *key) {
+    id<MTLTexture> t = a.texture; if (!t) return;
+    g_rpAtt++; if (t.sampleCount > 1) g_rpMSAA++;
+    long long b = (long long)t.width * t.height * MSBytesPerPixel(t.pixelFormat) * MAX(1, (int)t.sampleCount);
+    BOOL ld = a.loadAction == MTLLoadActionLoad, st = a.storeAction == MTLStoreActionStore || a.storeAction == MTLStoreActionStoreAndMultisampleResolve;
+    if (ld) { g_rpLoads++; g_rpBytes += b; } if (st) { g_rpStores++; g_rpBytes += b; }
+    if (ld || st) [key appendFormat:@"%s%lux%lu:%s%s ", key.length ? "" : "", (unsigned long)t.width, (unsigned long)t.height, ld ? "L" : "", st ? "S" : ""];
+}
+static id ms_cbRenderEnc(id self, SEL c, MTLRenderPassDescriptor *d) {
+    if (g_gpuSampling && d) {
+        g_rpPasses++; NSMutableString *k = [NSMutableString string];
+        for (int i = 0; i < 8; i++) MSRPAtt(d.colorAttachments[i], k);
+        MSRPAtt(d.depthAttachment, k);
+        if (d.stencilAttachment.texture != d.depthAttachment.texture) MSRPAtt(d.stencilAttachment, k);
+        if (k.length) { os_unfair_lock_lock(&g_gpuLock); if (g_rpSizes.count < 400) g_rpSizes[k] = @(g_rpSizes[k].intValue + 1); os_unfair_lock_unlock(&g_gpuLock); }
+    }
+    return ((id (*)(id, SEL, id))g_oCBRenderEnc)(self, c, d);
+}
+static NSString *MSGPUBreakdown(long long frames) {
+    if (!g_oCBRenderEnc || frames <= 0) return @"";
+    os_unfair_lock_lock(&g_gpuLock); NSDictionary *sz = [g_rpSizes copy], *lb = [g_cbLabels copy]; os_unfair_lock_unlock(&g_gpuLock);
+    NSArray *top = [sz keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) { return [b compare:a]; }];
+    NSMutableArray *ts = [NSMutableArray array]; for (NSString *k in top) { if (ts.count >= 6) break; [ts addObject:[NSString stringWithFormat:@"%.1fx %@", [sz[k] doubleValue] / frames, k]]; }
+    NSArray *tl = [lb keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) { return [b compare:a]; }];
+    NSMutableArray *ls = [NSMutableArray array]; for (NSString *k in tl) { if (ls.count >= 6) break; [ls addObject:[NSString stringWithFormat:@"%@ %.1f ms", k, 1000 * [lb[k] doubleValue] / frames]]; }
+    return [NSString stringWithFormat:@" | per frame: %.1f render passes, %.1f attachments (%.1f MSAA), %.1f loads + %.1f stores = %.0f MB memory traffic | busiest: %@%@",
+            (double)g_rpPasses / frames, (double)g_rpAtt / frames, (double)g_rpMSAA / frames, (double)g_rpLoads / frames, (double)g_rpStores / frames,
+            g_rpBytes / (double)frames / 1048576.0, [ts componentsJoinedByString:@", "], ls.count ? [@" | labels: " stringByAppendingString:[ls componentsJoinedByString:@", "]] : @""];
+}
 static void ms_cbCommit(id self, SEL c) {
     id md = nil;
     if (g_mirrorOn && g_oCBPresent && (md = objc_getAssociatedObject(self, &g_mirrorKey)))
@@ -5670,7 +5715,10 @@ static void ms_cbCommit(id self, SEL c) {
     if (g_gpuSampling) {
         [(id<MTLCommandBuffer>)self addCompletedHandler:^(id<MTLCommandBuffer> b) {
             CFTimeInterval a = b.GPUStartTime, e = b.GPUEndTime; if (e <= a || a <= 0) return;
-            os_unfair_lock_lock(&g_gpuLock); if (g_gpuN < 4096) { g_gpuIv[g_gpuN][0] = a; g_gpuIv[g_gpuN][1] = e; g_gpuN++; } os_unfair_lock_unlock(&g_gpuLock);
+            NSString *lab = g_oCBRenderEnc ? b.label : nil;
+            os_unfair_lock_lock(&g_gpuLock); if (g_gpuN < 4096) { g_gpuIv[g_gpuN][0] = a; g_gpuIv[g_gpuN][1] = e; g_gpuN++; }
+            if (lab.length && g_cbLabels.count < 200) g_cbLabels[lab] = @(g_cbLabels[lab].doubleValue + (e - a));
+            os_unfair_lock_unlock(&g_gpuLock);
         }];
     }
     ((void (*)(id, SEL))g_oCBCommit)(self, c);
@@ -5679,7 +5727,10 @@ static void ms_cbCommit(id self, SEL c) {
 static int MSCmpIv(const void *x, const void *y) { double a = ((const double *)x)[0], b = ((const double *)y)[0]; return a < b ? -1 : a > b; }
 static NSString *MSGPUSample(void) {                    /* progress thread: blocks ~1.2 s */
     if (!g_oCBCommit || !g_gpuSamplerOn) return nil;
-    os_unfair_lock_lock(&g_gpuLock); g_gpuN = 0; os_unfair_lock_unlock(&g_gpuLock);
+    os_unfair_lock_lock(&g_gpuLock); g_gpuN = 0;
+    if (!g_rpSizes) { g_rpSizes = [NSMutableDictionary dictionary]; g_cbLabels = [NSMutableDictionary dictionary]; }
+    [g_rpSizes removeAllObjects]; [g_cbLabels removeAllObjects]; os_unfair_lock_unlock(&g_gpuLock);
+    g_rpPasses = g_rpLoads = g_rpStores = g_rpAtt = g_rpBytes = g_rpMSAA = 0;
     long long f0 = g_frames; double t0 = CACurrentMediaTime(); g_gpuSampling = YES; usleep(1000000); g_gpuSampling = NO;
     double t1 = CACurrentMediaTime(); long long frames = g_frames - f0; usleep(200000);     /* late completions */
     os_unfair_lock_lock(&g_gpuLock); int n = g_gpuN; static double iv[4096][2]; memcpy(iv, g_gpuIv, sizeof(double) * 2 * n); os_unfair_lock_unlock(&g_gpuLock);
@@ -5688,8 +5739,8 @@ static NSString *MSGPUSample(void) {                    /* progress thread: bloc
     double busy = 0, cs = iv[0][0], ce = iv[0][1];
     for (int i = 1; i < n; i++) { if (iv[i][0] > ce) { busy += ce - cs; cs = iv[i][0]; ce = iv[i][1]; } else if (iv[i][1] > ce) ce = iv[i][1]; }
     busy += ce - cs;
-    return [NSString stringWithFormat:@"gpu: busy %.0f%% of the last second (%.1f ms per frame, %lld frames, %d command buffers)",
-            100 * busy / (t1 - t0), 1000 * busy / frames, frames, n];
+    return [NSString stringWithFormat:@"gpu: busy %.0f%% of the last second (%.1f ms per frame, %lld frames, %d command buffers)%@",
+            100 * busy / (t1 - t0), 1000 * busy / frames, frames, n, MSGPUBreakdown(frames)];
 }
 /* 120 Hz. iOS runs the screen at 60 Hz for a Metal layer unless something in the app asks for more with a display
  * link's preferredFrameRateRange (the Info.plist key alone only allows it). The Mac game never asks, so menus stopped
@@ -5815,6 +5866,8 @@ static void MSInstallPacing(void) {
     Method cm = cb ? class_getInstanceMethod(object_getClass(cb), @selector(commit)) : NULL;
     g_gpuSamplerOn = ![MSConfig()[@"GPUSampler"] isEqual:@NO];
     if (cm && !g_oCBCommit && (g_gpuSamplerOn || MSCfgD(@"TVMirror", 1) != 0)) g_oCBCommit = method_setImplementation(cm, (IMP)ms_cbCommit);
+    Method re = cb ? class_getInstanceMethod(object_getClass(cb), @selector(renderCommandEncoderWithDescriptor:)) : NULL;
+    if (re && g_gpuSamplerOn && !g_oCBRenderEnc && MSCfgD(@"GPUBreakdown", 1) != 0) g_oCBRenderEnc = method_setImplementation(re, (IMP)ms_cbRenderEnc);
     Method pm = cb ? class_getInstanceMethod(object_getClass(cb), @selector(presentDrawable:afterMinimumDuration:)) : NULL;
     if (p && pm && !g_oCBPresent) { g_oCBPresent = method_setImplementation(p, (IMP)ms_cbPresent); g_oCBPresentMin = method_setImplementation(pm, (IMP)ms_cbPresentMin); }
     Class D = NSClassFromString(@"CAMetalDrawable"); Method dp = D ? class_getInstanceMethod(D, @selector(present)) : NULL;
