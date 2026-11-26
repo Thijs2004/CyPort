@@ -6606,9 +6606,35 @@ static void MSHookGameWindow(void) {
 }
 
 static IMP g_origEngineStart;
+/* what the game's audio output looks like (once, 10 s after its engine starts): channel counts and the 3D rendering
+   settings of its nodes - to learn where the audio threads' CPU time goes. Read only. */
+static void MSAudioGraphLog(id eng) {
+    @try {
+        NSMutableString *m = [NSMutableString string];
+        id out = [eng valueForKey:@"outputNode"], mix = [eng valueForKey:@"mainMixerNode"];
+        id fo = ((id (*)(id, SEL, NSUInteger))objc_msgSend)(out, NSSelectorFromString(@"outputFormatForBus:"), 0);
+        id fm = ((id (*)(id, SEL, NSUInteger))objc_msgSend)(mix, NSSelectorFromString(@"outputFormatForBus:"), 0);
+        [m appendFormat:@"output %u ch %.0f Hz, main mixer %u ch", [[fo valueForKey:@"channelCount"] unsignedIntValue], [[fo valueForKey:@"sampleRate"] doubleValue], [[fm valueForKey:@"channelCount"] unsignedIntValue]];
+        NSCountedSet *kinds = [NSCountedSet set]; NSMutableSet *algos = [NSMutableSet set];
+        for (id nd in [eng valueForKey:@"attachedNodes"]) {
+            [kinds addObject:NSStringFromClass([nd class])];
+            id f = ((id (*)(id, SEL, NSUInteger))objc_msgSend)(nd, NSSelectorFromString(@"outputFormatForBus:"), 0);
+            NSString *a = [nd respondsToSelector:NSSelectorFromString(@"renderingAlgorithm")] ? [NSString stringWithFormat:@"%@ algo %@ src %@ %u ch", NSStringFromClass([nd class]),
+                [nd valueForKey:@"renderingAlgorithm"], [nd respondsToSelector:NSSelectorFromString(@"sourceMode")] ? [nd valueForKey:@"sourceMode"] : @"-", [[f valueForKey:@"channelCount"] unsignedIntValue]] : nil;
+            if (a) [algos addObject:a];
+            if ([NSStringFromClass([nd class]) containsString:@"Environment"] && [nd respondsToSelector:NSSelectorFromString(@"outputType")])
+                [algos addObject:[NSString stringWithFormat:@"environment outputType %@ in %u ch", [nd valueForKey:@"outputType"], [[f valueForKey:@"channelCount"] unsignedIntValue]]];
+        }
+        for (NSString *k in kinds) [m appendFormat:@", %lu x %@", (unsigned long)[kinds countForObject:k], k];
+        MSLogf(@"audio graph: %@ | %@", m, [algos.allObjects componentsJoinedByString:@"; "]);
+    } @catch (NSException *e) { MSLogf(@"audio graph: not readable (%@)", e.reason); }
+}
 static BOOL ms_engineStart(id self, SEL _cmd, NSError **err) {
     @synchronized (g_audioEngines) { [g_audioEngines addObject:self]; }
-    return ((BOOL (*)(id, SEL, NSError **))g_origEngineStart)(self, _cmd, err);
+    BOOL ok = ((BOOL (*)(id, SEL, NSError **))g_origEngineStart)(self, _cmd, err);
+    static int said; if (ok && said++ < 2) { __weak id w = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ id e = w; if (e) MSAudioGraphLog(e); }); }
+    return ok;
 }
 /* ---------------------------------------------------------------- audio: autorelease pools for per-tick AVAudio setters
  * Wwise's audio thread (AK::AudioMgr) updates every 3D voice each tick - -[AVAudioPlayerNode setPosition:] and friends.
@@ -7087,8 +7113,28 @@ int ms_BinkStartAsyncThread(int thread, const void *param) {
    fitted to iOS's per-app limit (MSFitMemSizeGB). The real size stays in g_realMemBytes for the launch log. */
 static double MSReportedMemGB(void) { double m = [MSConfig()[@"MemSizeGB"] doubleValue]; return m > 0 ? m : MSFitMemSizeGB(); }
 static unsigned long long ms_physMem(id self, SEL _cmd) { return (unsigned long long)(MSReportedMemGB() * 1073741824.0); }
+/* Memory headroom by default where it is needed: phones with 10 GB+ of RAM whose per-app limit is only ~6 GB (iPhone Air /
+   17 Pro (Max) inside LiveContainer or without the full entitlement). Metal promises them more GPU memory than iOS lets
+   the app use, and the game was killed at character creation with ~60 MB left (issue #19: told 7 GB, footprint 6.08 GB
+   at a 6.0 GB limit). Decided once, only while the start screen switch was never touched (CyPortMemoryHeadroom unset);
+   CyPortHeadroomAuto remembers it for the start screen's "Restore defaults". 8 GB phones (6 GB limit, Metal 5.3 GB)
+   and 12 GB phones with the full 8 GB limit keep the old default. HeadroomAuto = NO in macshim.plist turns this off. */
+static void MSHeadroomAutoDecide(void) {
+    NSUserDefaults *u = NSUserDefaults.standardUserDefaults;
+    size_t avail = os_proc_available_memory(); if (!avail || [MSConfig()[@"HeadroomAuto"] isEqual:@NO]) return;
+    task_vm_info_data_t v; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&v, &n) != KERN_SUCCESS) return;
+    double limGB = (avail + v.phys_footprint) / 1073741824.0, ramGB = g_realMemBytes / 1073741824.0;
+    BOOL want = ramGB >= 10 && limGB <= 6.5;
+    [u setBool:want forKey:@"CyPortHeadroomAuto"];
+    if (want && ![u objectForKey:@"CyPortMemoryHeadroom"]) {
+        [u setBool:YES forKey:@"CyPortMemoryHeadroom"];
+        MSLogf(@"memory headroom: switched on for this phone (%.1f GB of RAM but iOS lets the app use only %.2f GB) - can be turned off on the start screen", ramGB, limGB);
+    }
+}
 __attribute__((constructor)) static void MSInstallMemSize(void) {
     g_realMemBytes = NSProcessInfo.processInfo.physicalMemory;
+    MSHeadroomAutoDecide();
     if (MSReportedMemGB() <= 0) return;
     method_setImplementation(class_getInstanceMethod(NSProcessInfo.class, @selector(physicalMemory)), (IMP)ms_physMem);
 }

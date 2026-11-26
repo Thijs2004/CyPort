@@ -333,7 +333,7 @@ private struct LauncherView: View {
         if let i = model.notes.firstIndex(of: "recommended") { model.resolution = i }
         model.overlay = 1
         smoothPacing = true; gameThread = true; lowLatency = false; appleFrameGen = false
-        vibration = true; adaptiveTriggers = true; kbmWithController = false; phoneRumble = true; memoryHeadroom = false
+        vibration = true; adaptiveTriggers = true; kbmWithController = false; phoneRumble = true; memoryHeadroom = UserDefaults.standard.bool(forKey: "CyPortHeadroomAuto")
         lookMode = 2; touchHaptics = true; lookSensitivity = 1.5
         silentModeSound = true; mixAudio = false
         let d = UserDefaults.standard
