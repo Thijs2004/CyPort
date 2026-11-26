@@ -69,7 +69,7 @@ clang $LDFLAG -target arm64-apple-ios16.0 -isysroot "$SDK" -dynamiclib -fobjc-ar
   -framework Security -framework CoreGraphics -framework CoreFoundation -framework Metal -framework UniformTypeIdentifiers -framework WebKit -lz \
   -lbz2 -liconv -Wl,-load_hidden,"$LA/ios/libarchive.a" -Wl,-load_hidden,"$LA/ios/liblzma.a" \
   -Wl,-reexport_framework,Foundation -Wl,-reexport_framework,CoreGraphics -Wl,-reexport_framework,Security -Wl,-reexport_framework,Metal \
-  "$HERE/shim/MacShim.m" "$HERE/shim/MacShimC.c" "$HERE/shim/PadLayout.c" "$HERE/shim/StoreCodecs.c" "$HERE/shim/ModManagerCore.c" "$HERE/shim/third_party/lzma/LzmaDec.c" $SWIFT_OBJ \
+  "$HERE/shim/MacShim.m" "$HERE/shim/PassMerge.m" "$HERE/shim/MacShimC.c" "$HERE/shim/PadLayout.c" "$HERE/shim/StoreCodecs.c" "$HERE/shim/ModManagerCore.c" "$HERE/shim/third_party/lzma/LzmaDec.c" $SWIFT_OBJ \
   -o "$APP/Frameworks/libMacShim.dylib"
 rm -f "$APP/Frameworks/Launcher.o"
 

@@ -54,6 +54,7 @@ id NSApp = nil;
 static void MSStartReadProgress(void);
 static _Atomic long long g_noCopyN, g_noCopyBytes, g_bufTexN, g_bufTexBad;
 static double MSCfgD(NSString *k, double def);
+void MSPassMergeFlush(id cb); BOOL MSPassMergeInstall(id<MTLDevice> dev, BOOL wanted); NSString *MSPassMergeStats(void);   /* PassMerge.m */
 static NSString *MSQuarantineStats(void);
 static NSDictionary *MSConfig(void);
 static NSInteger MSPref(NSString *k, NSInteger def);
@@ -3881,12 +3882,16 @@ static NSString *MSRenderWidthReport(void) {
     if (!n || !out) return nil;
     return [NSString stringWithFormat:@"render size: %ld-%ld px wide, avg %ld (%.0f-%.0f %%, avg %.0f %% of %ld)", lo, hi, sum / n, 100.0 * lo / out, 100.0 * hi / out, 100.0 * sum / n / out, out];
 }
+static IMP g_fxEnc;
+static void ms_fxEncode(id self, SEL c, id cb) { MSPassMergeFlush(cb); ((void (*)(id, SEL, id))g_fxEnc)(self, c, cb); }
 static id ms_fxNew(id self, SEL c, id dev) {
     id r = ((id (*)(id, SEL, id))g_fxNew)(self, c, dev);
     if (r) {
         g_fxOutW = (long)[[self valueForKey:@"outputWidth"] unsignedLongValue];
         Method m = class_getInstanceMethod(object_getClass(r), @selector(setInputContentWidth:));
         if (m && method_getImplementation(m) != (IMP)ms_fxSetW) { IMP o = method_setImplementation(m, (IMP)ms_fxSetW); if (!g_fxSetW) g_fxSetW = o; }
+        Method en = class_getInstanceMethod(object_getClass(r), @selector(encodeToCommandBuffer:));   /* pass merge: no held pass under MetalFX's own encoders */
+        if (en && method_getImplementation(en) != (IMP)ms_fxEncode) { IMP o = method_setImplementation(en, (IMP)ms_fxEncode); if (!g_fxEnc) g_fxEnc = o; }
     }
     static int n; if (n++ < 6) MSLogf(@"MetalFX: temporal scaler %@ (input %lux%lu -> output %lux%lu)", r ? @"created" : @"FAILED",
         [[self valueForKey:@"inputWidth"] unsignedLongValue], [[self valueForKey:@"inputHeight"] unsignedLongValue],
@@ -5868,6 +5873,7 @@ static void MSInstallPacing(void) {
     if (cm && !g_oCBCommit && (g_gpuSamplerOn || MSCfgD(@"TVMirror", 1) != 0)) g_oCBCommit = method_setImplementation(cm, (IMP)ms_cbCommit);
     Method re = cb ? class_getInstanceMethod(object_getClass(cb), @selector(renderCommandEncoderWithDescriptor:)) : NULL;
     if (re && g_gpuSamplerOn && !g_oCBRenderEnc && MSCfgD(@"GPUBreakdown", 1) != 0) g_oCBRenderEnc = method_setImplementation(re, (IMP)ms_cbRenderEnc);
+    MSPassMergeInstall(dev, MSCfgD(@"PassMerge", 1) != 0);
     Method pm = cb ? class_getInstanceMethod(object_getClass(cb), @selector(presentDrawable:afterMinimumDuration:)) : NULL;
     if (p && pm && !g_oCBPresent) { g_oCBPresent = method_setImplementation(p, (IMP)ms_cbPresent); g_oCBPresentMin = method_setImplementation(pm, (IMP)ms_cbPresentMin); }
     Class D = NSClassFromString(@"CAMetalDrawable"); Method dp = D ? class_getInstanceMethod(D, @selector(present)) : NULL;
@@ -6026,7 +6032,7 @@ static void MSStartReadProgress(void) {
                            now - t0, b / 1073741824.0, c, mbps, idle, cpuPct, mem, avail / 1048576.0, fr, fps, MSMouseGate(), g_mqAsked > g_mqBeat ? now - g_mqAsked : 0.0, MSThermal(), MSYieldRate(0), MSYieldRate(1),
                            NSProcessInfo.processInfo.lowPowerModeEnabled ? @", LOW POWER MODE" : @"");
                 static int diag = -1; if (diag < 0) diag = [MSConfig()[@"Diagnostics"] boolValue];
-                if (tick % 60 == 29 && fr > 300) { NSString *g = MSGPUSample(); if (g) MSLogf(@"%@", g); }
+                if (tick % 60 == 29 && fr > 300) { NSString *g = MSGPUSample(); if (g) MSLogf(@"%@", g); NSString *pm = MSPassMergeStats(); if (pm) MSLogf(@"%@", pm); }
                 if (tick % 60 == 59 && fr > 60) MSLogf(@"threads (CPU over the last 30 s): %@", MSThreadCPUReport());
                 if (tick % 60 == 59 && fr > 60) { NSString *rs = MSRenderWidthReport(); if (rs) MSLogf(@"%@", rs); }
                 if (tick % 60 == 59 && fr > 60) { NSString *sp = MSSpinReport(30); if (sp) MSLogf(@"%@", sp); }
@@ -6321,7 +6327,7 @@ static id ms_bufTex(id self, SEL c, MTLTextureDescriptor *d, NSUInteger off, NSU
 /* did the game really get Apple's frame interpolator? (supportsDevice: says NO on A18 Pro) - logged, plus how many
    frames it makes (encodeToCommandBuffer: calls, in the 30 s progress line's "gpu" report via MSFIReport) */
 static IMP g_oFINew, g_oFINew4, g_oFIEnc; static _Atomic long long g_fiEncodes;
-static void ms_fiEncode(id self, SEL c, id cb) { g_fiEncodes++; ((void (*)(id, SEL, id))g_oFIEnc)(self, c, cb); }
+static void ms_fiEncode(id self, SEL c, id cb) { g_fiEncodes++; MSPassMergeFlush(cb); ((void (*)(id, SEL, id))g_oFIEnc)(self, c, cb); }
 static void MSFIReport(void) {
     static double rep; double now = CACurrentMediaTime(); if (now - rep < 30) return;
     long long n = g_fiEncodes; g_fiEncodes = 0;
