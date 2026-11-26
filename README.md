@@ -33,7 +33,7 @@ No emulation, no streaming: the Apple Silicon Mac build runs directly on iOS / i
 | Online features (GOG Galaxy achievements, crash upload) | ❌ offline only (stubbed) |
 
 Tested on: **iPhone 16 Pro Max (A18 Pro, 8 GB), iOS 27.0.1**, built with Xcode 27; **iPhone Duo (12 GB), iOS 27.1**, built with Xcode 27.1.
-The build stamps the game with the iOS SDK of the Xcode it's built with: an iPhone Duo only shows apps built with the iOS 27 SDK at its real screen sizes.
+The build stamps the game with the iOS SDK of the Xcode it's built with, and at least **27.1**: an iPhone Duo only shows an app full screen when it says it was built with the iOS 27.1 SDK (27.0 leaves a black bar at the side), so builds made with Xcode 27.0 are stamped 27.1 too.
 
 ---
 
@@ -174,7 +174,11 @@ while loading. If it is killed with no crash log, the memory limit is still the 
 - **Frame rate:** the game's *VSync* setting is its frame cap: 30 / 40 / 60 / 120 / Off. On a 120 Hz iPhone CyPort switches the
   screen to 120 Hz whenever the cap needs it (40, 120, Off – iOS would otherwise stay at 60 Hz and 40 would show as 30). Higher
   caps make the phone hot faster: **40** is a good choice for the open world, 60–120 for menus and short sessions.
-- Leave **frame generation off** – it adds GPU work and input delay.
+- **Frame generation** gives the highest frame rate once the phone is hot (45–58 FPS measured in the city on an iPhone 16 Pro Max,
+  20–30 without), at the cost of a little input delay.
+- **Menus** run at up to 60 FPS (not 120): a menu doesn't need more, and at 120 the phone used to be throttling before a save had
+  even loaded. Gameplay keeps the game's own frame rate.
+- Start with a **cool phone** and don't play while charging: a phone that is warm at the start throttles within a minute or two.
 - A clip-on phone cooler helps more than any setting: heat, not raw speed, is what limits the phone.
 
 ### Options – `Documents/Cyberpunk 2077/macshim.plist`
@@ -198,6 +202,11 @@ while loading. If it is killed with no crash log, the memory limit is still the 
 | `RealPadCategory` = NO | show third-party controllers to the game as what they are (not as Xbox) |
 | `Drawables` = 2, `LowLatencyLockstep` = YES, `PadTiming` = YES | older low-latency methods (cost FPS) / controller delay measurement |
 | `FramePacing` = NO | no frame pacing hooks at all |
+| `MenuFPS` (number, default 60, 0 = off) | highest frame rate in menus, the map and loading screens (while the game has the pointer free) |
+| `AudioBufferMs` (number, default 20, 0 = iOS default) | audio hardware buffer CyPort asks iOS for (fewer audio thread wake-ups) |
+| `HeadroomAuto` = NO | don't switch Memory headroom on by itself on 10 GB+ phones that iOS gives only ~6 GB per app |
+| `PassMerge` = YES | join back-to-back render passes on the same images into one GPU pass (off: Cyberpunk's frames never allow it) |
+| `GPUBreakdown` = NO | no render pass / memory traffic numbers in the `gpu: busy` log line |
 | `Diagnostics` = YES | memory pool / GPU memory statistics in the log every 10 s |
 | `AudioPools` = NO | don't wrap the per-tick AVAudio setters (`setPosition:`, `setVolume:`...) in an autorelease pool. Wwise's audio thread never drains one, so without it autoreleased memory piles up for the whole session |
 | `WorkerSampler` = YES | worker-thread profile in the log every ~60 s (pauses the workers briefly – causes a hitch) |
