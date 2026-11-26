@@ -44,6 +44,7 @@ enum { PM_ATT = 10 };   // 8 colour, depth, stencil
     BOOL wroteDS, fence, merged;
     NSUInteger w, h; int chain;
     NSMutableString *seq; NSMutableDictionary *ids; int seqPasses;   // sequence sample (one command buffer a minute)
+    BOOL used;                                                       // a pass was made since the last commit (the driver reuses command buffers)
 }
 @end
 @implementation MSPMState @end
@@ -145,7 +146,7 @@ static NSString *PMTexId(MSPMState *s, id t) {
 static const char *PMLA(MTLLoadAction a) { return a == MTLLoadActionLoad ? "L" : a == MTLLoadActionClear ? "C" : "-"; }
 static const char *PMSA(MTLStoreAction a) { return a == MTLStoreActionStore ? "S" : a == MTLStoreActionDontCare ? "-" : "?"; }
 static void PMSeqPass(MSPMState *s, MTLRenderPassDescriptor *d, BOOL joined) {
-    if (!s || !s->seq || s->seq.length > 3000) return;
+    if (!s || !s->seq || s->seq.length > 6000) return;
     s->seqPasses++;
     [s->seq appendString:joined ? @" +R(" : @" R("];
     for (int i = 0; i < PM_ATT; i++) { MTLRenderPassAttachmentDescriptor *a = PMAtt(d, i); if (!a.texture || (i == 9 && a.texture == d.depthAttachment.texture)) continue;
@@ -153,7 +154,7 @@ static void PMSeqPass(MSPMState *s, MTLRenderPassDescriptor *d, BOOL joined) {
     [s->seq appendString:@")"];
 }
 static void PMSeqCall(MSPMState *s, SEL c) {
-    if (!s || !s->seq || s->seq.length > 3000) return;
+    if (!s || !s->seq || s->seq.length > 6000) return;
     const char *n = sel_getName(c);
     [s->seq appendFormat:@" %s", !strncmp(n, "blit", 4) ? "blit" : !strncmp(n, "compute", 7) ? "compute" : !strncmp(n, "commit", 6) ? "commit" : n];
 }
@@ -163,7 +164,10 @@ static id pm_render(id cb, SEL c, MTLRenderPassDescriptor *d) {
     if (!g_pmOn) return ((id (*)(id, SEL, id))g_oRender)(cb, c, d);
     g_pmPasses++;
     MSPMState *s = PMStateOf(cb);
-    if (!s || !s->pending) g_pmR[PMR_NOPREV]++;
+    if (!s) { s = [MSPMState new]; objc_setAssociatedObject(cb, &g_pmKey, s, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+    if (!s->used) { s->used = YES; double now = CACurrentMediaTime();
+        if (!s->seq && now >= g_pmSeqNext) { g_pmSeqNext = now + 1e9; s->seq = [NSMutableString string]; s->ids = [NSMutableDictionary dictionary]; s->seqPasses = 0; } }
+    if (!s->pending) g_pmR[PMR_NOPREV]++;
     if (s && s->pending) {
         if (PMCanMerge(s, d)) {
             id e = s->pending; s->pending = nil; s->chain++; s->merged = YES; g_pmMerged++;
@@ -174,20 +178,21 @@ static id pm_render(id cb, SEL c, MTLRenderPassDescriptor *d) {
     }
     id e = ((id (*)(id, SEL, id))g_oRender)(cb, c, d);
     if (e && PMCandidate(d)) {
-        if (!s) { s = [MSPMState new]; objc_setAssociatedObject(cb, &g_pmKey, s, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                  double now = CACurrentMediaTime(); if (now >= g_pmSeqNext) { g_pmSeqNext = now + 60; s->seq = [NSMutableString string]; s->ids = [NSMutableDictionary dictionary]; } }
+        if (!s) { s = [MSPMState new]; objc_setAssociatedObject(cb, &g_pmKey, s, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
         PMRecord(s, d, e);
         objc_setAssociatedObject(e, &g_pmKey, s, OBJC_ASSOCIATION_RETAIN_NONATOMIC);   /* the driver may reuse encoder objects: always set */
     } else {
-        if (e) objc_setAssociatedObject(e, &g_pmKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        if (s) s->open = nil;
+        if (e) objc_setAssociatedObject(e, &g_pmKey, s, OBJC_ASSOCIATION_RETAIN_NONATOMIC);   /* never held (open is nil): only for the sequence's "e" */
+        s->open = nil;
+        if (s->seq && s->seq.length < 6000) [s->seq appendString:@" x"];
     }
     if (e) PMSeqPass(s, d, NO);
     return e;
 }
 static void pm_end(id e, SEL c) {
     MSPMState *s = g_pmOn ? objc_getAssociatedObject(e, &g_pmKey) : nil;
-    if (s && s->open == e && !s->pending) { s->pending = e; g_pmHeld++; return; }
+    if (s && s->open == e && !s->pending) { s->pending = e; g_pmHeld++; if (s->seq && s->seq.length < 6000) [s->seq appendString:@"h"]; return; }
+    if (s && s->seq && s->seq.length < 6000) [s->seq appendString:@"e"];
     ((void (*)(id, SEL))g_oEnd)(e, c);
 }
 static void pm_updFence(id e, SEL c, id f, NSUInteger stages) {
@@ -255,9 +260,11 @@ static IMP g_oCommitPM;
 static void pm_commit(id cb, SEL c) {
     PMF(cb); PMWatchErrors(cb);
     MSPMState *s = PMStateOf(cb);
+    if (s) s->used = NO;
     if (s && s->seq) {
-        if (s->seqPasses >= 12) PMLog([NSString stringWithFormat:@"sequence of one command buffer (%d passes; t<n> = image, L/C/- load, S/- store, |depth, +R joined, F fence):%@", s->seqPasses, s->seq]);
-        else g_pmSeqNext = 0;   // too small: sample the next one
+        static int logged; double now = CACurrentMediaTime();
+        if (s->seqPasses >= 3) { logged++; g_pmSeqNext = logged >= 60 ? 1e18 : now + (logged % 4 ? 0.3 : 30); } else g_pmSeqNext = now;   /* 4 in a row every 30 s, at most 60 */
+        if (s->seqPasses >= 3) PMLog([NSString stringWithFormat:@"sequence of one command buffer (%d passes; t<n> = image, L/C/- load, S/- store, |depth, +R joined, F fence, h held / e ended, x = not mergeable pass):%@", s->seqPasses, s->seq]);
         s->seq = nil; s->ids = nil;
     }
     ((void (*)(id, SEL))g_oCommitPM)(cb, c);
@@ -316,7 +323,7 @@ BOOL MSPassMergeInstall(id<MTLDevice> dev, BOOL wanted) {
     g_oUpdFence = method_setImplementation(mf, (IMP)pm_updFence);
     g_oSetDS = method_setImplementation(ms, (IMP)pm_setDS);
     g_oCommitPM = method_setImplementation(mc, (IMP)pm_commit);
-    g_pmOn = YES;
+    g_pmOn = YES; g_pmSeqNext = CACurrentMediaTime() + 120;   /* sequences from gameplay, not the menu */
     PMLog([NSString stringWithFormat:@"on (%s / %s, %d command buffer calls end a held pass)", class_getName(C), class_getName(E), g_pmWN]);
     return YES;
 }
