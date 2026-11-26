@@ -220,13 +220,7 @@ static void MSRefreshScreen(void) {
     MSOnMain(^{
         UIScreen *s = MSPhoneScreen(); g_fps = (double)s.maximumFramesPerSecond;
         if (!g_sizeLocked) {                          /* the scale is part of the size the game was told: fixed too */
-            /* the app's window, not the screen: on an iPhone Duo they differ (a letterboxed window, the inner screen
-               while UIScreen still describes the outer one) and Apple says to size from the scene */
-            UIWindowScene *sc = MSAppScene(); CGRect sb = s.bounds, wb = sc ? sc.coordinateSpace.bounds : sb;
-            if (wb.size.width < 100 || wb.size.height < 100) wb = sb;
-            static int said; if ((fabs(wb.size.width - sb.size.width) > 1 || fabs(wb.size.height - sb.size.height) > 1) && said++ < 6)
-                MSLogf(@"screen: the app's window is %.0fx%.0f pt, the screen %.0fx%.0f pt - the game gets the window's size", wb.size.width, wb.size.height, sb.size.width, sb.size.height);
-            double w = wb.size.width, h = wb.size.height; g_ss = s.nativeScale;
+            double w = s.bounds.size.width, h = s.bounds.size.height; g_ss = s.nativeScale;
             g_sw = MAX(w, h); g_sh = MIN(w, h);          /* landscape only */
         }
         /* decided once, so the size the game was told never changes under it: same height (= same pixel cost) as
