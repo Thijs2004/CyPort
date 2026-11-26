@@ -1974,8 +1974,28 @@ static void MSPaceSet(int fps, NSString *why) {
     g_paceT = t; g_paceFPS = fps;
     MSLogf(@"frame pacing: %@ (%@)", fps > 0 ? [NSString stringWithFormat:@"%d FPS", fps] : @"off", why);
 }
+/* Menus at most 60 FPS. With VSync Off / 120 (what smooth pacing's first run sets) the main menu, pause menu, map and
+ * inventory ran at 120 FPS: logs showed the phone thermal HOT (throttling) 40 s after launch, before a save had even
+ * loaded, so every session started its gameplay already throttled. A menu gains nothing from 120 FPS. While the game
+ * has the pointer free (not gameplay: menus, map, loading screens) CyPort holds it to MenuFPS (macshim.plist, default
+ * 60, 0 = off) when the game's own cap is faster; the screen drops to 60 Hz too. Gameplay keeps the game's / smooth
+ * pacing's frame rate. */
+static _Atomic double g_gameMinDur;
+static double MSMenuCapT(void) {
+    static double t = -1;
+    if (t < 0) { double f = MSCfgD(@"MenuFPS", 60); t = f >= 10 ? 1.0 / f : 0; }
+    return t;
+}
+static double MSPaceNow(void) {                      /* the frame time CyPort holds the game to right now (0 = none) */
+    double T = g_paceT, m = MSMenuCapT();
+    if (m <= 0 || g_pointerLocked || g_inBackground) return T;
+    if (g_gameMinDur >= m - 0.0005) return T;       /* the game's own cap (VSync 60/40/30) is already that slow */
+    return T > m ? T : m;
+}
 static void MSPaceWait(void) {                      /* nextDrawable, on the game's render thread */
-    double T = g_paceT; static __thread uint64_t next;
+    double T = MSPaceNow(); static __thread uint64_t next;
+    static int menu = -1, said; int nowMenu = T > 0 && T != g_paceT;
+    if (nowMenu != menu) { if (menu >= 0 && said++ < 30) MSLogf(@"frame pacing: %@", nowMenu ? [NSString stringWithFormat:@"menu - at most %.0f FPS", 1 / T] : @"gameplay - menu cap off"); menu = nowMenu; }
     if (T <= 0) { next = 0; return; }
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
     uint64_t per = (uint64_t)(T * 1e9 * tb.denom / tb.numer), early = (uint64_t)(0.0007 * 1e9 * tb.denom / tb.numer);
@@ -3943,6 +3963,7 @@ static void MSSmoothFrame(double tOut) {                 /* render thread, after
     if (g_smoothStop && on) { on = 0; if (g_paceMode <= 0) MSPaceSet(0, @"smooth pacing off: frame generation is on"); }
     if (!on || g_paceMode > 0 || g_inBackground) return;
     static double last, winStart, probeAt, backoff = 20; static int n, late, step, top, probing, probeFrom, probeWins, badWins;
+    if (MSPaceNow() != g_paceT) { last = 0; winStart = 0; n = late = 0; return; }   /* menu cap in charge: nothing to measure */
     int maxHz = (int)lround(g_fps); if (maxHz < 60) maxHz = 60;
     double gd = g_gameMinDur; int cap = gd > 0 ? (int)lround(1 / gd) : maxHz; if (cap > maxHz) cap = maxHz;
     static const int steps[] = { 120, 60, 40, 30 };
@@ -5679,7 +5700,7 @@ static NSString *MSGPUSample(void) {                    /* progress thread: bloc
 @implementation MSRefreshTicker
 - (void)tick:(CADisplayLink *)l { }
 - (void)check:(NSTimer *)t {
-    CADisplayLink *l = t.userInfo; double d = g_paceT > 0 ? g_paceT : g_gameMinDur;
+    CADisplayLink *l = t.userInfo; double pn = MSPaceNow(), d = pn > 0 ? pn : g_gameMinDur;
     /* 60 Hz only fits caps that divide 60 (60, 30, 20): VSync 40 (25 ms) fell back to 33 ms = 30 FPS. Anything else -
        40, 120, uncapped, a custom Max FPS - gets 120 Hz, where 25 ms is exactly 3 refreshes. */
     int fps = d > 0 ? (int)lround(1 / d) : 0;
@@ -5748,14 +5769,14 @@ static void ms_cbPresentMin(id self, SEL c, id d, CFTimeInterval t) {   /* the g
     if (d) objc_setAssociatedObject(d, &g_capKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     MSShownWatch(d);
     if (g_mirrorOn) objc_setAssociatedObject(self, &g_mirrorKey, d, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    double T = g_paceT; static int said; if (!said++) MSLogf(@"frame pacing: game presents with presentDrawable:afterMinimumDuration: %.4f", (double)g_gameMinDur);
+    double T = MSPaceNow(); static int said; if (!said++) MSLogf(@"frame pacing: game presents with presentDrawable:afterMinimumDuration: %.4f", (double)g_gameMinDur);
     ((void (*)(id, SEL, id, CFTimeInterval))g_oCBPresentMin)(self, c, d, T > 0 ? MAX(t, T - 0.002) : t);
 }
 static void ms_drPresentMin(id self, SEL c, CFTimeInterval t) {
     if (MSIsOverlayDrawable(self)) { ((void (*)(id, SEL, CFTimeInterval))g_oDrPresentMin)(self, c, t); return; }   /* CET overlay */
     if (objc_getAssociatedObject(self, &g_capKey)) { ((void (*)(id, SEL, CFTimeInterval))g_oDrPresentMin)(self, c, t); return; }
     g_gameMinDur = t; t = MSCapMargin(t); MSShownWatch(self);
-    double T = g_paceT; ((void (*)(id, SEL, CFTimeInterval))g_oDrPresentMin)(self, c, T > 0 ? MAX(t, T - 0.002) : t);
+    double T = MSPaceNow(); ((void (*)(id, SEL, CFTimeInterval))g_oDrPresentMin)(self, c, T > 0 ? MAX(t, T - 0.002) : t);
 }
 /* Uncapped (VSync Off): a plain present is treated by iOS as ordinary 60 Hz content - menus sat at exactly 60 while
    VSync 120 (an 8.3 ms cap) ran at 120. So "no cap" is passed on as "every refresh of the fastest screen rate", which
@@ -5771,7 +5792,7 @@ static void ms_cbPresent(id self, SEL c, id d) {                /* -[MTLCommandB
     if (d) objc_setAssociatedObject(d, &g_capKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     MSShownWatch(d);
     if (g_mirrorOn) objc_setAssociatedObject(self, &g_mirrorKey, d, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    double T = g_paceT; static int said; if (!said++) MSLogf(@"frame pacing: game presents with presentDrawable:");
+    double T = MSPaceNow(); static int said; if (!said++) MSLogf(@"frame pacing: game presents with presentDrawable:");
     double U = MSUncappedDur();
     if (T > 0 || U > 0) ((void (*)(id, SEL, id, CFTimeInterval))(g_oCBPresentMin ?: class_getMethodImplementation(object_getClass(self), @selector(presentDrawable:afterMinimumDuration:))))(self, @selector(presentDrawable:afterMinimumDuration:), d, T > 0 ? T - 0.002 : MSCapMargin(U));
     else ((void (*)(id, SEL, id))g_oCBPresent)(self, c, d);
@@ -5780,7 +5801,7 @@ static void ms_drPresent(id self, SEL c) {                      /* -[CAMetalDraw
     if (MSIsOverlayDrawable(self)) { ((void (*)(id, SEL))g_oDrPresent)(self, c); return; }   /* CET overlay */
     if (objc_getAssociatedObject(self, &g_capKey)) { ((void (*)(id, SEL))g_oDrPresent)(self, c); return; }
     g_gameMinDur = 0; MSShownWatch(self);
-    double T = g_paceT; static int said; if (!said++) MSLogf(@"frame pacing: game presents with [drawable present]");
+    double T = MSPaceNow(); static int said; if (!said++) MSLogf(@"frame pacing: game presents with [drawable present]");
     double U = MSUncappedDur();
     if (T > 0 || U > 0) ((void (*)(id, SEL, CFTimeInterval))(g_oDrPresentMin ?: class_getMethodImplementation(object_getClass(self), @selector(presentAfterMinimumDuration:))))(self, @selector(presentAfterMinimumDuration:), T > 0 ? T - 0.002 : MSCapMargin(U));
     else ((void (*)(id, SEL))g_oDrPresent)(self, c);
