@@ -78,17 +78,26 @@ static MTLRenderPassAttachmentDescriptor *PMAtt(MTLRenderPassDescriptor *d, int 
 }
 static BOOL PMStoreKnown(MTLStoreAction a) { return a == MTLStoreActionStore || a == MTLStoreActionDontCare; }
 // a pass that may take part at all (as the first or a later one)
+static char g_pmWhy;   /* why the last PMCandidate said no (sequence sample): v visibility, r rate map, i imageblock/threadgroup/tile,
+                          a array length, c counters, m MSAA/resolve, l memoryless, s store action not known yet, 0 no attachments */
 static BOOL PMCandidate(MTLRenderPassDescriptor *d) {
-    if (!d || d.visibilityResultBuffer || d.rasterizationRateMap || d.imageblockSampleLength || d.threadgroupMemoryLength ||
-        d.tileWidth || d.tileHeight || d.renderTargetArrayLength > 1) return NO;
-    if (@available(iOS 14.0, macOS 11.0, *)) { if (d.sampleBufferAttachments[0].sampleBuffer) return NO; }
+#define PMC(ch) do { g_pmWhy = ch; return NO; } while (0)
+    if (!d) PMC('0');
+    if (d.visibilityResultBuffer) PMC('v');
+    if (d.rasterizationRateMap) PMC('r');
+    if (d.imageblockSampleLength || d.threadgroupMemoryLength || d.tileWidth || d.tileHeight) PMC('i');
+    if (d.renderTargetArrayLength > 1) PMC('a');
+    if (@available(iOS 14.0, macOS 11.0, *)) { if (d.sampleBufferAttachments[0].sampleBuffer) PMC('c'); }
     int n = 0;
     for (int i = 0; i < PM_ATT; i++) {
         MTLRenderPassAttachmentDescriptor *a = PMAtt(d, i); id<MTLTexture> t = a.texture; if (!t) continue;
-        if (t.sampleCount > 1 || a.resolveTexture || t.storageMode == MTLStorageModeMemoryless || !PMStoreKnown(a.storeAction)) return NO;
+        if (t.sampleCount > 1 || a.resolveTexture) PMC('m');
+        if (t.storageMode == MTLStorageModeMemoryless) PMC('l');
+        if (!PMStoreKnown(a.storeAction)) PMC('s');
         n++;
     }
-    return n > 0;
+    if (!n) PMC('0');
+    return YES;
 }
 static void PMRecord(MSPMState *s, MTLRenderPassDescriptor *d, id enc) {
     s->open = enc; s->pending = nil; s->wroteDS = NO; s->fence = NO; s->chain = 0;
@@ -184,7 +193,7 @@ static id pm_render(id cb, SEL c, MTLRenderPassDescriptor *d) {
     } else {
         if (e) objc_setAssociatedObject(e, &g_pmKey, s, OBJC_ASSOCIATION_RETAIN_NONATOMIC);   /* never held (open is nil): only for the sequence's "e" */
         s->open = nil;
-        if (s->seq && s->seq.length < 6000) [s->seq appendString:@" x"];
+        if (s->seq && s->seq.length < 6000) [s->seq appendFormat:@" x%c", g_pmWhy];
     }
     if (e) PMSeqPass(s, d, NO);
     return e;
@@ -263,8 +272,9 @@ static void pm_commit(id cb, SEL c) {
     if (s) s->used = NO;
     if (s && s->seq) {
         static int logged; double now = CACurrentMediaTime();
-        if (s->seqPasses >= 3) { logged++; g_pmSeqNext = logged >= 60 ? 1e18 : now + (logged % 4 ? 0.3 : 30); } else g_pmSeqNext = now;   /* 4 in a row every 30 s, at most 60 */
-        if (s->seqPasses >= 3) PMLog([NSString stringWithFormat:@"sequence of one command buffer (%d passes; t<n> = image, L/C/- load, S/- store, |depth, +R joined, F fence, h held / e ended, x = not mergeable pass):%@", s->seqPasses, s->seq]);
+        BOOL big = s->seqPasses >= 20;
+        if (big) { logged++; g_pmSeqNext = logged >= 20 ? 1e18 : now + 20; } else g_pmSeqNext = now;   /* busy command buffers only: one every 20 s, at most 20 */
+        if (big) PMLog([NSString stringWithFormat:@"sequence of one command buffer (%d passes; t<n> = image, L/C/- load, S/- store, |depth, +R joined, F fence, h held / e ended, x<why> = pass that can't take part: v visibility, r rate map, i imageblock/tile, a array, c counters, m MSAA, l memoryless, s store unknown):%@", s->seqPasses, s->seq]);
         s->seq = nil; s->ids = nil;
     }
     ((void (*)(id, SEL))g_oCommitPM)(cb, c);
